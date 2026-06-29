@@ -1,0 +1,20 @@
+{
+  "name": "generic-exploratory-agent",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "dev": "concurrently \"npm run dev -w @qa/chat-agent\" \"npm run dev -w @qa/api\" \"npm run dev -w @qa/web\"",
+    "dev:api": "npm run dev -w @qa/api",
+    "dev:web": "npm run dev -w @qa/web",
+    "setup": "bash scripts/setup.sh"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}
