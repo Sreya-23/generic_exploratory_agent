@@ -21,6 +21,132 @@ import {
 
 const URL_RE = /https?:\/\/[^\s<>"']+/gi;
 
+/** Exploration matrix ID → flowClass mapping */
+export const MATRIX_ID_MAP: Record<string, string> = {
+  // UI & Interaction
+  A1: 'navigation',
+  A2: 'form-validation',
+  A3: 'input-boundary',
+  A4: 'double-click',
+  A5: 'keyboard-nav',
+  A6: 'viewport',
+  A7: 'modal-lifecycle',
+  A8: 'empty-states',
+  A9: 'error-ui',
+  A10: 'autofill',
+  A11: 'file-upload',
+  A12: 'pagination-ui',
+  A13: 'wizard',
+  // Navigation & Session
+  B1: 'back-during-post',
+  B2: 'forward-after-back',
+  B3: 'refresh-during-request',
+  B5: 'deep-link',
+  B6: 'session-timeout',
+  B7: 'multi-tab-logout',
+  // Network & Chaos
+  C1: 'slow-network',
+  C2: 'offline-mid-request',
+  C3: 'offline-recovery',
+  C4: 'flaky-network',
+  C5: 'timeout-retry',
+  C6: 'websocket-disconnect',
+  // API
+  D1: 'crud',
+  D2: 'auth-matrix',
+  D3: 'idempotency',
+  D4: 'pagination',
+  D7: 'rate-limit',
+  // Security
+  F1: 'idor-probe',
+  F2: 'horizontal-privilege',
+  F3: 'vertical-privilege',
+  F4: 'xss-probe',
+  F5: 'mass-assignment',
+  // Performance
+  G1: 'spike-load',
+  G2: 'large-payload',
+  G3: 'n-plus-one',
+  // Regression
+  H1: 'golden-path',
+  H2: 'schema-drift',
+  H3: 'visual-regression',
+};
+
+/** Parse matrix IDs like "A6, B2, F2" or "run A6 and B7" from user text */
+function extractMatrixIds(text: string): string[] {
+  const ids = [...text.matchAll(/\b([A-H]\d{1,2})\b/g)].map((m) => m[1].toUpperCase());
+  return ids.filter((id) => id in MATRIX_ID_MAP);
+}
+
+/** Returns a formatted list of all matrix tests for display */
+export function matrixTestList(): string {
+  const sections: Record<string, { id: string; label: string }[]> = {
+    'UI & Interaction': [
+      { id: 'A1', label: 'Happy path navigation' },
+      { id: 'A2', label: 'Form validation' },
+      { id: 'A3', label: 'Input boundary' },
+      { id: 'A4', label: 'Double / rapid actions' },
+      { id: 'A5', label: 'Keyboard navigation' },
+      { id: 'A6', label: 'Scroll & viewport' },
+      { id: 'A7', label: 'Modal lifecycle' },
+      { id: 'A8', label: 'Empty & loading states' },
+      { id: 'A9', label: 'Error UI & toast duration' },
+      { id: 'A10', label: 'Copy/paste & autofill' },
+      { id: 'A11', label: 'File upload edge cases' },
+      { id: 'A12', label: 'Pagination UI' },
+      { id: 'A13', label: 'Multi-step wizard' },
+    ],
+    'Navigation & Session': [
+      { id: 'B1', label: 'Back during API call' },
+      { id: 'B2', label: 'Forward after back (stale form)' },
+      { id: 'B3', label: 'Refresh during request' },
+      { id: 'B5', label: 'Deep link without context' },
+      { id: 'B6', label: 'Session timeout mid-flow' },
+      { id: 'B7', label: 'Logout in another tab' },
+    ],
+    'Network & Chaos': [
+      { id: 'C1', label: 'Slow network (3G)' },
+      { id: 'C2', label: 'Offline mid-request' },
+      { id: 'C3', label: 'Offline → online recovery' },
+      { id: 'C4', label: 'Flaky network 50% drop' },
+      { id: 'C5', label: 'Request timeout + retry' },
+      { id: 'C6', label: 'WebSocket disconnect' },
+    ],
+    'API': [
+      { id: 'D1', label: 'CRUD completeness' },
+      { id: 'D2', label: 'Auth matrix' },
+      { id: 'D3', label: 'Idempotency' },
+      { id: 'D4', label: 'Pagination edge cases' },
+      { id: 'D7', label: 'Rate limiting' },
+    ],
+    'Security': [
+      { id: 'F1', label: 'IDOR probe' },
+      { id: 'F2', label: 'Horizontal privilege escalation' },
+      { id: 'F3', label: 'Vertical privilege escalation' },
+      { id: 'F4', label: 'XSS in inputs' },
+      { id: 'F5', label: 'Mass assignment' },
+    ],
+    'Performance': [
+      { id: 'G1', label: 'Spike load' },
+      { id: 'G2', label: 'Large payload' },
+      { id: 'G3', label: 'N+1 UI pattern' },
+    ],
+    'Regression': [
+      { id: 'H1', label: 'Golden path snapshot' },
+      { id: 'H2', label: 'API schema drift' },
+      { id: 'H3', label: 'Visual regression' },
+    ],
+  };
+
+  return Object.entries(sections)
+    .map(([section, tests]) => {
+      const rows = tests.map((t) => `  \`${t.id}\` ${t.label}`).join('\n');
+      return `**${section}**\n${rows}`;
+    })
+    .join('\n\n');
+}
+
 const AREA_KEYWORDS: Record<ExplorationArea, string[]> = {
   ui: ['ui', 'interface', 'forms', 'navigation', 'click', 'button', 'frontend', 'visual'],
   api: ['api', 'endpoint', 'rest', 'graphql', 'backend', 'request'],
@@ -161,6 +287,7 @@ function draftToConfig(draft: SetupDraft): SessionConfig | undefined {
     areas: draft.areas.length ? draft.areas : ['ui'],
     credentials: draft.credentials,
     flowInstructions: draft.flowInstructions?.length ? draft.flowInstructions : undefined,
+    selectedFlowClasses: draft.selectedFlowClasses?.length ? draft.selectedFlowClasses : undefined,
   };
 }
 
@@ -189,6 +316,15 @@ function summarizeDraft(draft: SetupDraft): string {
       ? `**Flow instructions:**\n${draft.flowInstructions.map((i) => `  - ${i}`).join('\n')}`
       : '';
 
+  // Show selected matrix tests (reverse-map flowClass → matrix ID for display)
+  const reverseMap = Object.fromEntries(
+    Object.entries(MATRIX_ID_MAP).map(([id, fc]) => [fc, id]),
+  );
+  const selectedLine =
+    draft.selectedFlowClasses?.length
+      ? `**Selected tests:** ${draft.selectedFlowClasses.map((fc) => reverseMap[fc] ?? fc).join(', ')}`
+      : '';
+
   return [
     `**Target:** ${draft.targetUrl ?? '(not set)'}`,
     `**Depth:** ${draft.depth}`,
@@ -196,6 +332,7 @@ function summarizeDraft(draft: SetupDraft): string {
     `**Auth:** ${creds}`,
     extrasLine,
     instructionsLine,
+    selectedLine,
     draft.context ? `**Context:** ${draft.context.slice(0, 120)}` : '',
   ]
     .filter(Boolean)
@@ -227,12 +364,13 @@ function buildAssistantReply(
   if (draft.targetUrl && !draft.credentialsAsked && !draft.needsLogin && !draft.authProbe) {
     return (
       `Got it — **${draft.targetUrl}**\n\n` +
-      `Does this site need any credentials or special inputs to use it?\n\n` +
-      `- **Login** (username + password)\n` +
-      `- **API key** or **bearer token**\n` +
-      `- **Phone number**, card, account ID, or any other input the site needs\n` +
-      `- Reply **"no"** if it's publicly accessible\n\n` +
-      `You can also tell me specific flows to test — e.g. _"test the payment flow"_, _"send a link to +91 9876543210"_`
+      `Does this site need any credentials to log in?\n\n` +
+      `- **Login**: \`username: admin\` / \`password: secret\`\n` +
+      `- **OTP**: \`otp: 123456\`\n` +
+      `- **API key**: \`api-key: sk-abc123\`\n` +
+      `- **Extra inputs** (phone, card, account ID): \`phone: +91 9876543210\`\n` +
+      `- Reply **"no"** if the site is publicly accessible\n\n` +
+      `Tip: For risky actions like payments or purchases, I'll ask for card/phone details when needed.`
     );
   }
 
@@ -262,7 +400,16 @@ function buildAssistantReply(
   }
 
   if (missing.length === 0) {
-    return `Ready to explore:\n\n${summarizeDraft(draft)}\n\nSay **"start"** or click Start Exploration.`;
+    const siteHint = draft.credentials.type !== 'none'
+      ? `I'll log in with the provided credentials, then run a full exploration.`
+      : `I'll run a full exploration of the site.`;
+    return (
+      `✅ All set!\n\n${siteHint}\n\n` +
+      `${summarizeDraft(draft)}\n\n` +
+      `I'll automatically run UI flows, API probes, chaos tests, security checks, and regression snapshots. ` +
+      `Before any risky action (payment, purchase, sending a link) I'll check with you first.\n\n` +
+      `Say **"start"** or click **Start Exploration** to begin.`
+    );
   }
 
   return `Got it.\n\n${summarizeDraft(draft)}`;
@@ -272,7 +419,18 @@ export function createSetupConversation(): SetupConversation {
   const id = randomUUID();
   const welcome = msg(
     'assistant',
-    `Hi! I'm your exploratory QA assistant.\n\nPaste a **website URL** to get started. I'll ask about credentials and any specific flows you want tested before running the exploration.\n\nExample: \`https://staging.myapp.com\``,
+    [
+      `Hi! I'm your exploratory QA assistant.`,
+      ``,
+      `Paste the **website URL** to start. I'll automatically:`,
+      `- Detect login requirements and ask for credentials if needed`,
+      `- Identify the site type and run domain-appropriate journeys`,
+      `- Run all applicable tests — UI, API, chaos, security, regression, performance`,
+      ``,
+      `Before any risky action (purchase, payment, sending a link) I'll pause and check with you first.`,
+      ``,
+      `Example: \`https://staging.myapp.com\``,
+    ].join('\n'),
     { kind: 'setup' },
   );
 
@@ -280,8 +438,8 @@ export function createSetupConversation(): SetupConversation {
     id,
     messages: [welcome],
     draft: {
-      depth: 'smoke',
-      areas: ['ui', 'chaos'],
+      depth: 'standard',
+      areas: ['ui', 'api', 'chaos', 'security', 'performance', 'regression'],
       credentials: { type: 'none', authMethod: 'none' },
       authState: 'unknown',
       credentialsAsked: false,
@@ -348,9 +506,24 @@ export function processSetupMessage(
     };
   }
 
+  // Detect matrix test IDs (e.g. "A6, B2, F2" or "run all")
+  const isRunAll = /\b(all tests?|run all|full matrix|every test|all flows?)\b/i.test(text);
+  if (isRunAll) {
+    conversation.draft.selectedFlowClasses = Object.values(MATRIX_ID_MAP);
+  } else {
+    const matrixIds = extractMatrixIds(text);
+    if (matrixIds.length > 0) {
+      const flowClasses = matrixIds.map((id) => MATRIX_ID_MAP[id]).filter(Boolean);
+      conversation.draft.selectedFlowClasses = [
+        ...new Set([...(conversation.draft.selectedFlowClasses ?? []), ...flowClasses]),
+      ];
+    }
+  }
+
   // Detect and store flow instructions
+  const isListRequest = /\b(list|show|what|which).{0,30}(tests?|flows?|matrix|checks?)\b/i.test(text);
   const instruction = extractFlowInstruction(text);
-  if (instruction) {
+  if (instruction && !isListRequest) {
     conversation.draft.flowInstructions = [
       ...(conversation.draft.flowInstructions ?? []),
       instruction,
@@ -374,7 +547,22 @@ export function processSetupMessage(
     ...authPatch,
     ...(extrasPatch ? { extras: extrasPatch } : {}),
   };
-  const reply = buildAssistantReply(conversation.draft, text, replyPatch);
+
+  let reply: string;
+  if (isListRequest) {
+    reply =
+      `Here are all available tests from the exploration matrix. Reference them by ID:\n\n` +
+      matrixTestList() +
+      `\n\n---\n` +
+      `You can say:\n` +
+      `- **"run A6, B2, C4"** — pick specific tests\n` +
+      `- **"run all"** — run the complete matrix\n` +
+      `- **"run all UI tests"** — run by section\n\n` +
+      `Current config:\n${summarizeDraft(conversation.draft)}`;
+  } else {
+    reply = buildAssistantReply(conversation.draft, text, replyPatch);
+  }
+
   conversation.messages.push(msg('assistant', reply, { kind: readyToStart ? 'command' : 'setup' }));
 
   return {

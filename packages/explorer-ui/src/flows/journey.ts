@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask, SiteType } from '@qa/shared';
 import { fillExtras } from './user-directed.js';
+import { findVisibleErrorText } from './helpers.js';
 
 async function shot(page: Page, ctx: ExecutorContext, name: string): Promise<string> {
   const p = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `journey-${name}.png`);
@@ -9,73 +10,238 @@ async function shot(page: Page, ctx: ExecutorContext, name: string): Promise<str
   return p;
 }
 
+/**
+ * Semantic button/link finder — works across languages, frameworks, and custom UI kits.
+ *
+ * Strategy (tries each in order, returns first visible match):
+ * 1. data-testid / data-test attributes (most reliable)
+ * 2. aria-label attributes (accessible labels, language-independent)
+ * 3. Text keywords (English first, then common translations)
+ * 4. Class-name patterns (e.g. btn-cart, buy-button)
+ * 5. DOM position heuristic (most prominent button in a product card)
+ */
+async function findSemanticButton(
+  page: Page,
+  intent: 'add-to-cart' | 'view-cart' | 'checkout' | 'confirm' | 'submit-form' |
+          'book-now' | 'search' | 'next-step' | 'login' | 'logout',
+): Promise<import('playwright').Locator | null> {
+  const strategies: string[][] = [];
+
+  switch (intent) {
+    case 'add-to-cart':
+      strategies.push(
+        ['[data-testid*="add-to-cart"]', '[data-test*="add-to-cart"]', '[data-action*="add-to-cart"]'],
+        ['[aria-label*="add to cart" i]', '[aria-label*="add to bag" i]', '[aria-label*="add to basket" i]'],
+        [
+          'button:has-text("Add to cart")', 'button:has-text("Add to Cart")',
+          'button:has-text("Add to bag")', 'button:has-text("Add to Bag")',
+          'button:has-text("Add to basket")', 'button:has-text("Buy Now")',
+          'button:has-text("Buy now")', 'button:has-text("Add")',
+          // Common translations
+          'button:has-text("Ajouter au panier")',  // French
+          'button:has-text("In den Warenkorb")',    // German
+          'button:has-text("Añadir al carrito")',   // Spanish
+          'button:has-text("Aggiungi al carrello")', // Italian
+        ],
+        ['[class*="add-to-cart"]', '[class*="addtocart"]', '[class*="btn-cart"]', '[class*="buy-btn"]'],
+      );
+      break;
+
+    case 'view-cart':
+      strategies.push(
+        ['[data-testid*="cart"]', '[data-test*="cart"]'],
+        ['[aria-label*="cart" i]', '[aria-label*="basket" i]', '[aria-label*="bag" i]'],
+        [
+          'a[href*="/cart"]', 'a[href*="/basket"]', 'a[href*="/bag"]',
+          'a:has-text("Cart")', 'a:has-text("Basket")', 'a:has-text("View cart")',
+          'button:has-text("View cart")', 'button:has-text("Go to cart")',
+        ],
+        ['[class*="cart-icon"]', '[class*="cart-link"]', '[class*="shopping-bag"]'],
+      );
+      break;
+
+    case 'checkout':
+      strategies.push(
+        ['[data-testid*="checkout"]', '[data-test*="checkout"]'],
+        ['[aria-label*="checkout" i]', '[aria-label*="proceed" i]'],
+        [
+          'button:has-text("Checkout")', 'button:has-text("Check out")',
+          'button:has-text("Proceed to checkout")', 'button:has-text("Continue to checkout")',
+          'a:has-text("Checkout")', 'a[href*="checkout"]',
+          'button:has-text("Passer la commande")',  // French
+          'button:has-text("Zur Kasse")',            // German
+          'button:has-text("Pagar")',                // Spanish
+        ],
+        ['[class*="checkout-btn"]', '[class*="proceed-btn"]'],
+      );
+      break;
+
+    case 'book-now':
+      strategies.push(
+        ['[data-testid*="book"]', '[data-testid*="reserve"]'],
+        ['[aria-label*="book" i]', '[aria-label*="reserve" i]', '[aria-label*="check availability" i]'],
+        [
+          'button:has-text("Book now")', 'button:has-text("Book Now")',
+          'button:has-text("Reserve")', 'button:has-text("Check availability")',
+          'button:has-text("Search")', 'button:has-text("Find")',
+          'button:has-text("Get started")', 'input[type="submit"]',
+        ],
+        ['[class*="book-btn"]', '[class*="reserve-btn"]', '[class*="cta"]'],
+      );
+      break;
+
+    case 'confirm':
+      strategies.push(
+        ['[data-testid*="confirm"]', '[data-testid*="submit"]'],
+        ['[aria-label*="confirm" i]', '[aria-label*="place order" i]'],
+        [
+          'button:has-text("Confirm")', 'button:has-text("Place order")',
+          'button:has-text("Complete")', 'button:has-text("Finish")',
+          'button:has-text("Submit")', 'button[type="submit"]',
+        ],
+        ['[class*="confirm-btn"]', '[class*="submit-btn"]'],
+      );
+      break;
+
+    case 'search':
+      strategies.push(
+        ['[data-testid*="search"]', 'input[type="search"]'],
+        ['[aria-label*="search" i]', '[placeholder*="search" i]'],
+        ['button:has-text("Search")', 'button[type="submit"]:near(input[type="search"])'],
+        ['[class*="search-btn"]', '[class*="search-button"]'],
+      );
+      break;
+
+    case 'next-step':
+      strategies.push(
+        ['[data-testid*="next"]', '[data-testid*="continue"]'],
+        ['[aria-label*="next" i]', '[aria-label*="continue" i]'],
+        ['button:has-text("Next")', 'button:has-text("Continue")', 'button:has-text("Proceed")'],
+        ['[class*="next-btn"]', '[class*="continue-btn"]'],
+      );
+      break;
+
+    case 'login':
+      strategies.push(
+        ['[data-testid*="login"]', '[data-testid*="signin"]'],
+        ['[aria-label*="login" i]', '[aria-label*="sign in" i]'],
+        [
+          'button:has-text("Login")', 'button:has-text("Log in")',
+          'button:has-text("Sign in")', 'input[type="submit"][value*="Login" i]',
+          'button[type="submit"]',
+        ],
+        ['[class*="login-btn"]', '[class*="signin-btn"]'],
+      );
+      break;
+
+    case 'logout':
+      strategies.push(
+        ['[data-testid*="logout"]', '[data-testid*="signout"]'],
+        ['[aria-label*="logout" i]', '[aria-label*="sign out" i]'],
+        [
+          'a:has-text("Logout")', 'a:has-text("Log out")', 'a:has-text("Sign out")',
+          'button:has-text("Logout")', 'button:has-text("Sign out")',
+          '[href*="logout"]', '[href*="signout"]',
+        ],
+        ['[class*="logout"]', '[class*="signout"]'],
+      );
+      break;
+
+    case 'submit-form':
+      strategies.push(
+        ['button[type="submit"]', 'input[type="submit"]'],
+        ['[aria-label*="submit" i]'],
+        ['button:has-text("Submit")', 'button:has-text("Save")', 'button:has-text("Send")'],
+        ['[class*="submit-btn"]', '[class*="form-submit"]'],
+      );
+      break;
+  }
+
+  // Try each strategy group in order
+  for (const group of strategies) {
+    for (const sel of group) {
+      try {
+        const loc = page.locator(sel).first();
+        if ((await loc.count()) > 0 && await loc.isVisible().catch(() => false)) {
+          return loc;
+        }
+      } catch {
+        // invalid selector, try next
+      }
+    }
+  }
+
+  return null;
+}
+
 // ── Ecommerce ─────────────────────────────────────────────────────────────────
 
 async function runEcommerceJourney(page: Page, ctx: ExecutorContext): Promise<void> {
   ctx.onLog('[Journey/ecommerce] Browse catalog → product → cart → checkout');
 
-  // 1. Find and click a product link
+  // 1. Find and click a product — try product links, or any prominent card link
   const productLink = page.locator(
-    'a[href*="product"], a[href*="item"], a[href*="shop"], .product a, [data-testid*="product"] a',
+    '[data-testid*="product"] a, .product a, [class*="product-item"] a, ' +
+    '[class*="product-card"] a, [class*="item-card"] a, ' +
+    'a[href*="product"], a[href*="item"], a[href*="inventory"]',
   ).first();
 
-  if (await productLink.count() > 0) {
+  if (await productLink.count() > 0 && await productLink.isVisible().catch(() => false)) {
     await productLink.click();
     await page.waitForLoadState('domcontentloaded');
     ctx.onLog('[Journey/ecommerce] Opened product page');
     await shot(page, ctx, 'product-detail');
   } else {
-    ctx.onLog('[Journey/ecommerce] No product link found, continuing from landing');
+    ctx.onLog('[Journey/ecommerce] No product link found, attempting Add to Cart from current page');
   }
 
-  // 2. Add to cart
-  const addToCart = page.locator(
-    'button:has-text("Add to Cart"), button:has-text("Add to Bag"), button:has-text("Buy Now"), [data-testid*="add-to-cart"]',
-  ).first();
+  // 2. Add to cart — semantic discovery (works across languages & frameworks)
+  const addToCart = await findSemanticButton(page, 'add-to-cart');
 
-  if (await addToCart.count() > 0) {
-    const cartBefore = await page.locator('[class*="cart-count"], [data-testid*="cart"] span, .cart-badge').first().textContent().catch(() => '0');
+  if (addToCart) {
+    const btnLabel = (await addToCart.textContent().catch(() => ''))?.trim() || 'Add to cart';
+    const cartBefore = await page
+      .locator('[class*="cart-count"], [class*="cart_badge"], .shopping_cart_badge, [data-testid*="cart"] span')
+      .first().textContent().catch(() => '0');
     await addToCart.click();
     await page.waitForTimeout(800);
-    const cartAfter = await page.locator('[class*="cart-count"], [data-testid*="cart"] span, .cart-badge').first().textContent().catch(() => null);
+    const cartAfter = await page
+      .locator('[class*="cart-count"], [class*="cart_badge"], .shopping_cart_badge, [data-testid*="cart"] span')
+      .first().textContent().catch(() => null);
     const s = await shot(page, ctx, 'after-add-to-cart');
 
-    if (cartAfter !== null && cartBefore !== cartAfter) {
-      ctx.onLog(`[Journey/ecommerce] Cart count updated: ${cartBefore} → ${cartAfter}`);
-    } else if (cartAfter === cartBefore) {
+    ctx.onLog(`[Journey/ecommerce] Clicked "${btnLabel}" — cart: ${cartBefore} → ${cartAfter ?? 'unknown'}`);
+
+    if (cartAfter !== null && cartBefore === cartAfter) {
       ctx.onFinding({
         severity: 'medium',
         area: 'UI-Journey',
-        title: 'Cart count did not update after "Add to Cart"',
-        steps: ['Open product page', 'Click "Add to Cart"', 'Observe cart badge'],
+        title: `Cart badge did not update after clicking "${btnLabel}"`,
+        steps: ['Open product page', `Click "${btnLabel}"`, 'Observe cart badge'],
         expected: 'Cart count increments',
-        actual: 'Cart badge unchanged',
+        actual: 'Cart badge unchanged after click',
         evidence: [s],
         reproRate: '1/1',
         automationCandidate: true,
       });
     }
   } else {
-    ctx.onLog('[Journey/ecommerce] No "Add to Cart" button found');
+    ctx.onLog('[Journey/ecommerce] No add-to-cart button found on this page');
   }
 
-  // 3. Navigate to cart
-  const cartLink = page.locator(
-    'a[href*="cart"], a[href*="basket"], [aria-label*="cart" i], [data-testid*="cart"]',
-  ).first();
+  // 3. Navigate to cart — semantic discovery
+  const cartLink = await findSemanticButton(page, 'view-cart');
 
-  if (await cartLink.count() > 0) {
+  if (cartLink) {
     await cartLink.click();
     await page.waitForLoadState('domcontentloaded');
     await shot(page, ctx, 'cart-page');
     ctx.onLog('[Journey/ecommerce] Opened cart page');
 
-    // 4. Proceed to checkout
-    const checkoutBtn = page.locator(
-      'button:has-text("Checkout"), a:has-text("Checkout"), button:has-text("Proceed"), a[href*="checkout"]',
-    ).first();
+    // 4. Proceed to checkout — semantic discovery
+    const checkoutBtn = await findSemanticButton(page, 'checkout');
 
-    if (await checkoutBtn.count() > 0) {
+    if (checkoutBtn) {
       await checkoutBtn.click();
       await page.waitForLoadState('domcontentloaded');
       const s = await shot(page, ctx, 'checkout-page');
@@ -97,6 +263,31 @@ async function runEcommerceJourney(page: Page, ctx: ExecutorContext): Promise<vo
           reproRate: '1/1',
           automationCandidate: true,
         });
+        return;
+      }
+
+      // 5. Pre-action gate before payment — need card/address details
+      const extras = ctx.onPreActionNeeded?.({
+        type: 'purchase',
+        description: 'Complete checkout / payment',
+        requiredExtras: ['card'],
+      });
+
+      if (extras && extras['card']) {
+        // Fill payment details if card was provided
+        const cardInput = page.locator(
+          'input[placeholder*="card" i], input[name*="card" i], input[data-testid*="card"]',
+        ).first();
+
+        if (await cardInput.count() > 0) {
+          await cardInput.fill(extras['card']);
+          ctx.onLog(`[Journey/ecommerce] Filled card number`);
+          await shot(page, ctx, 'checkout-payment-filled');
+        } else {
+          ctx.onLog('[Journey/ecommerce] No card input visible on checkout page');
+        }
+      } else {
+        ctx.onLog('[Journey/ecommerce] Payment step skipped — no card provided');
       }
     }
   }
@@ -139,6 +330,29 @@ async function runBookingJourney(page: Page, ctx: ExecutorContext): Promise<void
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       await shot(page, ctx, 'booking-results');
       ctx.onLog('[Journey/booking] Search submitted');
+
+      // Try to select a result
+      const firstResult = page.locator(
+        'button:has-text("Book"), button:has-text("Reserve"), a:has-text("Select"), a:has-text("Book Now")',
+      ).first();
+
+      if (await firstResult.count() > 0) {
+        // Pre-action gate before confirming a booking
+        const extras = ctx.onPreActionNeeded?.({
+          type: 'booking_confirm',
+          description: 'Confirm booking / reservation',
+          requiredExtras: [],
+        });
+
+        if (extras !== null) {
+          await firstResult.click();
+          await page.waitForLoadState('domcontentloaded').catch(() => {});
+          await shot(page, ctx, 'booking-confirm-page');
+          ctx.onLog('[Journey/booking] Opened booking confirm page');
+        } else {
+          ctx.onLog('[Journey/booking] Booking confirmation skipped by pre-action gate');
+        }
+      }
     }
   } else {
     ctx.onFinding({
@@ -171,15 +385,13 @@ async function runAuthPortalJourney(page: Page, ctx: ExecutorContext): Promise<v
     return;
   }
 
-  // Invalid login test
+  // Invalid login test — use findVisibleErrorText to avoid empty placeholder containers
   await usernameInput.fill('invalid_user_qa_test');
   await passwordInput.fill('wrongpassword123');
   await submitBtn.click();
-  await page.waitForTimeout(1000);
 
-  const errorMsg = await page.locator(
-    '[class*="error"], [role="alert"], [class*="invalid"], [data-test*="error"]',
-  ).first().textContent().catch(() => null);
+  // Wait for error to render (some apps have async validation)
+  const errorMsg = await findVisibleErrorText(page, 1000);
 
   const s1 = await shot(page, ctx, 'auth-invalid-login');
 
@@ -188,9 +400,9 @@ async function runAuthPortalJourney(page: Page, ctx: ExecutorContext): Promise<v
       severity: 'high',
       area: 'UI-Journey',
       title: 'No error message shown for invalid login credentials',
-      steps: ['Enter invalid username and password', 'Click Login'],
-      expected: 'Clear error message displayed',
-      actual: 'No visible error feedback',
+      steps: ['Enter invalid username and password', 'Click Login', 'Wait 1s for error'],
+      expected: 'Clear, visible error message',
+      actual: 'No error message with text found after 1s (empty containers excluded)',
       evidence: [s1],
       reproRate: '1/1',
       automationCandidate: true,
@@ -203,35 +415,77 @@ async function runAuthPortalJourney(page: Page, ctx: ExecutorContext): Promise<v
   const extras = config.credentials?.extras;
   if (extras) await fillExtras(page, extras);
 
-  // Valid login test (only if credentials provided)
+  // Valid login test (only if credentials are fully provided)
   const creds = config.credentials;
   if (!creds || creds.type === 'none' || !creds.username || !creds.password) {
-    ctx.onLog('[Journey/auth-portal] No valid credentials provided — skipping valid login test');
+    ctx.onLog('[Journey/auth-portal] No valid credentials configured — skipping valid login test');
+    if (!creds?.username) ctx.onLog('[Journey/auth-portal] Missing: username');
+    if (!creds?.password) ctx.onLog('[Journey/auth-portal] Missing: password');
     return;
   }
 
+  // Re-navigate to a clean login page state
   await page.goto(config.targetUrl, { waitUntil: 'domcontentloaded' });
-  const usernameInput2 = page.locator('input[type="text"], input[type="email"], input[name*="user" i]').first();
-  const passwordInput2 = page.locator('input[type="password"]').first();
-  const submitBtn2 = page.locator('button[type="submit"], input[type="submit"]').first();
+  await page.waitForTimeout(300);
 
-  await usernameInput2.fill(creds.username);
-  await passwordInput2.fill(creds.password);
-  await submitBtn2.click();
-  await page.waitForLoadState('domcontentloaded').catch(() => {});
-  await page.waitForTimeout(1000);
+  const usernameInput2 = page
+    .locator('input[type="text"], input[type="email"], input[name*="user" i], input[name*="email" i]')
+    .first();
+  const passwordInput2 = page.locator('input[type="password"]').first();
+  const submitBtn2 = page
+    .locator('button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Sign in")')
+    .first();
+
+  if ((await usernameInput2.count()) === 0 || (await passwordInput2.count()) === 0) {
+    ctx.onLog('[Journey/auth-portal] Could not find login form inputs after re-navigation');
+    return;
+  }
+
+  // Verify credentials are non-empty before attempting login
+  const username = creds.username.trim();
+  const password = creds.password.trim();
+  if (!username || !password) {
+    ctx.onLog('[Journey/auth-portal] Credentials present but empty after trim — skipping valid login test');
+    return;
+  }
+
+  ctx.onLog(`[Journey/auth-portal] Attempting login as: ${username} (password: ${'*'.repeat(Math.min(password.length, 8))})`);
+
+  await usernameInput2.fill(username);
+  await passwordInput2.fill(password);
+  await submitBtn2.click().catch(() => {});
+
+  // Wait for navigation or dynamic login completion
+  await page.waitForTimeout(2000);
+  try {
+    await page.waitForLoadState('domcontentloaded', { timeout: 5000 });
+  } catch {
+    // Some SPAs don't fire domcontentloaded on login redirect — continue anyway
+  }
 
   const s2 = await shot(page, ctx, 'auth-valid-login');
-  const stillOnLogin = (await page.locator('input[type="password"]').count()) > 0;
+  const currentUrl = page.url();
+  const stillOnLogin =
+    (await page.locator('input[type="password"]').count()) > 0 &&
+    currentUrl === config.targetUrl;
 
   if (stillOnLogin) {
+    // Check if there's an error message explaining why login failed
+    const loginError = await findVisibleErrorText(page, 500);
     ctx.onFinding({
       severity: 'high',
       area: 'UI-Journey',
       title: 'Valid credentials did not complete login',
-      steps: [`Enter username: ${creds.username}`, 'Enter password', 'Click Login'],
-      expected: 'Navigate to authenticated home page',
-      actual: 'Still on login page',
+      steps: [
+        `Enter username: ${username}`,
+        `Enter password (${password.length} chars)`,
+        'Click Login button',
+        'Wait 2s for redirect',
+      ],
+      expected: 'Navigate away from login page to authenticated area',
+      actual: loginError
+        ? `Still on login page — error shown: "${loginError.slice(0, 100)}"`
+        : `Still on login page at ${currentUrl} — verify credentials are correct`,
       evidence: [s2],
       reproRate: '1/1',
       automationCandidate: true,
@@ -372,6 +626,99 @@ async function runGenericJourney(page: Page, ctx: ExecutorContext): Promise<void
   }
 }
 
+// ── Fintech ───────────────────────────────────────────────────────────────────
+
+async function runFintechJourney(page: Page, ctx: ExecutorContext): Promise<void> {
+  ctx.onLog('[Journey/fintech] View balance → initiate transfer → confirm');
+
+  await shot(page, ctx, 'fintech-landing');
+
+  // Check balance/account section
+  const balanceEl = page.locator(
+    '[class*="balance"], [data-testid*="balance"], :has-text("Balance"), :has-text("Available")',
+  ).first();
+
+  if (await balanceEl.count() > 0) {
+    const balanceText = await balanceEl.textContent().catch(() => '');
+    ctx.onLog(`[Journey/fintech] Balance visible: "${balanceText?.trim().slice(0, 40)}"`);
+  }
+
+  // Find transfer/send flow
+  const transferBtn = page.locator(
+    'button:has-text("Transfer"), button:has-text("Send"), a:has-text("Transfer"), a:has-text("Pay")',
+  ).first();
+
+  if (await transferBtn.count() > 0) {
+    // Pre-action gate before any payment/transfer
+    const extras = ctx.onPreActionNeeded?.({
+      type: 'payment',
+      description: 'Initiate fund transfer or payment',
+      requiredExtras: ['phone'],
+    });
+
+    if (extras !== null) {
+      await transferBtn.click();
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await shot(page, ctx, 'fintech-transfer-form');
+      ctx.onLog('[Journey/fintech] Transfer form opened');
+
+      // Fill phone/account if available
+      if (extras?.['phone']) {
+        const phoneInput = page.locator('input[type="tel"], input[name*="phone" i], input[placeholder*="phone" i]').first();
+        if (await phoneInput.count() > 0) {
+          await phoneInput.fill(extras['phone']);
+          ctx.onLog('[Journey/fintech] Filled phone for transfer');
+        }
+      }
+    } else {
+      ctx.onLog('[Journey/fintech] Transfer flow skipped — waiting for user confirmation');
+    }
+  } else {
+    ctx.onLog('[Journey/fintech] No transfer button found — running generic navigation');
+    await runGenericJourney(page, ctx);
+  }
+}
+
+// ── Social ────────────────────────────────────────────────────────────────────
+
+async function runSocialJourney(page: Page, ctx: ExecutorContext): Promise<void> {
+  ctx.onLog('[Journey/social] Browse feed → open profile → interact');
+
+  await shot(page, ctx, 'social-feed');
+
+  // Open a profile or post
+  const profileLink = page.locator(
+    'a[href*="/user"], a[href*="/profile"], a[href*="/@"], [class*="avatar"] a',
+  ).first();
+
+  if (await profileLink.count() > 0) {
+    await profileLink.click();
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await shot(page, ctx, 'social-profile');
+    ctx.onLog('[Journey/social] Opened profile page');
+  }
+
+  // Try liking/following — pre-action gate
+  const interactBtn = page.locator(
+    'button:has-text("Follow"), button[aria-label*="like" i], button:has-text("Like")',
+  ).first();
+
+  if (await interactBtn.count() > 0) {
+    const extras = ctx.onPreActionNeeded?.({
+      type: 'generic',
+      description: 'Interact with social content (follow/like)',
+      requiredExtras: [],
+    });
+
+    if (extras !== null) {
+      await interactBtn.click();
+      await page.waitForTimeout(500);
+      await shot(page, ctx, 'social-after-interact');
+      ctx.onLog('[Journey/social] Interaction button clicked');
+    }
+  }
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
 const JOURNEY_MAP: Record<SiteType, (page: Page, ctx: ExecutorContext) => Promise<void>> = {
@@ -380,8 +727,8 @@ const JOURNEY_MAP: Record<SiteType, (page: Page, ctx: ExecutorContext) => Promis
   'auth-portal': runAuthPortalJourney,
   'saas-dashboard': runSaasDashboardJourney,
   'blog-cms': runBlogJourney,
-  social: runGenericJourney,
-  fintech: runGenericJourney,
+  social: runSocialJourney,
+  fintech: runFintechJourney,
   generic: runGenericJourney,
 };
 

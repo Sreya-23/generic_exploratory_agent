@@ -4,6 +4,7 @@ import type {
   ExecutorContext,
   Finding,
   FlowTask,
+  PreActionRequest,
   SessionCredentials,
   SessionEvent,
   SessionState,
@@ -305,6 +306,41 @@ export class SessionOrchestrator {
             timestamp: new Date().toISOString(),
             payload: { message },
           });
+        },
+        onPreActionNeeded: (req: PreActionRequest): Record<string, string> | null => {
+          const extras = state.config.credentials?.extras ?? {};
+          const missing = (req.requiredExtras ?? []).filter((k) => !extras[k]);
+
+          if (missing.length > 0) {
+            // Tell the user what's needed via a live chat message
+            const prompt =
+              `⚠️ **${req.description}** — I need more info before proceeding:\n\n` +
+              missing.map((k) => `- \`${k}\`: _not provided_`).join('\n') +
+              `\n\nReply with the missing value(s) in the format \`key: value\` (e.g. \`card: 4111111111111111\`) to allow this action, or ignore to skip it.`;
+
+            this.emit({
+              type: 'pre_action:required',
+              sessionId,
+              timestamp: new Date().toISOString(),
+              payload: { request: req, missing, prompt },
+            });
+
+            ctx.onFinding({
+              severity: 'info',
+              area: 'UI-Journey',
+              title: `Skipped: ${req.description}`,
+              steps: [`${req.type} action reached`, 'Required data not provided'],
+              expected: `Data provided for: ${missing.join(', ')}`,
+              actual: `Action skipped — provide missing data in live chat to test this flow`,
+              evidence: [],
+              reproRate: 'N/A',
+              automationCandidate: false,
+            });
+
+            return null;
+          }
+
+          return extras;
         },
         onClassification: (raw) => {
           // recon.ts passes raw signals wrapped in a SiteClassification shell

@@ -87,6 +87,18 @@ function applyEvent(
   if (event.type === 'session:started') {
     setSession((prev) => (prev ? { ...prev, status: 'running' } : prev));
   }
+
+  if (event.type === 'pre_action:required') {
+    const payload = event.payload as { prompt: string; missing: string[] };
+    const msg: ChatMessage = {
+      id: `pre-action-${Date.now()}`,
+      role: 'assistant',
+      content: payload.prompt,
+      timestamp: new Date().toISOString(),
+      meta: { kind: 'status' },
+    };
+    setChatMessages((prev) => [...prev, msg]);
+  }
 }
 
 export function LiveSessionPage() {
@@ -224,8 +236,8 @@ export function LiveSessionPage() {
             disabled={false}
             placeholder={
               awaitingAuth
-                ? 'email: you@co.com password: secret  — or  otp: 123456'
-                : 'Ask "status", "show findings", or "pause"...'
+                ? 'email: you@co.com   password: secret   otp: 123456'
+                : 'Reply to agent requests, e.g. card: 4111111111111111   phone: +91 9876543210'
             }
             title="Exploration Chat"
           />

@@ -114,6 +114,7 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       }
 
       if (result.action === 'update_auth' && result.credentials) {
+        // Handles both auth state updates and extras (card, phone, etc.) updates
         orchestrator.updateCredentials(req.params.id, result.credentials, result.authState);
       }
 

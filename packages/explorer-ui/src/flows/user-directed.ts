@@ -168,6 +168,27 @@ export async function runUserDirectedFlow(
   const instruction = task.description ?? task.title;
   ctx.onLog(`[UserDirected] Following instruction: "${instruction}"`);
 
+  // Pre-action gate for risky operations
+  const lower = instruction.toLowerCase();
+  const isRisky =
+    /\bpay(ment|ing)?\b|\bpurchase\b|\bbuy\b|\bcheckout\b|\bsend.*link\b|\btransfer\b|\bbook.*confirm\b/.test(lower);
+
+  if (isRisky && ctx.onPreActionNeeded) {
+    const isPayment = /\bpay|\bpurchase\b|\bbuy\b|\bcheckout\b|\btransfer\b/.test(lower);
+    const isSendLink = /\bsend.*link\b/.test(lower);
+
+    const extras = ctx.onPreActionNeeded({
+      type: isPayment ? 'purchase' : isSendLink ? 'send_link' : 'generic',
+      description: `User-directed: "${instruction.slice(0, 80)}"`,
+      requiredExtras: isPayment ? ['card'] : isSendLink ? ['phone'] : [],
+    });
+
+    if (extras === null) {
+      ctx.onLog(`[UserDirected] Skipped risky instruction — awaiting user confirmation`);
+      return;
+    }
+  }
+
   const parsed = parseInstruction(instruction);
   const s1 = await shot(page, ctx, `before-${parsed.keywords[0] ?? 'start'}`);
 

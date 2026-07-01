@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask, SiteIntelligenceSignals } from '@qa/shared';
+import { isLoginWallPage } from './helpers.js';
 
 export async function collectIntelligenceSignals(page: Page): Promise<SiteIntelligenceSignals> {
   return page.evaluate(() => {
@@ -128,7 +129,10 @@ export async function runRecon(
     });
   }
 
-  if (links.length === 0) {
+  // Login/auth walls intentionally have no nav links — suppress false positives
+  const onLoginWall = await isLoginWallPage(page);
+
+  if (links.length === 0 && !onLoginWall) {
     ctx.onFinding({
       severity: 'low',
       area: 'UI-Recon',
@@ -140,5 +144,7 @@ export async function runRecon(
       reproRate: '1/1',
       automationCandidate: false,
     });
+  } else if (links.length === 0 && onLoginWall) {
+    ctx.onLog('[Recon] No nav links found but page is a login wall — expected, skipping finding');
   }
 }

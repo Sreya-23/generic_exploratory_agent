@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type {
+  ExplorationArea,
   ExplorationPlan,
   FlowTask,
   PlanPhase,
@@ -7,45 +8,13 @@ import type {
   SessionDepth,
   SiteClassification,
 } from '@qa/shared';
-import { FLOW_CLASSES, GENERIC_PHASES } from '@qa/shared';
+import { FLOW_CLASSES, FLOW_TITLES, GENERIC_PHASES } from '@qa/shared';
 
 const DEPTH_TASK_LIMITS: Record<SessionDepth, number> = {
-  smoke: 8,
-  standard: 20,
-  deep: 50,
-  chaos: 15,
-};
-
-const FLOW_TITLES: Record<string, string> = {
-  navigation: 'Happy path navigation',
-  'form-validation': 'Form validation edge cases',
-  'input-boundary': 'Input boundary values',
-  'double-click': 'Double / rapid click actions',
-  'modal-lifecycle': 'Modal and drawer lifecycle',
-  'empty-states': 'Empty and loading states',
-  'keyboard-nav': 'Keyboard navigation',
-  crud: 'CRUD completeness',
-  'auth-matrix': 'Authentication matrix',
-  pagination: 'Pagination edge cases',
-  boundary: 'API boundary values',
-  idempotency: 'Idempotency checks',
-  'rate-limit': 'Rate limiting behavior',
-  'slow-network': 'Slow network (3G simulation)',
-  'offline-mid-request': 'Offline mid-request',
-  'offline-recovery': 'Offline to online recovery',
-  'back-during-post': 'Browser back during POST',
-  'refresh-during-request': 'Refresh during in-flight request',
-  'double-submit': 'Double submit on slow response',
-  'idor-probe': 'IDOR probe',
-  'auth-bypass': 'Auth bypass probe',
-  'xss-probe': 'XSS input probe',
-  labels: 'Screen reader labels',
-  keyboard: 'Keyboard accessibility',
-  contrast: 'Color contrast check',
-  'load-time': 'Page load time',
-  'large-payload': 'Large payload handling',
-  'golden-path': 'Golden path regression',
-  'api-schema-drift': 'API schema drift detection',
+  smoke: 15,     // recon + core UI + chaos basics
+  standard: 80,  // all matrix flows across all areas
+  deep: 200,     // full matrix + duplicates for extra coverage
+  chaos: 20,     // all chaos + session + network flows
 };
 
 function tasksForArea(area: keyof typeof FLOW_CLASSES, startPriority: number): FlowTask[] {
@@ -60,23 +29,72 @@ function tasksForArea(area: keyof typeof FLOW_CLASSES, startPriority: number): F
   }));
 }
 
+/** All areas that are always explored by default */
+const ALL_AREAS: (keyof typeof FLOW_CLASSES)[] = [
+  'ui',
+  'chaos',
+  'api',
+  'security',
+  'accessibility',
+  'performance',
+  'regression',
+];
+
+/** Area lookup for a given flow class */
+function areaForFlow(fc: string): ExplorationArea {
+  const chaosFlows = new Set(FLOW_CLASSES.chaos as readonly string[]);
+  const apiFlows = new Set(FLOW_CLASSES.api as readonly string[]);
+  const secFlows = new Set(FLOW_CLASSES.security as readonly string[]);
+  const a11yFlows = new Set(FLOW_CLASSES.accessibility as readonly string[]);
+  const perfFlows = new Set(FLOW_CLASSES.performance as readonly string[]);
+  const regFlows = new Set(FLOW_CLASSES.regression as readonly string[]);
+  if (chaosFlows.has(fc)) return 'chaos';
+  if (apiFlows.has(fc)) return 'api';
+  if (secFlows.has(fc)) return 'security';
+  if (a11yFlows.has(fc)) return 'accessibility';
+  if (perfFlows.has(fc)) return 'performance';
+  if (regFlows.has(fc)) return 'regression';
+  return 'ui';
+}
+
 export function buildGenericPlan(sessionId: string, config: SessionConfig): ExplorationPlan {
-  const areas = config.areas.length > 0 ? config.areas : (['ui'] as const);
   let priority = 0;
   const tasks: FlowTask[] = [];
 
+  // Recon always runs first
   tasks.push({
     id: 'recon-site-map',
     area: 'ui',
     flowClass: 'recon',
     title: 'Site reconnaissance',
-    description: 'Map URLs, forms, links, and API calls',
+    description: 'Map URLs, forms, links, and API calls, classify site type',
     priority: priority++,
   });
 
-  for (const area of areas) {
-    if (area in FLOW_CLASSES) {
-      const areaTasks = tasksForArea(area as keyof typeof FLOW_CLASSES, priority);
+  if (config.selectedFlowClasses && config.selectedFlowClasses.length > 0) {
+    // User explicitly chose specific matrix tests — run only those
+    for (const fc of config.selectedFlowClasses) {
+      tasks.push({
+        id: `selected-${fc}`,
+        area: areaForFlow(fc),
+        flowClass: fc,
+        title: FLOW_TITLES[fc] ?? fc,
+        description: `Run ${FLOW_TITLES[fc] ?? fc}`,
+        priority: priority++,
+      });
+    }
+  } else {
+    // Default: run ALL matrix flows across all areas, ordered by priority
+    // Smoke runs only the core UI set; standard/deep/chaos run everything
+    const depthAreas: (keyof typeof FLOW_CLASSES)[] =
+      config.depth === 'smoke'
+        ? ['ui', 'chaos']
+        : config.depth === 'chaos'
+          ? ['chaos', 'ui']
+          : ALL_AREAS;
+
+    for (const area of depthAreas) {
+      const areaTasks = tasksForArea(area, priority);
       tasks.push(...areaTasks);
       priority += areaTasks.length;
     }
@@ -93,23 +111,64 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
       .filter((t) => {
         if (phase.id === 'recon') return t.flowClass === 'recon';
         if (phase.id === 'smoke')
-          return ['navigation', 'crud'].includes(t.flowClass);
+          return ['navigation', 'crud', 'journey', 'user-directed'].includes(t.flowClass);
         if (phase.id === 'boundary')
-          return ['form-validation', 'input-boundary', 'boundary', 'pagination'].includes(
-            t.flowClass,
-          );
+          return [
+            'form-validation',
+            'input-boundary',
+            'boundary',
+            'pagination',
+            'pagination-ui',
+            'error-ui',
+            'file-upload',
+            'autofill',
+            'viewport',
+          ].includes(t.flowClass);
         if (phase.id === 'interruption')
-          return ['back-during-post', 'refresh-during-request', 'double-click'].includes(
-            t.flowClass,
-          );
+          return [
+            'back-during-post',
+            'refresh-during-request',
+            'double-click',
+            'forward-after-back',
+            'deep-link',
+            'session-timeout',
+            'multi-tab-logout',
+            'wizard',
+          ].includes(t.flowClass);
         if (phase.id === 'auth')
-          return ['auth-matrix', 'auth-bypass', 'idor-probe'].includes(t.flowClass);
+          return [
+            'auth-matrix',
+            'auth-bypass',
+            'idor-probe',
+            'horizontal-privilege',
+            'vertical-privilege',
+            'mass-assignment',
+          ].includes(t.flowClass);
         if (phase.id === 'chaos')
           return [
             'slow-network',
             'offline-mid-request',
             'offline-recovery',
             'double-submit',
+            'flaky-network',
+            'timeout-retry',
+            'websocket-disconnect',
+          ].includes(t.flowClass);
+        if (phase.id === 'report')
+          return [
+            'golden-path',
+            'visual-regression',
+            'schema-drift',
+            'spike-load',
+            'load-time',
+            'large-payload',
+            'n-plus-one',
+            'xss-probe',
+            'rate-limit',
+            'idempotency',
+            'labels',
+            'keyboard',
+            'contrast',
           ].includes(t.flowClass);
         return false;
       })

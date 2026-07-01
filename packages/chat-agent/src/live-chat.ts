@@ -9,6 +9,23 @@ import type {
 } from '@qa/shared';
 import { mergeCredentials, parseAuthFields, credentialsComplete, effectiveAuthState, authPromptForState } from './auth-chat.js';
 
+/** Parse key:value extras from free-form text. Returns null if nothing found. */
+function parseExtras(text: string, existing?: Record<string, string>): Record<string, string> | null {
+  if (/https?:\/\//i.test(text)) return null;
+  const KNOWN_CRED_KEYS = /^(email|user(?:name)?|pass(?:word)?|pwd|otp|code|api[- ]?key|bearer|login|account)$/i;
+  const extras: Record<string, string> = { ...(existing ?? {}) };
+  const matches = [...text.matchAll(/\b([a-zA-Z][a-zA-Z0-9_-]{1,29})\s*[:=]\s*([^\s,][^,\n]*?)(?=\s*[,\n]|$)/g)];
+  let added = false;
+  for (const m of matches) {
+    const key = m[1].trim().toLowerCase();
+    const value = m[2].trim();
+    if (KNOWN_CRED_KEYS.test(key) || !value || key.length < 2) continue;
+    extras[key] = value;
+    added = true;
+  }
+  return added ? extras : null;
+}
+
 function msg(role: ChatMessage['role'], content: string, meta?: ChatMessage['meta']): ChatMessage {
   return { id: randomUUID(), role, content, timestamp: new Date().toISOString(), meta };
 }
@@ -79,6 +96,15 @@ export function sessionEventToChatMessage(event: SessionEvent): ChatMessage | nu
 
     case 'session:paused':
       return msg('assistant', '⏸ Exploration paused.', { kind: 'status' });
+
+    case 'site:classified': {
+      const c = event.payload as { siteType: string; confidence: number; inferredJourneys: string[] };
+      return msg(
+        'assistant',
+        `🔍 Site classified as **${c.siteType}** (${Math.round(c.confidence * 100)}% confidence)\n\nJourneys queued: ${c.inferredJourneys.slice(0, 3).join(', ')}`,
+        { kind: 'progress' },
+      );
+    }
 
     default:
       return null;
@@ -166,6 +192,22 @@ export function processLiveMessage(
     return { messages, action: 'resume', credentials: merged };
   }
 
+  // Check for extra key:value inputs (card, phone, account, etc.) provided in response to pre-action prompts
+  const extrasPatch = parseExtras(userText, session.config.credentials?.extras);
+  if (extrasPatch) {
+    const existingCreds = session.config.credentials ?? { type: 'none' as const };
+    const merged: SessionCredentials = { ...existingCreds, extras: extrasPatch };
+    const keys = Object.keys(extrasPatch).join(', ');
+    messages.push(
+      msg(
+        'assistant',
+        `✅ Saved: **${keys}**\n\nThese will be used for any pending or upcoming risky actions. The agent will use this data in the next applicable flow.`,
+        { kind: 'status' },
+      ),
+    );
+    return { messages, action: 'update_auth', credentials: merged };
+  }
+
   if (/critical|show important/.test(text)) {
     const critical = session.findings.filter((f) => f.severity === 'critical' || f.severity === 'high');
     if (!critical.length) {
@@ -223,7 +265,16 @@ export class LiveChatStore {
   initSession(sessionId: string, targetUrl: string): ChatMessage[] {
     const welcome = msg(
       'assistant',
-      `Connected to **${targetUrl}**.\n\nI'll ask for login here if needed. You can send:\n- \`email: you@co.com password: secret\`\n- \`otp: 123456\``,
+      [
+        `Connected to **${targetUrl}**.`,
+        ``,
+        `I'll automatically run all tests. You can interact here at any time:`,
+        `- If login is needed I'll ask for credentials`,
+        `- Before risky actions (payment, purchase, sending a link) I'll ask for your confirmation`,
+        `- Reply with any missing data: \`card: 4111111111111111\`  \`phone: +91 9876543210\``,
+        ``,
+        `Say **"status"** to check progress or **"pause"** to stop.`,
+      ].join('\n'),
       { kind: 'status' },
     );
     this.histories.set(sessionId, [welcome]);

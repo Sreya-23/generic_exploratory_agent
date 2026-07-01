@@ -19,6 +19,19 @@ import { runEmptyStates } from './flows/empty-states.js';
 import { runBackDuringAction } from './flows/interruption.js';
 import { runJourneyFlow } from './flows/journey.js';
 import { runUserDirectedFlow } from './flows/user-directed.js';
+import { runViewport } from './flows/viewport.js';
+import { runErrorUi } from './flows/error-ui.js';
+import { runAutofill } from './flows/autofill.js';
+import { runFileUpload } from './flows/file-upload.js';
+import { runPaginationUi } from './flows/pagination-ui.js';
+import { runWizard } from './flows/wizard.js';
+import {
+  runForwardAfterBack,
+  runDeepLink,
+  runSessionTimeout,
+  runMultiTabLogout,
+} from './flows/session-flows.js';
+import { runGoldenPath, runVisualRegression } from './flows/regression.js';
 import { performLogin } from './auth/login.js';
 
 let sharedBrowser: Browser | null = null;
@@ -93,6 +106,30 @@ const FLOW_HANDLERS: Record<
   'prd-driven': runNavigation,
   'journey': runJourneyFlow,
   'user-directed': runUserDirectedFlow,
+  // A6 — Viewport
+  'viewport': runViewport,
+  // A9 — Error UI
+  'error-ui': runErrorUi,
+  // A10 — Autofill
+  'autofill': runAutofill,
+  // A11 — File Upload
+  'file-upload': runFileUpload,
+  // A12 — Pagination UI
+  'pagination-ui': runPaginationUi,
+  // A13 — Wizard
+  'wizard': runWizard,
+  // B2 — Forward after Back
+  'forward-after-back': runForwardAfterBack,
+  // B5 — Deep Link
+  'deep-link': runDeepLink,
+  // B6 — Session Timeout
+  'session-timeout': runSessionTimeout,
+  // B7 — Multi-tab Logout
+  'multi-tab-logout': runMultiTabLogout,
+  // H1 — Golden Path
+  'golden-path': runGoldenPath,
+  // H3 — Visual Regression
+  'visual-regression': runVisualRegression,
 };
 
 export class UiExecutor implements BaseExecutor {

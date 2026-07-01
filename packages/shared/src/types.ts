@@ -68,6 +68,8 @@ export interface SessionConfig {
   openApiUrl?: string;
   /** User-provided exploration instructions e.g. "test the payment flow", "send link to +91..." */
   flowInstructions?: string[];
+  /** Explicit list of flowClass strings to run (pinned from matrix IDs) */
+  selectedFlowClasses?: string[];
 }
 
 export interface Finding {
@@ -144,6 +146,7 @@ export type SessionEventType =
   | 'task:started'
   | 'task:completed'
   | 'site:classified'
+  | 'pre_action:required'
   | 'log'
   | 'chat:message'
   | 'chat:history'
@@ -172,6 +175,14 @@ export interface FormInfo {
   fields: string[];
 }
 
+export interface PreActionRequest {
+  /** Category of the risky action */
+  type: 'purchase' | 'payment' | 'send_link' | 'booking_confirm' | 'delete' | 'generic';
+  description: string;
+  /** Extra data keys the action requires (e.g. 'card', 'phone') */
+  requiredExtras?: string[];
+}
+
 export interface ExecutorContext {
   sessionId: string;
   config: SessionConfig;
@@ -180,6 +191,13 @@ export interface ExecutorContext {
   onFinding: (finding: Omit<Finding, 'id' | 'sessionId' | 'createdAt'>) => void;
   onLog: (message: string) => void;
   onClassification?: (c: SiteClassification) => void;
+  /**
+   * Called before any risky / irreversible action (purchase, payment, send link, etc.).
+   * Returns the extras data available (from credentials.extras) if the action can proceed,
+   * or null if the required data is missing and the action should be skipped.
+   * The orchestrator also emits a live chat message prompting the user to provide missing data.
+   */
+  onPreActionNeeded?: (req: PreActionRequest) => Record<string, string> | null;
 }
 
 export interface ExecutorResult {
@@ -222,6 +240,8 @@ export interface SetupDraft {
   credentialsAsked?: boolean;
   /** User-provided flow instructions */
   flowInstructions?: string[];
+  /** Explicitly selected matrix flow IDs (e.g. "A6", "B2", "C4") mapped to flowClass strings */
+  selectedFlowClasses?: string[];
 }
 
 export interface SetupChatResponse {
