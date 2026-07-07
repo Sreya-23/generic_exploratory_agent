@@ -5,6 +5,52 @@ import { isLoginWallPage, findVisibleErrorText } from './helpers.js';
 
 const BOUNDARY_INPUTS = ['', ' ', 'a', 'x'.repeat(500), '<script>alert(1)</script>', '🎉测试'];
 
+/**
+ * Classify whether an input field could trigger an external communication
+ * (email, SMS, WhatsApp, etc.) if filled with random data.
+ *
+ * Returns:
+ *   'high-risk'  — could send a real message/link to someone; NEVER use random data
+ *   'sensitive'  — PII that belongs to a real person; ask user for real value
+ *   'safe'       — generic test field; random/placeholder data is fine
+ */
+type InputRisk = 'high-risk' | 'sensitive' | 'safe';
+
+function classifyInputRisk(
+  name: string,
+  placeholder: string,
+  label: string,
+  inputType: string,
+): InputRisk {
+  const text = `${name} ${placeholder} ${label}`.toLowerCase();
+
+  // HIGH-RISK: filling these could trigger an actual message/email/notification to a real person
+  const highRiskPatterns = [
+    /recipient/i, /send to/i, /to:/i,
+    /whatsapp/i, /telegram/i,
+    /mobile.*number/i, /phone.*number/i, /contact.*number/i,
+    /sms/i, /notify/i,
+    /invite.*email/i, /share.*email/i, /email.*recipient/i,
+    /message.*to/i, /subject/i,
+  ];
+  if (highRiskPatterns.some((p) => p.test(text)) || inputType === 'tel') {
+    return 'high-risk';
+  }
+
+  // SENSITIVE: PII — should use real user-provided data, not random values
+  const sensitivePatterns = [
+    /\bemail\b/i, /\bphone\b/i, /\bmobile\b/i,
+    /\baddress\b/i, /\bpostcode\b/i, /\bzip\b/i, /\bpincode\b/i,
+    /\bcard\b/i, /\bcvv\b/i, /\biban\b/i, /\bbank\b/i, /\baccount.*no/i,
+    /\bdob\b/i, /\bbirthday\b/i, /\baadhar\b/i, /\bpassport\b/i, /\bpan\b/i,
+  ];
+  if (sensitivePatterns.some((p) => p.test(text)) || inputType === 'email') {
+    return 'sensitive';
+  }
+
+  return 'safe';
+}
+
 // Selectors that indicate visible validation feedback.
 // Covers: CSS class conventions, ARIA roles, data-test attributes (e.g. Sauce Demo),
 // and common framework patterns (Bootstrap, Material, Tailwind, custom).
@@ -65,6 +111,24 @@ export async function runFormValidation(
     const input = inputs.nth(i);
     const inputType = (await input.getAttribute('type')) ?? 'text';
     if (['checkbox', 'radio', 'file'].includes(inputType)) continue;
+
+    // Classify the field before touching it
+    const fieldName = (await input.getAttribute('name')) ?? '';
+    const fieldPlaceholder = (await input.getAttribute('placeholder')) ?? '';
+    const fieldId = (await input.getAttribute('id')) ?? '';
+    const fieldLabel = fieldId
+      ? ((await page.locator(`label[for="${fieldId}"]`).first().textContent().catch(() => '')) ?? '')
+      : '';
+    const risk = classifyInputRisk(fieldName, fieldPlaceholder, fieldLabel, inputType);
+
+    if (risk === 'high-risk') {
+      ctx.onLog(`[Forms] Field ${i} ("${fieldName || fieldPlaceholder}") is HIGH-RISK (could send real communication) — skipping random input`);
+      continue;
+    }
+    if (risk === 'sensitive') {
+      ctx.onLog(`[Forms] Field ${i} ("${fieldName || fieldPlaceholder}") is SENSITIVE PII — skipping random input, testing empty-submit only`);
+      // Still test empty submission for required validation — just don't fill with random data
+    }
 
     const hasRequired = (await input.getAttribute('required')) !== null;
     const hasAriaRequired = (await input.getAttribute('aria-required')) === 'true';

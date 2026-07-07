@@ -107,6 +107,13 @@ export async function runRecon(
     `[Recon] "${title}" — ${links.length} links, ${forms.length} forms, ${apiCalls.length} API calls`,
   );
 
+  // Share discovered API endpoints with the context so the API executor uses
+  // real endpoints instead of guessing generic paths like /api/users, /api/admin
+  if (apiCalls.length > 0) {
+    ctx.discoveredApiEndpoints = apiCalls;
+    ctx.onLog(`[Recon] Sharing ${apiCalls.length} real API endpoints with API executor`);
+  }
+
   // Collect signals and notify orchestrator for classification
   if (ctx.onClassification) {
     const signals = await collectIntelligenceSignals(page);

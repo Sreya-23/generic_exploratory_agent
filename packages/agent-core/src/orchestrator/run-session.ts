@@ -16,7 +16,7 @@ import { buildPlan, injectJourneyTasks } from '../planner/index.js';
 import { classifySite } from '../intelligence/classify-site.js';
 import { saveSessionState, writeReports } from '../reporter/index.js';
 import { parsePrd } from '@qa/prd-parser';
-import { UiExecutor, probeAuth } from '@qa/explorer-ui';
+import { UiExecutor, probeAuth, performSessionLogin } from '@qa/explorer-ui';
 import { ApiExecutor } from '@qa/explorer-api';
 import { ChaosExecutor } from '@qa/chaos-engine';
 
@@ -218,6 +218,45 @@ export class SessionOrchestrator {
     state.authState = 'ready';
     await saveSessionState(sessionsDir, state);
 
+    // ── Pre-session login (once, shared across all tasks) ─────────────────────
+    // Builds an ExecutorContext just for login so the OTP pre-action gate works.
+    if (state.config.credentials && state.config.credentials.type !== 'none') {
+      const loginCtx: ExecutorContext = {
+        sessionId,
+        config: state.config,
+        sessionsDir,
+        onFinding: () => {},
+        onLog: (message) => {
+          this.emit({ type: 'log', sessionId, timestamp: new Date().toISOString(), payload: { message } });
+        },
+        onPreActionNeeded: (req: PreActionRequest): Record<string, string> | null => {
+          const extras = state.config.credentials?.extras ?? {};
+          const otp = extras['otp'];
+          if (req.type === 'otp' && !otp) {
+            this.emit({
+              type: 'pre_action:required',
+              sessionId,
+              timestamp: new Date().toISOString(),
+              payload: {
+                request: req,
+                missing: ['otp'],
+                prompt:
+                  '🔐 **OTP sent to your phone.** Enter the code in the chat to continue login.\n\n' +
+                  'Reply with: `otp: 123456`',
+              },
+            });
+            return null;
+          }
+          return otp ? { otp } : null;
+        },
+      };
+      const loginOk = await performSessionLogin(loginCtx);
+      if (!loginOk) {
+        loginCtx.onLog('[Auth] Pre-session login failed or waiting for OTP — tasks will attempt re-login individually');
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     this.runTasks(sessionId, sessionsDir, abort.signal).catch((err) => {
       state.status = 'failed';
       state.error = (err as Error).message;
@@ -284,6 +323,7 @@ export class SessionOrchestrator {
         config: state.config,
         sessionsDir,
         classification: state.classification,
+        discoveredApiEndpoints: state.discoveredApiEndpoints,
         onFinding: (partial) => {
           const finding: Finding = {
             ...partial,
@@ -309,6 +349,14 @@ export class SessionOrchestrator {
         },
         onPreActionNeeded: (req: PreActionRequest): Record<string, string> | null => {
           const extras = state.config.credentials?.extras ?? {};
+
+          // User explicitly said "skip" in live chat — honour it for this action
+          if (extras['_user_skip'] === 'true') {
+            // Clear the skip flag after consuming it once
+            delete extras['_user_skip'];
+            return null;
+          }
+
           const missing = (req.requiredExtras ?? []).filter((k) => !extras[k]);
 
           if (missing.length > 0) {
@@ -371,6 +419,13 @@ export class SessionOrchestrator {
       if (executor) {
         try {
           await executor.execute(task, ctx);
+          // Persist any newly discovered API endpoints back to session state
+          // so subsequent tasks (API executor) can use them
+          if (ctx.discoveredApiEndpoints && ctx.discoveredApiEndpoints.length > 0) {
+            const existing = new Set(state.discoveredApiEndpoints ?? []);
+            for (const e of ctx.discoveredApiEndpoints) existing.add(e);
+            state.discoveredApiEndpoints = [...existing];
+          }
         } catch (err) {
           ctx.onLog(`Task failed: ${(err as Error).message}`);
         }

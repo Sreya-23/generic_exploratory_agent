@@ -1,5 +1,6 @@
 import { join } from 'node:path';
-import { chromium, type Browser, type Page } from 'playwright';
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import type {
   BaseExecutor,
   ExecutorContext,
@@ -43,12 +44,39 @@ async function getBrowser(): Promise<Browser> {
   return sharedBrowser;
 }
 
-async function createPage(ctx: ExecutorContext): Promise<Page> {
+/**
+ * Save authenticated session state (cookies + storage) to disk so all
+ * subsequent tasks can restore it instead of re-logging in.
+ */
+async function saveSessionState(context: BrowserContext, sessionDir: string): Promise<void> {
+  const stateFile = join(sessionDir, 'auth-state.json');
+  const state = await context.storageState();
+  writeFileSync(stateFile, JSON.stringify(state, null, 2));
+}
+
+/**
+ * Returns the path to a saved session state, or null if none exists.
+ */
+function savedSessionStatePath(ctx: ExecutorContext): string | null {
+  const stateFile = join(ctx.sessionsDir, ctx.sessionId, 'auth-state.json');
+  return existsSync(stateFile) ? stateFile : null;
+}
+
+async function createPage(ctx: ExecutorContext, restoreAuth = true): Promise<Page> {
   const browser = await getBrowser();
-  const context = await browser.newContext({
+
+  // Restore authenticated session state if available (avoids re-login for every task)
+  const savedState = restoreAuth ? savedSessionStatePath(ctx) : null;
+  const contextOptions: Parameters<Browser['newContext']>[0] = {
     ignoreHTTPSErrors: true,
     viewport: { width: 1280, height: 720 },
-  });
+  };
+
+  if (savedState) {
+    contextOptions.storageState = savedState;
+  }
+
+  const context = await browser.newContext(contextOptions);
 
   const { config } = ctx;
   if (config.credentials?.type === 'bearer' && config.credentials.bearerToken) {
@@ -61,25 +89,224 @@ async function createPage(ctx: ExecutorContext): Promise<Page> {
   return page;
 }
 
+/**
+ * Perform login ONCE at session start, save the resulting session state.
+ * For OTP flows: fills phone/email, triggers OTP send, then pauses via
+ * onPreActionNeeded to collect the code from the user before completing login.
+ */
+export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean> {
+  const creds = ctx.config.credentials;
+  if (!creds || creds.type === 'none') return true;
+  if (creds.type === 'bearer' || creds.type === 'api-key') return true;
+
+  const sessionDir = join(ctx.sessionsDir, ctx.sessionId);
+  mkdirSync(sessionDir, { recursive: true });
+
+  // Already logged in from a previous attempt
+  if (existsSync(join(sessionDir, 'auth-state.json'))) {
+    ctx.onLog('[Auth] Restoring saved session state');
+    return true;
+  }
+
+  const browser = await getBrowser();
+  const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 } });
+  const page = await context.newPage();
+
+  try {
+    ctx.onLog(`[Auth] Navigating to ${ctx.config.targetUrl}`);
+    await page.goto(ctx.config.targetUrl, { waitUntil: 'load', timeout: 30000 }).catch(() =>
+      page.goto(ctx.config.targetUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }),
+    );
+    await page.waitForTimeout(1500);
+
+    const method = creds.authMethod ?? 'password';
+
+    // ── OAuth / SSO — inject session cookies provided by user from DevTools ──
+    if (method === 'oauth' || method === 'saml') {
+      if (creds.cookieString) {
+        ctx.onLog('[Auth/OAuth] Injecting session cookies from user');
+        const origin = new URL(ctx.config.targetUrl).origin;
+        const cookiePairs = creds.cookieString.split(';').map((s) => s.trim()).filter(Boolean);
+        for (const pair of cookiePairs) {
+          const eqIdx = pair.indexOf('=');
+          if (eqIdx === -1) continue;
+          const name = pair.slice(0, eqIdx).trim();
+          const value = pair.slice(eqIdx + 1).trim();
+          await context.addCookies([{ name, value, url: origin }]);
+        }
+        // Reload with injected cookies
+        await page.reload({ waitUntil: 'load' }).catch(() => {});
+        await page.waitForTimeout(1000);
+      } else if (creds.bearerToken) {
+        ctx.onLog('[Auth/OAuth] Bearer token will be used via header injection');
+        // Bearer token is already set at context level by createPage()
+      } else {
+        ctx.onLog('[Auth/OAuth] No cookies or bearer token provided — cannot complete OAuth login');
+        await context.close();
+        return false;
+      }
+      await saveSessionState(context, sessionDir);
+      ctx.onLog(`[Auth/OAuth] Session saved. Post-login URL: ${page.url()}`);
+      await context.close();
+      return true;
+    }
+
+    // ── Magic-link — navigate to the URL the user received in their email ───
+    if (method === 'magic-link') {
+      if (creds.magicLinkUrl) {
+        ctx.onLog(`[Auth/MagicLink] Navigating to magic link URL`);
+        await page.goto(creds.magicLinkUrl, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
+        await page.waitForTimeout(2000);
+      } else {
+        // Phase 1: trigger the magic link send
+        ctx.onLog('[Auth/MagicLink] Phase 1: filling email to trigger magic link');
+        await fillFirstMatchOnPage(page, [
+          'input[type="email"]', 'input[name*="email" i]', 'input[type="text"]',
+        ], creds.username ?? '');
+        await clickSubmitOnPage(page);
+        await page.waitForTimeout(1500);
+
+        // Pause — ask user to paste the magic link URL
+        const extras = ctx.onPreActionNeeded?.({
+          type: 'magic-link' as 'generic',
+          description: 'Magic link sent to your email. Paste the full login URL here.',
+          requiredExtras: ['magic-link'],
+        });
+
+        const linkUrl = extras?.['magic-link'];
+        if (!linkUrl) {
+          ctx.onLog('[Auth/MagicLink] Magic link URL not provided — login paused');
+          await context.close();
+          return false;
+        }
+        await page.goto(linkUrl, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
+        await page.waitForTimeout(2000);
+      }
+      await saveSessionState(context, sessionDir);
+      ctx.onLog(`[Auth/MagicLink] Session saved. Post-login URL: ${page.url()}`);
+      await context.close();
+      return true;
+    }
+
+    const isOtpFlow = method === 'otp' || method === 'password-otp';
+
+    if (isOtpFlow && !creds.otp) {
+      // Phase 1 — fill identifier (phone/email) and trigger OTP send
+      ctx.onLog('[Auth/OTP] Phase 1: filling identifier to trigger OTP');
+      const filled = await fillFirstMatchOnPage(page, [
+        'input[type="tel"]',
+        'input[name*="phone" i]',
+        'input[name*="mobile" i]',
+        'input[placeholder*="phone" i]',
+        'input[placeholder*="mobile" i]',
+        'input[type="email"]',
+        'input[name*="email" i]',
+        'input[name*="user" i]',
+        'input[type="text"]',
+      ], creds.username ?? '');
+
+      if (!filled) {
+        ctx.onLog('[Auth/OTP] Could not find phone/email input — skipping login');
+        await context.close();
+        return false;
+      }
+
+      await clickSubmitOnPage(page);
+      await page.waitForTimeout(2000); // Give site time to send OTP and show OTP field
+
+      // Phase 2 — pause and collect OTP from user via live chat
+      const extras = ctx.onPreActionNeeded?.({
+        type: 'otp',
+        description: 'OTP sent to your phone. Enter the code to continue.',
+        requiredExtras: ['otp'],
+      });
+
+      const otp = extras?.['otp'];
+      if (!otp) {
+        ctx.onLog('[Auth/OTP] OTP not provided — login paused. Enter your OTP in the chat.');
+        await context.close();
+        return false;
+      }
+
+      // Fill OTP
+      const filledOtp = await fillFirstMatchOnPage(page, [
+        'input[autocomplete="one-time-code"]',
+        'input[name*="otp" i]',
+        'input[id*="otp" i]',
+        'input[name*="code" i]',
+        'input[placeholder*="otp" i]',
+        'input[placeholder*="code" i]',
+        'input[type="text"]',
+      ], otp);
+
+      if (!filledOtp) {
+        ctx.onLog('[Auth/OTP] OTP field not found after waiting — login failed');
+        await context.close();
+        return false;
+      }
+
+      await clickSubmitOnPage(page);
+      await page.waitForTimeout(2000);
+      ctx.onLog('[Auth/OTP] OTP submitted');
+    } else {
+      // Standard password login
+      const result = await performLogin(page, creds);
+      ctx.onLog(`[Auth] ${result.message}`);
+      if (!result.success) {
+        await context.close();
+        return false;
+      }
+    }
+
+    // Save authenticated session state for all tasks
+    await saveSessionState(context, sessionDir);
+    const postLoginUrl = page.url();
+    ctx.onLog(`[Auth] Session saved. Post-login URL: ${postLoginUrl}`);
+    await context.close();
+    return true;
+  } catch (err) {
+    ctx.onLog(`[Auth] Login error: ${(err as Error).message}`);
+    await context.close();
+    return false;
+  }
+}
+
+async function fillFirstMatchOnPage(page: Page, selectors: string[], value: string): Promise<boolean> {
+  for (const sel of selectors) {
+    const loc = page.locator(sel).first();
+    if ((await loc.count()) > 0 && await loc.isVisible().catch(() => false)) {
+      await loc.fill(value);
+      return true;
+    }
+  }
+  return false;
+}
+
+async function clickSubmitOnPage(page: Page): Promise<void> {
+  const submit = page.locator(
+    'button[type="submit"], input[type="submit"], ' +
+    'button:has-text("Continue"), button:has-text("Send OTP"), button:has-text("Get OTP"), ' +
+    'button:has-text("Log in"), button:has-text("Sign in"), button:has-text("Login"), ' +
+    'button:has-text("Verify"), button:has-text("Submit"), button:has-text("Next")',
+  ).first();
+  if ((await submit.count()) > 0) {
+    await submit.click().catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+  }
+}
+
 async function loginIfNeeded(page: Page, ctx: ExecutorContext): Promise<void> {
+  // Session-level login is now handled by performSessionLogin() before tasks start.
+  // If auth-state.json exists, the page already has session cookies restored via
+  // createPage(). This function is kept as a safety fallback for edge cases only.
+  const statePath = savedSessionStatePath(ctx);
+  if (statePath) return; // Session already restored via storageState in createPage()
+
   const creds = ctx.config.credentials;
   if (!creds || creds.type === 'none') return;
 
   const result = await performLogin(page, creds);
-  ctx.onLog(`[Auth] ${result.message}`);
-  if (!result.success && result.needsOtp) {
-    ctx.onFinding({
-      severity: 'high',
-      area: 'Auth-OTP',
-      title: 'OTP required to continue login',
-      steps: ['Enter password', 'Observe OTP prompt'],
-      expected: 'OTP provided in session credentials',
-      actual: 'OTP field appeared — provide OTP in chat to continue',
-      evidence: [],
-      reproRate: '1/1',
-      automationCandidate: false,
-    });
-  }
+  ctx.onLog(`[Auth/fallback] ${result.message}`);
 }
 
 async function screenshot(page: Page, ctx: ExecutorContext, name: string): Promise<string> {

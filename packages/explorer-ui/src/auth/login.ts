@@ -116,8 +116,21 @@ export async function detectLoginWall(page: Page): Promise<boolean> {
   const hasOtp = (await page.locator(
     'input[autocomplete="one-time-code"], input[name*="otp" i], input[id*="code" i]',
   ).count()) > 0;
-  const hasLoginBtn = (await page.locator(
-    'button:has-text("Log in"), button:has-text("Sign in"), button:has-text("Login")',
+  // Phone-based login (no password field — common in consumer apps)
+  const hasPhone = (await page.locator(
+    'input[type="tel"], input[name*="phone" i], input[name*="mobile" i], ' +
+    'input[placeholder*="phone" i], input[placeholder*="mobile" i]',
   ).count()) > 0;
-  return hasPassword || (hasOtp && hasLoginBtn);
+  const hasLoginBtn = (await page.locator(
+    'button:has-text("Log in"), button:has-text("Sign in"), button:has-text("Login"), ' +
+    'button:has-text("Continue"), button:has-text("Send OTP"), button:has-text("Get OTP"), ' +
+    'button[type="submit"]',
+  ).count()) > 0;
+  // Also check URL path as a fast signal
+  const urlPath = page.url().toLowerCase();
+  const urlHintsLogin =
+    urlPath.includes('/login') || urlPath.includes('/signin') ||
+    urlPath.includes('/sign-in') || urlPath.includes('/auth');
+
+  return hasPassword || (hasOtp && hasLoginBtn) || (hasPhone && hasLoginBtn) || urlHintsLogin;
 }

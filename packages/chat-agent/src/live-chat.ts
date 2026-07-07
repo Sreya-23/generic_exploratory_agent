@@ -192,12 +192,34 @@ export function processLiveMessage(
     return { messages, action: 'resume', credentials: merged };
   }
 
+  // Handle explicit "skip" reply to a pre-action gate prompt
+  // User says: "skip", "no", "skip this", "don't do it", "ignore", "cancel"
+  const isSkipReply = /^(skip|no|cancel|ignore|don'?t|not now|pass)\b/i.test(userText.trim());
+  if (isSkipReply) {
+    const existingCreds = session.config.credentials ?? { type: 'none' as const };
+    const skipExtras: Record<string, string> = {
+      ...(existingCreds.extras ?? {}),
+      _user_skip: 'true',  // flag that the user explicitly chose to skip the pending action
+    };
+    const merged: SessionCredentials = { ...existingCreds, extras: skipExtras };
+    messages.push(
+      msg(
+        'assistant',
+        '⏭️ Got it — skipping that action. The agent will move on to the next test.',
+        { kind: 'status' },
+      ),
+    );
+    return { messages, action: 'update_auth', credentials: merged };
+  }
+
   // Check for extra key:value inputs (card, phone, account, etc.) provided in response to pre-action prompts
   const extrasPatch = parseExtras(userText, session.config.credentials?.extras);
   if (extrasPatch) {
+    // Clear any previous skip flag if user is now providing data
+    delete extrasPatch['_user_skip'];
     const existingCreds = session.config.credentials ?? { type: 'none' as const };
     const merged: SessionCredentials = { ...existingCreds, extras: extrasPatch };
-    const keys = Object.keys(extrasPatch).join(', ');
+    const keys = Object.keys(extrasPatch).filter((k) => !k.startsWith('_')).join(', ');
     messages.push(
       msg(
         'assistant',

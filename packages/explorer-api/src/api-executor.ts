@@ -26,19 +26,27 @@ function buildHeaders(ctx: ExecutorContext): Record<string, string> {
 
 async function probe(
   baseUrl: string,
-  probe: ApiProbe,
+  p: ApiProbe,
   headers: Record<string, string>,
-): Promise<{ status: number; body: string }> {
-  const url = new URL(probe.path, baseUrl).toString();
+): Promise<{ status: number; body: string; isJson: boolean; contentType: string }> {
+  const url = new URL(p.path, baseUrl).toString();
   const res = await fetch(url, {
-    method: probe.method,
-    headers: { ...headers, ...probe.headers },
-    body: probe.body ? JSON.stringify(probe.body) : undefined,
+    method: p.method,
+    headers: { ...headers, ...p.headers },
+    body: p.body ? JSON.stringify(p.body) : undefined,
     signal: AbortSignal.timeout(10000),
   });
+  const contentType = res.headers.get('content-type') ?? '';
   const body = await res.text().catch(() => '');
-  return { status: res.status, body: body.slice(0, 500) };
+  // Determine if this is actually a JSON API response vs SPA catch-all HTML
+  const isJson =
+    contentType.includes('application/json') ||
+    (body.trimStart().startsWith('{') || body.trimStart().startsWith('['));
+  return { status: res.status, body: body.slice(0, 500), isJson, contentType };
 }
+
+// Public endpoints that are intentionally unauthenticated — should never be flagged HIGH
+const PUBLIC_ENDPOINTS = new Set(['/health', '/api/health', '/api/status', '/ping', '/api/ping', '/status']);
 
 const COMMON_PATHS = ['/api', '/api/v1', '/api/health', '/health', '/api/users', '/api/status'];
 
@@ -48,7 +56,13 @@ export class ApiExecutor implements BaseExecutor {
 
   async execute(task: FlowTask, ctx: ExecutorContext): Promise<ExecutorResult> {
     let findingsCount = 0;
-    const baseUrl = ctx.config.targetUrl;
+
+    // Always use the site ORIGIN — strip path/login suffix from targetUrl
+    // e.g. "https://web.dev.cofee.life/login" → "https://web.dev.cofee.life"
+    const baseUrl = (() => {
+      try { return new URL(ctx.config.targetUrl).origin; } catch { return ctx.config.targetUrl; }
+    })();
+
     const headers = buildHeaders(ctx);
 
     ctx.onLog(`[API] Starting: ${task.title}`);
@@ -59,7 +73,7 @@ export class ApiExecutor implements BaseExecutor {
       }
 
       if (task.flowClass === 'auth-matrix' || task.flowClass === 'auth-bypass') {
-        findingsCount += await this.testAuthMatrix(baseUrl, ctx);
+        findingsCount += await this.testAuthMatrix(baseUrl, ctx, headers);
       }
 
       if (task.flowClass === 'pagination') {
@@ -109,30 +123,42 @@ export class ApiExecutor implements BaseExecutor {
     }
   }
 
+  // Track which auth findings have already been reported to prevent duplicates
+  // (auth-matrix and auth-bypass both run testAuthMatrix)
+  private reportedAuthPaths = new Set<string>();
+  private reportedPrivilegePaths = new Set<string>();
+
   private async probeCommonEndpoints(
     baseUrl: string,
     headers: Record<string, string>,
     ctx: ExecutorContext,
   ): Promise<number> {
     let count = 0;
-    for (const path of COMMON_PATHS) {
-      try {
-        const { status } = await probe(baseUrl, { method: 'GET', path }, headers);
-        ctx.onLog(`[API] GET ${path} → ${status}`);
 
-        if (status === 200) {
+    // Prefer real endpoints from recon; fall back to generic guesses
+    const pathsToProbe = this.resolveEndpointPaths(ctx, COMMON_PATHS);
+    ctx.onLog(`[API] Probing ${pathsToProbe.length} endpoints on ${baseUrl}`);
+
+    for (const path of pathsToProbe) {
+      try {
+        const { status, isJson, contentType } = await probe(baseUrl, { method: 'GET', path }, headers);
+        ctx.onLog(`[API] GET ${path} → ${status} (${contentType.split(';')[0]})`);
+
+        if (status === 200 && isJson) {
           ctx.onFinding({
             severity: 'info',
             area: 'API-Discovery',
-            title: `Discovered endpoint: GET ${path}`,
+            title: `Discovered JSON API endpoint: GET ${path}`,
             steps: [`GET ${path}`],
             expected: 'Endpoint exists',
-            actual: `HTTP 200`,
+            actual: `HTTP 200 with JSON response`,
             evidence: [],
             reproRate: '1/1',
             automationCandidate: true,
           });
           count++;
+        } else if (status === 200 && !isJson) {
+          ctx.onLog(`[API] GET ${path} → 200 HTML (SPA catch-all) — not a real API endpoint`);
         }
       } catch {
         /* endpoint may not exist */
@@ -141,30 +167,75 @@ export class ApiExecutor implements BaseExecutor {
     return count;
   }
 
-  private async testAuthMatrix(baseUrl: string, ctx: ExecutorContext): Promise<number> {
+  private async testAuthMatrix(
+    baseUrl: string,
+    ctx: ExecutorContext,
+    headers: Record<string, string>,
+  ): Promise<number> {
     let count = 0;
-    for (const path of COMMON_PATHS.slice(0, 3)) {
+
+    // Use real discovered endpoints; fall back to guesses minus known-public health endpoints
+    const fallbackPaths = COMMON_PATHS.filter((p) => !PUBLIC_ENDPOINTS.has(p));
+    const pathsToTest = this.resolveEndpointPaths(ctx, fallbackPaths).slice(0, 5);
+
+    for (const path of pathsToTest) {
+      if (this.reportedAuthPaths.has(path)) continue; // Deduplicate
+
       try {
-        const { status } = await probe(baseUrl, { method: 'GET', path }, {});
-        if (status === 200) {
+        // Test without ANY auth headers to check if endpoint is truly protected
+        const { status, isJson } = await probe(baseUrl, { method: 'GET', path }, {});
+
+        if (status === 200 && isJson) {
+          this.reportedAuthPaths.add(path);
           ctx.onFinding({
             severity: 'high',
             area: 'API-Auth',
-            title: `Unauthenticated access to ${path}`,
-            steps: [`GET ${path} without auth headers`],
-            expected: '401 or 403',
-            actual: `HTTP ${status} without credentials`,
+            title: `Unauthenticated access to JSON API: ${path}`,
+            steps: [`GET ${baseUrl}${path} without auth headers`],
+            expected: 'HTTP 401 or 403',
+            actual: `HTTP ${status} — returns JSON data without credentials`,
             evidence: [],
             reproRate: '1/1',
             automationCandidate: true,
           });
           count++;
+        } else if (status === 401 || status === 403) {
+          ctx.onLog(`[API-Auth] ${path} → ${status} — correctly protected`);
+        } else if (status === 200 && !isJson) {
+          ctx.onLog(`[API-Auth] ${path} → 200 HTML (SPA catch-all) — not a real API endpoint`);
         }
       } catch {
         /* ignore */
       }
     }
     return count;
+  }
+
+  /**
+   * Returns paths to probe, preferring those actually discovered by recon
+   * from the site's real network traffic. Falls back to generic guesses only
+   * when recon found nothing.
+   */
+  private resolveEndpointPaths(ctx: ExecutorContext, fallback: string[]): string[] {
+    const discovered = ctx.discoveredApiEndpoints ?? [];
+    if (discovered.length > 0) {
+      // Extract just the path portion from "GET https://..." or "GET /path"
+      const paths = discovered.map((e) => {
+        try {
+          const parts = e.split(' ');
+          const urlPart = parts[1] ?? parts[0];
+          return urlPart.startsWith('http') ? new URL(urlPart).pathname : urlPart;
+        } catch { return null; }
+      }).filter((p): p is string => Boolean(p) && p !== '/');
+
+      const unique = [...new Set(paths)].slice(0, 10);
+      if (unique.length > 0) {
+        ctx.onLog(`[API] Using ${unique.length} recon-discovered endpoints instead of generic guesses`);
+        return unique;
+      }
+    }
+    ctx.onLog(`[API] No recon endpoints available — using ${fallback.length} generic path guesses`);
+    return fallback;
   }
 
   private async testPagination(
@@ -213,24 +284,27 @@ export class ApiExecutor implements BaseExecutor {
 
     for (const id of ids) {
       try {
-        const { status } = await probe(
+        const { status, isJson } = await probe(
           baseUrl,
           { method: 'GET', path: `/api/users/${id}` },
           headers,
         );
-        if (status === 200) {
+        if (status === 200 && isJson) {
+          // Only flag if JSON — HTML means SPA, not an actual user data endpoint
           ctx.onFinding({
             severity: 'info',
             area: 'API-Security',
-            title: `User resource accessible: /api/users/${id}`,
+            title: `User resource returns JSON: /api/users/${id}`,
             steps: [`GET /api/users/${id}`],
-            expected: 'Proper authorization check',
-            actual: `HTTP 200 — verify caller is authorized for this resource`,
+            expected: 'Proper authorization check on user data',
+            actual: `HTTP 200 with JSON — verify caller is authorized for this resource`,
             evidence: [],
             reproRate: '1/1',
             automationCandidate: true,
           });
           count++;
+        } else if (status === 200 && !isJson) {
+          ctx.onLog(`[IDOR] /api/users/${id} → 200 HTML (SPA catch-all) — not a real endpoint`);
         }
       } catch {
         /* ignore */
@@ -247,19 +321,24 @@ export class ApiExecutor implements BaseExecutor {
     // Discover a responsive endpoint on the TARGET site to probe for rate limiting.
     // Prefer an API-like path; fall back to the root. Never use /api/health which
     // is the agent's own backend, not the site under test.
+    // Find a real JSON API path to rate-limit test; fall back to root if none found
     const candidatePaths = ['/api/v1', '/api', '/api/status', '/api/health', '/'];
     let probePath = '/';
 
     for (const p of candidatePaths) {
       try {
-        const { status } = await probe(baseUrl, { method: 'GET', path: p }, headers);
-        if (status !== 404 && status !== 0) {
+        const { status, isJson } = await probe(baseUrl, { method: 'GET', path: p }, headers);
+        if (status !== 404 && status !== 0 && isJson) {
           probePath = p;
           break;
         }
       } catch {
         // try next
       }
+    }
+    // If no JSON endpoint found, always use root for rate-limit baseline
+    if (probePath === '/' ) {
+      ctx.onLog('[RateLimit] No JSON API endpoint found — testing rate limit on root URL');
     }
 
     ctx.onLog(`[RateLimit] Sending 20 rapid GET ${probePath} to ${baseUrl}`);
@@ -305,28 +384,41 @@ export class ApiExecutor implements BaseExecutor {
     let count = 0;
 
     for (const path of adminPaths) {
+      // Deduplicate across horizontal-privilege and vertical-privilege
+      const dedupKey = `${flowClass}-${path}`;
+      if (this.reportedPrivilegePaths.has(path)) continue;
+
       try {
-        const { status } = await probe(baseUrl, { method: 'GET', path }, headers);
-        if (status === 200) {
+        const { status, isJson } = await probe(baseUrl, { method: 'GET', path }, headers);
+
+        if (status === 200 && isJson) {
+          // Only flag if the response is actually JSON — HTML means SPA catch-all
+          this.reportedPrivilegePaths.add(path);
           const severity = flowClass === 'vertical-privilege' ? 'high' : 'medium';
           ctx.onFinding({
             severity,
             area: 'Security-Privilege',
-            title: `Privileged endpoint accessible: ${path}`,
+            title: `Privileged JSON API endpoint accessible without proper auth: ${path}`,
             steps: [
               flowClass === 'vertical-privilege'
                 ? 'Use non-admin credentials'
                 : 'Use another user\'s credentials',
               `GET ${path}`,
+              'Check response is JSON and contains sensitive data',
             ],
             expected: '403 Forbidden — resource restricted to authorized roles',
-            actual: `HTTP 200 returned for ${path} — verify role-based access control`,
+            actual: `HTTP 200 with JSON data for ${path} — verify role-based access control`,
             evidence: [],
             reproRate: '1/1',
             automationCandidate: true,
           });
           count++;
+        } else if (status === 200 && !isJson) {
+          ctx.onLog(`[Privilege] ${path} → 200 but HTML (SPA catch-all) — not a real API endpoint, skipping`);
+        } else if (status === 403 || status === 401) {
+          ctx.onLog(`[Privilege] ${path} → ${status} — correctly protected`);
         }
+        this.reportedPrivilegePaths.add(dedupKey);
       } catch {
         /* ignore */
       }

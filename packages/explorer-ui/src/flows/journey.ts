@@ -174,6 +174,82 @@ async function findSemanticButton(
   return null;
 }
 
+/**
+ * Sensitive action gate — checks if a button's label implies sending a real external
+ * communication (email, SMS, WhatsApp, invite, payment, link-share, etc.).
+ *
+ * If the action is sensitive AND the user hasn't provided the required data,
+ * the gate emits a live-chat prompt and returns false (skip the click).
+ * If data is provided, returns true (proceed).
+ */
+async function gateIfSensitive(
+  page: Page,
+  ctx: ExecutorContext,
+  buttonLabel: string,
+): Promise<boolean> {
+  const label = buttonLabel.toLowerCase();
+
+  const isExternalComm =
+    /\bsend\b/.test(label) ||
+    /\bshare\b/.test(label) ||
+    /\binvite\b/.test(label) ||
+    /\bwhatsapp\b/.test(label) ||
+    /\bsms\b/.test(label) ||
+    /\bemail\b/.test(label) ||
+    /\bnotif(y|ication)\b/.test(label) ||
+    /\bmessage\b/.test(label) ||
+    /\bforward\b/.test(label) ||
+    /\bsubmit.*order\b/.test(label) ||
+    /\bplace.*order\b/.test(label) ||
+    /\bpay\b/.test(label) ||
+    /\btransfer\b/.test(label);
+
+  if (!isExternalComm) return true; // Not sensitive, proceed
+
+  // Check what data is already available in extras
+  const extras = ctx.config.credentials?.extras ?? {};
+
+  // If user explicitly said "skip" in chat, honour it
+  if (extras['_user_skip'] === 'true') {
+    ctx.onLog(`[Journey] Action "${buttonLabel}" skipped — user requested skip`);
+    return false;
+  }
+
+  // Determine what extra we need based on the action type
+  let requiredKey = 'confirm';
+  let actionType: 'send_link' | 'payment' | 'purchase' | 'generic' = 'generic';
+
+  if (/pay|transfer/.test(label)) {
+    actionType = 'payment';
+    requiredKey = 'confirm';
+  } else if (/order/.test(label)) {
+    actionType = 'purchase';
+    requiredKey = 'confirm';
+  } else if (/send|share|invite|whatsapp|sms|email|message|forward/.test(label)) {
+    actionType = 'send_link';
+    requiredKey = 'recipient';
+  }
+
+  if (extras[requiredKey]) return true; // User already provided data
+
+  // Emit gate — pause and ask user
+  const provided = ctx.onPreActionNeeded?.({
+    type: actionType,
+    description: `"${buttonLabel}" — this will send a real communication or payment`,
+    requiredExtras: [requiredKey],
+  });
+
+  if (provided && provided[requiredKey]) {
+    // Merge provided value into config extras for use by the flow
+    ctx.config.credentials = ctx.config.credentials ?? { type: 'none' };
+    ctx.config.credentials.extras = { ...extras, ...provided };
+    return true;
+  }
+
+  ctx.onLog(`[Journey] Skipped sensitive action "${buttonLabel}" — user did not provide required data`);
+  return false;
+}
+
 // ── Ecommerce ─────────────────────────────────────────────────────────────────
 
 async function runEcommerceJourney(page: Page, ctx: ExecutorContext): Promise<void> {
@@ -698,23 +774,33 @@ async function runSocialJourney(page: Page, ctx: ExecutorContext): Promise<void>
     ctx.onLog('[Journey/social] Opened profile page');
   }
 
-  // Try liking/following — pre-action gate
+  // Like/Follow — low-risk, proceed directly
   const interactBtn = page.locator(
     'button:has-text("Follow"), button[aria-label*="like" i], button:has-text("Like")',
   ).first();
 
   if (await interactBtn.count() > 0) {
-    const extras = ctx.onPreActionNeeded?.({
-      type: 'generic',
-      description: 'Interact with social content (follow/like)',
-      requiredExtras: [],
-    });
+    await interactBtn.click();
+    await page.waitForTimeout(500);
+    await shot(page, ctx, 'social-after-interact');
+    ctx.onLog('[Journey/social] Like/Follow clicked');
+  }
 
-    if (extras !== null) {
-      await interactBtn.click();
+  // Send / Share / Message — HIGH-RISK, always gate
+  const sendButtons = await page.locator(
+    'button:has-text("Send"), button:has-text("Share"), button:has-text("Message"), ' +
+    'button:has-text("Invite"), button:has-text("Forward")',
+  ).all();
+
+  for (const btn of sendButtons.slice(0, 3)) {
+    const label = (await btn.textContent().catch(() => ''))?.trim() ?? 'Send';
+    const proceed = await gateIfSensitive(page, ctx, label);
+    if (proceed) {
+      await btn.click().catch(() => {});
       await page.waitForTimeout(500);
-      await shot(page, ctx, 'social-after-interact');
-      ctx.onLog('[Journey/social] Interaction button clicked');
+      await shot(page, ctx, `social-${label.toLowerCase().replace(/\s+/g, '-')}`);
+      ctx.onLog(`[Journey/social] "${label}" clicked after user confirmation`);
+      break; // One send action per session is enough
     }
   }
 }

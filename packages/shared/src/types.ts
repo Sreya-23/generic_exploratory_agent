@@ -23,7 +23,17 @@ export type Severity = 'critical' | 'high' | 'medium' | 'low' | 'info';
 
 export type CredentialType = 'none' | 'login' | 'api-key' | 'bearer';
 
-export type AuthMethod = 'none' | 'password' | 'otp' | 'password-otp' | 'api-key' | 'bearer' | 'unknown';
+export type AuthMethod =
+  | 'none'
+  | 'password'
+  | 'otp'           // phone/email → OTP code
+  | 'password-otp'  // password + TOTP/OTP second factor
+  | 'magic-link'    // email → click link in email
+  | 'oauth'         // Google / Apple / Facebook / Microsoft SSO
+  | 'saml'          // enterprise SSO / SAML redirect
+  | 'api-key'
+  | 'bearer'
+  | 'unknown';
 
 export interface SessionCredentials {
   type: CredentialType;
@@ -33,6 +43,15 @@ export interface SessionCredentials {
   otp?: string;
   apiKey?: string;
   bearerToken?: string;
+  /**
+   * Raw cookie string (for OAuth/SAML where the user pastes cookies from DevTools).
+   * Format: "name=value; name2=value2"
+   */
+  cookieString?: string;
+  /**
+   * Magic-link redirect URL — the user pastes the link from their email.
+   */
+  magicLinkUrl?: string;
   /** Any extra site-specific inputs: phone, card number, account ID, merchant ID, etc. */
   extras?: Record<string, string>;
 }
@@ -45,6 +64,9 @@ export interface AuthProbeResult {
   hasPasswordField: boolean;
   hasOtpField: boolean;
   hasUsernameField: boolean;
+  hasOAuthButton?: boolean;
+  hasMagicLink?: boolean;
+  hasSaml?: boolean;
   error?: string;
 }
 
@@ -121,6 +143,12 @@ export interface SessionState {
   authProbe?: AuthProbeResult;
   authState?: AuthState;
   classification?: SiteClassification;
+  /**
+   * Real API endpoints captured from the site's network traffic during
+   * recon and authenticated BFS traversal. Persisted here so all tasks
+   * (including API executor which runs later) can access them.
+   */
+  discoveredApiEndpoints?: string[];
   createdAt: string;
   updatedAt: string;
   error?: string;
@@ -177,7 +205,7 @@ export interface FormInfo {
 
 export interface PreActionRequest {
   /** Category of the risky action */
-  type: 'purchase' | 'payment' | 'send_link' | 'booking_confirm' | 'delete' | 'generic';
+  type: 'purchase' | 'payment' | 'send_link' | 'booking_confirm' | 'delete' | 'generic' | 'otp';
   description: string;
   /** Extra data keys the action requires (e.g. 'card', 'phone') */
   requiredExtras?: string[];
@@ -188,6 +216,12 @@ export interface ExecutorContext {
   config: SessionConfig;
   sessionsDir: string;
   classification?: SiteClassification;
+  /**
+   * Real API endpoints discovered by the recon phase from network traffic.
+   * Format: "METHOD /path" e.g. "GET /api/v2/menu", "POST /api/orders"
+   * API executor uses these instead of generic guesses.
+   */
+  discoveredApiEndpoints?: string[];
   onFinding: (finding: Omit<Finding, 'id' | 'sessionId' | 'createdAt'>) => void;
   onLog: (message: string) => void;
   onClassification?: (c: SiteClassification) => void;

@@ -30,15 +30,89 @@ The agent uses a simple 3-step conversational setup:
 
 ```
 1. User pastes URL
-   → Agent auto-probes for auth (login wall detection)
+   → Agent auto-probes for auth type (password / OTP / OAuth / magic-link / SAML / none)
+   → Agent asks exactly the right questions for that auth type
 
-2. If login required: Agent asks for credentials
-   User replies with: username: admin   password: secret   otp: 123456
-   Or provides extra site-specific inputs: phone: +91...   card: 4111...   account: ACC123
+2. If login required: Agent asks for credentials specific to the detected login type
+   (see Auth Types table below)
 
-3. User says "start" (or clicks Start Exploration)
-   → Agent runs ALL tests automatically — no test selection needed
+3. Session starts — agent logs in ONCE, saves session, runs ALL tests automatically
 ```
+
+---
+
+## Authentication — Generalized for Any Site
+
+The agent detects 8 login types and handles each correctly:
+
+| Detected type | How detected | What agent asks | How it logs in |
+|---|---|---|---|
+| **password** | `input[type="password"]` + email/username field | `username: ...` + `password: ...` | Fills form, submits |
+| **otp** | `input[type="tel"]` / phone field + no password | `phone: +91...` or `email: ...` | Fills phone → clicks Send → **pauses for OTP code** → fills code |
+| **password-otp** | Password field + OTP field after submit | `username + password` → then OTP code | Two-phase: password → wait for OTP prompt → fill code |
+| **magic-link** | "Send magic link" / "Email me a link" button | `email: ...` → then asks for the link URL | Triggers send → **pauses for user to paste link URL** → navigates to it |
+| **oauth** | "Continue with Google/Apple/Facebook/Microsoft" button | Asks user to paste cookies from DevTools | Injects cookies into browser context, reloads |
+| **saml** | "Enterprise SSO / SAML" button | Asks for cookies or bearer token from DevTools | Injects into context |
+| **api-key** | — | `api-key: ...` | Sends as header |
+| **bearer** | — | `bearer: ...` | Sends as Authorization header |
+
+### OTP login flow (phone-based, e.g. cofee.life)
+```
+1. Agent fills phone number in the field
+2. Clicks "Continue / Send OTP"
+3. Pauses → asks in live chat: "OTP sent. Reply with: otp: 123456"
+4. User reads phone and types otp: 123456 in chat
+5. Agent fills OTP field → clicks Verify → session saved
+6. All 51 tasks now start already logged in (no re-login)
+```
+
+### OAuth/Google login flow (e.g. Gmail, social sites)
+```
+1. Agent detects OAuth button, cannot automate Google's IdP
+2. Asks: "Log in manually in Chrome, then paste cookies from DevTools → Application → Cookies"
+3. User pastes: cookies: session=abc123; csrf_token=xyz
+4. Agent injects cookies → reloads → verified as authenticated
+5. All tasks run from authenticated session
+```
+
+### RULE: Login happens ONCE per session
+- A shared `auth-state.json` file stores cookies + localStorage after successful login
+- Every subsequent task RESTORES this state instead of re-logging in
+- This means OTP-based sites work correctly — only one OTP request per session
+
+---
+
+## Sensitive Data & External Communication Policy
+
+### RULE: No random data for sensitive fields — EVER
+
+The agent classifies every input field before filling it:
+
+| Risk level | Field patterns | Agent behaviour |
+|---|---|---|
+| **HIGH-RISK** | recipient, send-to, whatsapp, SMS, message-to, invite-email, subject | **Skip entirely** — never fill with random data |
+| **SENSITIVE** | email, phone, address, card number, bank account, PAN, Aadhar | Skip random data; only test empty-submit validation |
+| **SAFE** | name, search, title, notes, description, quantity | Use safe placeholder values for testing |
+
+### RULE: Gate all Send/Share/Invite/Pay actions
+
+Before clicking any button whose label contains these words, the agent pauses and asks in live chat:
+
+| Button label pattern | Action type | Agent asks in chat |
+|---|---|---|
+| Send, Forward, Message, Email, WhatsApp, SMS | `send_link` | "Provide recipient: `recipient: phone/email`" |
+| Pay, Transfer, Send money | `payment` | "Provide confirmation: `confirm: yes`" |
+| Place order, Submit order | `purchase` | "Provide confirmation: `confirm: yes`" |
+| Share link, Invite | `send_link` | "Provide recipient: `recipient: phone/email`" |
+
+If the user doesn't respond, the action is **skipped** and a finding is logged:
+`"Action skipped — sensitive communication action requires user confirmation"`
+
+**User can explicitly skip** by replying with any of:
+`skip` / `no` / `cancel` / `ignore` / `don't` / `not now` / `pass`
+
+→ Agent replies: "⏭️ Got it — skipping that action. Moving on to the next test."
+→ The skip flag is consumed after one use — next sensitive gate asks again independently.
 
 ### What runs automatically (no user input needed)
 
@@ -48,22 +122,9 @@ After the URL is given and start is clicked, the agent runs ALL of these:
 - **Network & Chaos** (C1–C6): slow network, offline, flaky network, WebSocket disconnect
 - **API** (D1–D7): CRUD, auth matrix, rate limiting, idempotency
 - **Security** (F1–F5): IDOR, privilege escalation, XSS, mass assignment
+- **Accessibility** (labels, keyboard, contrast)
 - **Performance** (G1–G3): spike load, large payload, N+1 patterns
 - **Regression** (H1–H3): golden path snapshots, visual regression, schema drift
-
-### Pre-action confirmation gates
-
-Before any irreversible action, the agent pauses and asks in the live chat:
-
-| Action | What agent asks |
-|--------|----------------|
-| Purchase / checkout | `card: 4111111111111111` |
-| Send payment link | `phone: +91 9876543210` |
-| Transfer funds | `phone: +91 9876543210` |
-| Book / confirm reservation | Confirmation (no extra data needed) |
-| Follow / interact (social) | Confirmation |
-
-The user replies in the live chat with the requested data. The agent stores it and uses it for that and any future flows in the session.
 
 ### Power-user: select specific tests
 
@@ -179,20 +240,45 @@ Journeys don't rely on hardcoded English button text. For each intended action, 
 
 This means the same journey works on an English Shopify, a German WooCommerce, or a custom React storefront with icon-only buttons.
 
-### Layer 4 — BFS Site Traversal (`navigation.ts`)
+### Layer 4 — BFS Site Traversal + API Endpoint Harvesting (`navigation.ts`)
 
-After login, regardless of site type, the agent physically explores the entire UI:
+After login, regardless of site type, the agent physically explores the entire UI AND captures all real API calls:
 
 ```
 1. Click all reveal triggers (hamburger ≡, dropdowns, accordion toggles)
 2. Collect all nav items from: nav, header, sidebar, tabs, [role="navigation"]
 3. Visit each page (BFS, up to 25 pages, 3 levels deep)
-4. On each page: screenshot, audit for broken images / blank content / JS errors
+4. On each page:
+   - Screenshot
+   - Audit: broken images, blank content, JS console errors
+   - Capture all XHR/fetch network calls (same-origin only)
 5. Discover new nav items on that page and add to queue
 6. Report all JS console errors collected across the full traversal
+7. Write all captured real endpoints to ctx.discoveredApiEndpoints
 ```
 
-This catches pages that aren't linked from the homepage and nav items only revealed after interaction.
+### Layer 5 — API Executor uses real endpoints (not guesses)
+
+After recon and navigation have run, `api-executor.ts` has a list of real endpoints:
+
+```
+Recon captures:  login API calls (e.g. POST /api/auth/verify-otp)
+Navigation captures: app API calls (e.g. GET /api/v2/menu, POST /api/cart)
+Both stored in: state.discoveredApiEndpoints (persisted across all tasks)
+
+API executor receives: these real endpoints via ctx.discoveredApiEndpoints
+resolveEndpointPaths() returns: real endpoints if available, generic guesses only as fallback
+```
+
+**Critical false-positive prevention — Content-Type check:**
+- A 200 response from a React/Vue SPA for ANY path (e.g. `/api/admin`) returns HTML (`text/html`)
+- This is the SPA's catch-all route serving `index.html` — NOT an exposed API endpoint
+- The API executor ONLY flags a 200 response if `Content-Type: application/json` OR body starts with `{`/`[`
+- HTML responses are silently skipped with a log: `→ 200 HTML (SPA catch-all) — not a real API endpoint`
+
+**Public endpoint whitelist — never flagged as HIGH:**
+- `/health`, `/api/health`, `/api/status`, `/ping`, `/api/ping`, `/status`
+- These are intentionally public (monitoring/uptime checks) — flagging them HIGH is always wrong
 
 ### Confidence threshold
 
@@ -226,56 +312,88 @@ Key rules baked into the flows to prevent noise:
 | Hamburger menus | `[class*="burger"]`, `[class*="hamburger"]`, small clickable in top 80px |
 | Cookie-only clear (B6) | Phase 1 clears cookies only; if still authed → HIGH finding. Phase 2 clears storage too |
 | Rapid-click on login form | Medium severity (not high — auth != transactional) |
+| SPA catch-all returning HTTP 200 | React/Vue SPAs return 200 + HTML for every URL. API executor checks Content-Type — only `application/json` or JSON body counts as a real API endpoint. HTML response = logged and skipped |
+| Public health endpoints (200 no auth) | `/health`, `/api/health`, `/status` etc. are intentionally public — never flagged as HIGH |
+| Duplicate auth/privilege findings | `reportedAuthPaths` and `reportedPrivilegePaths` sets prevent same path being reported twice (auth-matrix and auth-bypass both run the same test) |
+| HIGH-RISK form fields | Fields matching recipient/whatsapp/SMS/message-to patterns — never filled with any data |
+| Sensitive form fields | email, phone, card, bank, PAN — no random data; only empty-submit validation |
+| `targetUrl` includes login path | API executor always extracts `new URL(targetUrl).origin` — strips `/login`, `/signin` etc. |
 
 ## File Structure
 
 ```
 packages/
   shared/src/
-    types.ts                       # SiteType, SiteClassification, SessionCredentials.extras,
-                                   # SessionConfig.flowInstructions/selectedFlowClasses, SetupDraft
-    constants.ts                   # FLOW_CLASSES (deduplicated per area), FLOW_TITLES
-                                   # security=[xss-probe only]; H1/H3 in regression only
+    types.ts                       # AuthMethod (8 types incl. oauth, magic-link, saml)
+                                   # SessionCredentials: cookieString, magicLinkUrl, extras
+                                   # SessionState.discoveredApiEndpoints (persisted across tasks)
+                                   # ExecutorContext.discoveredApiEndpoints (injected per task)
+                                   # PreActionRequest.type includes 'otp'
+    constants.ts                   # FLOW_CLASSES (deduplicated), FLOW_TITLES
+                                   # ALL_AREAS includes 'accessibility' (labels, keyboard, contrast)
   agent-core/src/
     intelligence/
-      classify-site.ts             # classifySite(signals) → SiteClassification
-    planner/index.ts               # buildGenericPlan — selectedFlowClasses, BFS phase assignment
-                                   # 'report' phase covers H1/H2/H3, G1, rate-limit, idempotency
+      classify-site.ts             # classifySite(signals) → SiteClassification (7 site types)
+    planner/index.ts               # buildGenericPlan — ALL_AREAS including accessibility
+                                   # areaForFlow() handles accessibility area
+    orchestrator/run-session.ts    # performSessionLogin() called ONCE before tasks start
+                                   # state.discoveredApiEndpoints persisted after each task
+                                   # ctx.discoveredApiEndpoints injected into each task's context
+                                   # onPreActionNeeded: honours _user_skip flag from live chat
   explorer-ui/src/
+    auth/
+      probe.ts                     # probeAuth(): detects password, otp, oauth, magic-link, saml
+                                   # Uses waitUntil:'load' + 1.5s wait for SPA hydration
+                                   # URL-path fallback (/login, /signin, /auth → requiresAuth=true)
+      login.ts                     # performLogin(): routes to correct handler per authMethod
+                                   # detectLoginWall(): checks tel/phone/mobile inputs + URL path
+    ui-executor.ts                 # performSessionLogin(): runs ONCE, saves auth-state.json
+                                   # OAuth: injects cookieString as browser cookies
+                                   # Magic-link: navigates to magicLinkUrl
+                                   # OTP: two-phase (fill phone → pause → fill code)
+                                   # All tasks restore auth from auth-state.json (no re-login)
     flows/
-      helpers.ts                   # isLoginWallPage(), findVisibleErrorText() — shared utilities
-      recon.ts                     # collectIntelligenceSignals(), skips no-link finding on login walls
-      navigation.ts                # BFS authenticated site traversal — clicks hamburger/sidebar/tabs,
-                                   # visits up to 25 pages 3 levels deep, JS error collection
-      journey.ts                   # site-type-specific journeys; findVisibleErrorText for error detection;
-                                   # two-phase credential verification before valid login test
-      user-directed.ts             # plain-language instructions; pre-action gate for risky ops
-      forms.ts                     # skips login-wall pages; findVisibleErrorText after 800ms wait
-      keyboard.ts                  # clicks body first (headless focus fix); escape on modals
-      double-click.ts              # 5-click rapid flood on action buttons (Add to Cart, Delete, Pay etc.);
-                                   # cart badge count before/after; button disabled-state check
+      helpers.ts                   # isLoginWallPage(), findVisibleErrorText()
+      recon.ts                     # collectIntelligenceSignals()
+                                   # Captures XHR/fetch calls → ctx.discoveredApiEndpoints
+                                   # Skips no-link finding on login walls
+      navigation.ts                # BFS authenticated site traversal (25 pages, 3 levels deep)
+                                   # page.on('request') captures ALL real API calls during BFS
+                                   # Writes captured endpoints → ctx.discoveredApiEndpoints
+                                   # Clicks hamburger/sidebar/tabs, audits each page
+                                   # JS console error collection across all pages
+      journey.ts                   # 7 site-type journeys + generic fallback
+                                   # findSemanticButton(): 4-strategy discovery (testid→aria→text→class)
+                                   # Multi-language button text (EN/FR/DE/ES/IT)
+                                   # gateIfSensitive(): pauses before Send/Share/Pay/Transfer/Invite
+                                   # _user_skip flag honoured → skip action if user said "skip"
+      forms.ts                     # classifyInputRisk(): HIGH-RISK/SENSITIVE/SAFE per field
+                                   # Never fills HIGH-RISK fields (recipient, WhatsApp, SMS)
+                                   # Skips random data for SENSITIVE fields (email, phone, card)
+                                   # Skips form validation on login walls
+      user-directed.ts             # plain-language instructions; pre-action gate
+      keyboard.ts                  # clicks body before Tab (headless focus fix)
+      double-click.ts              # 5-click rapid flood; cart badge + button disabled check
       viewport.ts                  # mobile/tablet/desktop; hamburger-aware; skips login walls
-      error-ui.ts                  # findVisibleErrorText; toast duration check
-      autofill.ts                  # A10 — paste, autofill, masked fields
-      file-upload.ts               # A11 — wrong type, large file, empty file
-      pagination-ui.ts             # A12 — last page, prev/next disabled states
-      wizard.ts                    # A13 — URL skip, back navigation, data persistence
-      session-flows.ts             # B2 forward-after-back, B5 deep-link (BFS path discovery +
-                                   # content check before firing), B6 TWO-PHASE cookie test
-                                   # (cookies-only first, then full storage), B7 multi-tab logout
+      session-flows.ts             # B5: collects real paths from authenticated session before clearing
+                                   # B6: two-phase cookie test
       regression.ts                # H1/H3 — golden path snapshots, visual regression
-    ui-executor.ts                 # FLOW_HANDLERS: all flows registered
   chaos-engine/src/
     chaos-executor.ts              # C4 flaky-network, C5 timeout-retry, C6 websocket-disconnect
   explorer-api/src/
-    api-executor.ts                # rate-limit probes TARGET site (not local /api/health);
-                                   # F2/F3 privilege, F5 mass-assignment, G1 spike-load,
-                                   # G3 n-plus-one, H2 schema-drift
+    api-executor.ts                # baseUrl = origin only (strips /login path)
+                                   # resolveEndpointPaths(): uses ctx.discoveredApiEndpoints first,
+                                   #   falls back to generic guesses only if nothing discovered
+                                   # Content-Type check: only flags JSON responses (not SPA HTML)
+                                   # PUBLIC_ENDPOINTS whitelist: /health, /api/health etc. never HIGH
+                                   # reportedAuthPaths / reportedPrivilegePaths: dedup across tasks
   chat-agent/src/
-    setup-chat.ts                  # MATRIX_ID_MAP, extractMatrixIds, matrixTestList
-                                   # Parses "run A6, B2" → selectedFlowClasses in draft
-    auth-chat.ts                   # parseAuthFields, auth state machine (no username loop)
-    live-chat.ts                   # parseExtras (key: value pairs), pre_action:required handler
+    setup-chat.ts                  # MATRIX_ID_MAP, extractMatrixIds
+    auth-chat.ts                   # authPromptFromProbe(): type-specific prompts per auth method
+                                   # parseAuthFields(): cookies:, magic-link:, phone: support
+    live-chat.ts                   # parseExtras(): key:value pairs for pre-action data
+                                   # Skip detection: "skip"/"no"/"cancel" → sets _user_skip flag
+                                   # Clears _user_skip when user later provides data
 ```
 
 ## Build & Dev

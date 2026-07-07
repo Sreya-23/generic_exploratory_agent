@@ -196,6 +196,23 @@ export async function runNavigation(
   const MAX_PAGES = 25;
   const MAX_DEPTH = 3;
 
+  // ── Network API call capture ────────────────────────────────────────────────
+  // Monitor all XHR/fetch requests made by the authenticated app during BFS.
+  // These are the REAL endpoints used by the app — much better than guesses.
+  const capturedApiEndpoints = new Set<string>();
+  page.on('request', (req) => {
+    const resourceType = req.resourceType();
+    if (resourceType !== 'xhr' && resourceType !== 'fetch') return;
+    try {
+      const u = new URL(req.url());
+      // Only capture paths from the same origin (not CDN/analytics calls)
+      if (u.origin === baseOrigin && u.pathname !== '/') {
+        capturedApiEndpoints.add(`${req.method()} ${u.pathname}${u.search ? u.search.split('&')[0] : ''}`);
+      }
+    } catch { /* ignore invalid URLs */ }
+  });
+  // ───────────────────────────────────────────────────────────────────────────
+
   // Collect JS console errors globally
   const jsErrors: string[] = [];
   page.on('console', (msg) => {
@@ -304,6 +321,25 @@ export async function runNavigation(
       reproRate: '1/1',
       automationCandidate: true,
     });
+  }
+
+  // ── Share discovered API endpoints with the API executor ────────────────
+  // This is the key handoff: real endpoints from the authenticated app's network
+  // traffic replace generic guesses (/api/users, /api/admin) in API tests.
+  if (capturedApiEndpoints.size > 0) {
+    const endpoints = [...capturedApiEndpoints];
+    // Merge with any endpoints already found by recon (login-phase calls)
+    const existing = new Set(ctx.discoveredApiEndpoints ?? []);
+    for (const e of endpoints) existing.add(e);
+    ctx.discoveredApiEndpoints = [...existing];
+    ctx.onLog(
+      `[Navigation] Captured ${endpoints.length} real API endpoints from authenticated app — ` +
+      `total available for API executor: ${ctx.discoveredApiEndpoints.length}`,
+    );
+    // Log a sample so the user can see what was discovered
+    endpoints.slice(0, 5).forEach((e) => ctx.onLog(`[Navigation]   → ${e}`));
+  } else {
+    ctx.onLog('[Navigation] No XHR/fetch API calls captured during traversal');
   }
 
   // ── Summary ──────────────────────────────────────────────────────────────

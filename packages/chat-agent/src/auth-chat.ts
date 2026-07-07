@@ -183,6 +183,30 @@ export function parseAuthFields(
     patch.bearerToken = bearerMatch[1];
   }
 
+  // OAuth / SSO — user pastes cookies from DevTools
+  const cookiesMatch = trimmed.match(/^cookies?\s*[:=]\s*(.+)$/i);
+  if (cookiesMatch) {
+    patch.type = 'bearer'; // reuse bearer flow, injected as cookies
+    patch.cookieString = cookiesMatch[1].trim();
+    patch.authMethod = 'oauth';
+  }
+
+  // Magic-link — user pastes the URL from their email
+  const magicLinkMatch = trimmed.match(/^magic-?link\s*[:=]\s*(https?:\/\/\S+)/i);
+  if (magicLinkMatch) {
+    patch.type = 'login';
+    patch.magicLinkUrl = magicLinkMatch[1].trim();
+    patch.authMethod = 'magic-link';
+  }
+
+  // Phone number — for OTP-based login
+  const phoneMatch = trimmed.match(/^phone\s*[:=]\s*([+\d\s()-]{7,20})/i);
+  if (phoneMatch) {
+    patch.type = 'login';
+    patch.username = phoneMatch[1].trim();
+    patch.authMethod = 'otp';
+  }
+
   const combo = trimmed.match(
     /(?:user(?:name)?|email)\s*[:=]\s*(\S+)\s+(?:pass(?:word)?)\s*[:=]\s*(\S+)(?:\s+(?:otp|code)\s*[:=]\s*(\S+))?/i,
   );
@@ -292,18 +316,104 @@ export function parseLiveCredentials(
 
 export function authPromptFromProbe(probe: AuthProbeResult): string {
   if (!probe.requiresAuth) {
-    return `✅ **${probe.targetUrl}** looks publicly accessible — no login detected.`;
+    return (
+      `✅ **${probe.targetUrl}** looks publicly accessible — no login detected.\n\n` +
+      `I'll explore it directly. If the site does require credentials, tell me now:\n` +
+      `- \`username: your@email.com\`\n` +
+      `- \`password: yourpassword\`\n` +
+      `- \`phone: +919876543210\` (for OTP-based login)`
+    );
   }
 
-  const methodLabel: Record<AuthMethod, string> = {
-    none: 'none',
-    password: 'username + password',
-    otp: 'OTP / verification code',
-    'password-otp': 'password then OTP',
-    'api-key': 'API key',
-    bearer: 'bearer token',
-    unknown: 'login (type unknown)',
-  };
+  const site = probe.title || probe.targetUrl;
 
-  return `🔐 **Login required** on "${probe.title || probe.targetUrl}".\n\nDetected: **${methodLabel[probe.suggestedMethod]}**\n\nI'll ask for the details next.`;
+  switch (probe.suggestedMethod) {
+    case 'oauth':
+      return (
+        `🔐 **Login required** on "${site}".\n\n` +
+        `Detected: **Social / OAuth login** (Google, Apple, etc.)\n\n` +
+        `Since OAuth redirects through a third-party, I can't automate it directly. ` +
+        `Please paste your **session cookies** from a logged-in browser tab:\n\n` +
+        `1. Open the site in Chrome and log in manually\n` +
+        `2. Open DevTools → Application → Cookies → copy all cookies for this domain\n` +
+        `3. Paste them here as: \`cookies: name1=val1; name2=val2\`\n\n` +
+        `Or provide a \`bearer: <token>\` if the site uses a JWT.`
+      );
+
+    case 'magic-link':
+      return (
+        `🔐 **Login required** on "${site}".\n\n` +
+        `Detected: **Magic link login** (email → click link)\n\n` +
+        `Please provide your email and I'll trigger the magic link:\n` +
+        `- \`email: your@email.com\`\n\n` +
+        `After the email arrives, paste the full login link here:\n` +
+        `- \`magic-link: https://...\``
+      );
+
+    case 'saml':
+      return (
+        `🔐 **Login required** on "${site}".\n\n` +
+        `Detected: **Enterprise SSO / SAML login**\n\n` +
+        `SAML redirects through your company's identity provider. Please either:\n` +
+        `- Paste your session cookies: \`cookies: name=val; name2=val2\`\n` +
+        `- Or paste a bearer token: \`bearer: <token>\`\n\n` +
+        `You can find these in DevTools → Application → Cookies/Local Storage after logging in.`
+      );
+
+    case 'otp':
+      return (
+        `🔐 **Login required** on "${site}".\n\n` +
+        `Detected: **Phone / OTP login**\n\n` +
+        `Please provide your phone number or email:\n` +
+        `- \`phone: +919876543210\`\n` +
+        `- or \`email: your@email.com\`\n\n` +
+        `I'll trigger the OTP and ask for the code once it arrives on your phone.`
+      );
+
+    case 'password-otp':
+      return (
+        `🔐 **Login required** on "${site}".\n\n` +
+        `Detected: **Password + OTP (two-factor)**\n\n` +
+        `Please provide:\n` +
+        `- \`username: your@email.com\`\n` +
+        `- \`password: yourpassword\`\n\n` +
+        `After login, I'll ask for your authenticator/SMS code.`
+      );
+
+    case 'password':
+      return (
+        `🔐 **Login required** on "${site}".\n\n` +
+        `Detected: **Username + Password**\n\n` +
+        `Please provide:\n` +
+        `- \`username: your@email.com\`\n` +
+        `- \`password: yourpassword\``
+      );
+
+    case 'api-key':
+      return (
+        `🔐 **Login required** on "${site}".\n\n` +
+        `Detected: **API key authentication**\n\n` +
+        `Please provide:\n` +
+        `- \`api-key: your_key_here\``
+      );
+
+    case 'bearer':
+      return (
+        `🔐 **Login required** on "${site}".\n\n` +
+        `Detected: **Bearer token authentication**\n\n` +
+        `Please provide:\n` +
+        `- \`bearer: your_token_here\``
+      );
+
+    default:
+      return (
+        `🔐 **Login required** on "${site}".\n\n` +
+        `I detected a login page but couldn't determine the exact method. ` +
+        `Please tell me the login type:\n\n` +
+        `- \`username: ...\` + \`password: ...\` (standard login)\n` +
+        `- \`phone: +91...\` (OTP login)\n` +
+        `- \`cookies: name=val; ...\` (OAuth/SSO — paste from DevTools)\n` +
+        `- \`bearer: ...\` (token-based)`
+      );
+  }
 }
