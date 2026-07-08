@@ -123,12 +123,6 @@ export function connectSessionWs(
   };
 }
 
-export async function fetchReportMarkdown(id: string): Promise<string> {
-  const res = await fetch(`${API_BASE}/api/sessions/${id}/report?format=md`);
-  if (!res.ok) throw new Error('Report not available');
-  return res.text();
-}
-
 let setupInitPromise: Promise<import('@qa/shared').SetupChatResponse> | null = null;
 
 export async function initSetupChat(

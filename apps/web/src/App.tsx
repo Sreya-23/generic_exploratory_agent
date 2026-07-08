@@ -4,7 +4,6 @@ import { HomePage } from './pages/HomePage';
 import { ChatSetupPage } from './pages/ChatSetupPage';
 import { SessionSetupPage } from './pages/SessionSetupPage';
 import { LiveSessionPage } from './pages/LiveSessionPage';
-import { ReportPage } from './pages/ReportPage';
 
 export default function App() {
   return (
@@ -14,7 +13,6 @@ export default function App() {
         <Route path="/chat" element={<ChatSetupPage />} />
         <Route path="/setup" element={<SessionSetupPage />} />
         <Route path="/session/:id" element={<LiveSessionPage />} />
-        <Route path="/report/:id" element={<ReportPage />} />
       </Routes>
     </AppShell>
   );

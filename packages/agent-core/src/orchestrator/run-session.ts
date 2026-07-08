@@ -14,7 +14,7 @@ import type {
 import { credentialsComplete, effectiveAuthState, authPromptForState } from '@qa/chat-agent';
 import { buildPlan, injectJourneyTasks } from '../planner/index.js';
 import { classifySite } from '../intelligence/classify-site.js';
-import { saveSessionState, writeReports } from '../reporter/index.js';
+import { saveSessionState } from '../reporter/index.js';
 import { parsePrd } from '@qa/prd-parser';
 import { UiExecutor, probeAuth, performSessionLogin } from '@qa/explorer-ui';
 import { ApiExecutor } from '@qa/explorer-api';
@@ -450,7 +450,6 @@ export class SessionOrchestrator {
       state.status = 'completed';
       state.progress.percent = 100;
       state.updatedAt = new Date().toISOString();
-      await writeReports(sessionsDir, state);
       this.emit({
         type: 'session:completed',
         sessionId,

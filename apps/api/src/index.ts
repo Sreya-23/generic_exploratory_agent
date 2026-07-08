@@ -9,10 +9,9 @@ import websocket from '@fastify/websocket';
 import fastifyStatic from '@fastify/static';
 import type { SessionConfig } from '@qa/shared';
 import { EXPLORATION_AREAS, SESSION_DEPTHS } from '@qa/shared';
-import { orchestrator, generateMarkdownReport } from '@qa/agent-core';
+import { orchestrator } from '@qa/agent-core';
 import { liveChatStore } from '@qa/chat-agent';
 import { registerChatRoutes, bridgeSessionEventToChat } from './routes/chat.js';
-import { readFile } from 'node:fs/promises';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '../../..');
@@ -63,7 +62,6 @@ app.get('/', async () => ({
     liveUpdates: 'WS /api/sessions/:id/ws',
     chatSetup: 'POST /api/chat/setup',
     sessionChat: 'GET|POST /api/sessions/:id/chat',
-    report: 'GET /api/sessions/:id/report?format=md|html|json',
   },
   note: 'Open the Web UI at http://localhost:5173 to start an exploration.',
 }));
@@ -142,37 +140,6 @@ app.post<{ Params: { id: string } }>(
   },
 );
 
-app.get<{ Params: { id: string }; Querystring: { format?: string } }>(
-  '/api/sessions/:id/report',
-  async (req, reply) => {
-    const session = orchestrator.getSession(req.params.id);
-    if (!session) return reply.status(404).send({ error: 'Session not found' });
-
-    const format = req.query.format ?? 'json';
-
-    if (format === 'md') {
-      const md = generateMarkdownReport(session);
-      reply.type('text/markdown');
-      return md;
-    }
-
-    if (format === 'html') {
-      try {
-        const html = await readFile(join(SESSIONS_DIR, req.params.id, 'report.html'), 'utf-8');
-        reply.type('text/html');
-        return html;
-      } catch {
-        return reply.status(404).send({ error: 'Report not generated yet' });
-      }
-    }
-
-    return {
-      session,
-      findings: session.findings,
-      reportUrl: `/api/sessions/${req.params.id}/report?format=md`,
-    };
-  },
-);
 
 app.get<{ Params: { id: string } }>('/api/sessions/:id/ws', { websocket: true }, (socket, req) => {
   const sessionId = req.params.id;

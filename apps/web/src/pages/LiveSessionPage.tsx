@@ -217,11 +217,6 @@ export function LiveSessionPage() {
               Pause
             </button>
           )}
-          {session.status === 'completed' && (
-            <Link to={`/report/${id}`} className="btn btn-primary">
-              View Report
-            </Link>
-          )}
         </div>
       </div>
 
