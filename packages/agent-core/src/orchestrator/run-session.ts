@@ -1,10 +1,14 @@
 import { randomUUID } from 'node:crypto';
+import { copyFile, access } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import type {
   BaseExecutor,
   ExecutorContext,
   Finding,
   FlowTask,
   PreActionRequest,
+  PrdCoverageSummary,
+  PrdFeatureCoverage,
   SessionCredentials,
   SessionEvent,
   SessionState,
@@ -14,8 +18,14 @@ import type {
 import { credentialsComplete, effectiveAuthState, authPromptForState } from '@qa/chat-agent';
 import { buildPlan, injectJourneyTasks } from '../planner/index.js';
 import { classifySite } from '../intelligence/classify-site.js';
-import { saveSessionState } from '../reporter/index.js';
-import { parsePrd } from '@qa/prd-parser';
+import { saveSessionState, chatSummaryFromCoverage } from '../reporter/index.js';
+import {
+  attachFingerprints,
+  diffFindingFingerprints,
+  fingerprintFinding,
+  loadPreviousSessionFindings,
+} from '../reporter/finding-diff.js';
+import { parsePrd, formatPrdCoverageMarkdown } from '@qa/prd-parser';
 import { UiExecutor, probeAuth, performSessionLogin } from '@qa/explorer-ui';
 import { ApiExecutor } from '@qa/explorer-api';
 import { ChaosExecutor } from '@qa/chaos-engine';
@@ -203,16 +213,73 @@ export class SessionOrchestrator {
     this.abortControllers.set(sessionId, abort);
 
     let prdFeatures: string[] | undefined;
+    let prdConstraints: string[] = [];
+    let prdFeatureCriteria: string[] = [];
+    const prdCoverageResults: PrdFeatureCoverage[] = [];
+
     if (state.config.prdPath) {
       try {
+        const sessionPrdDir = join(sessionsDir, sessionId);
+        const destName = state.config.prdFilename ?? basename(state.config.prdPath);
+        const destPath = join(
+          sessionPrdDir,
+          destName.toLowerCase().startsWith('prd.') ? destName : `prd-${destName}`,
+        );
+        if (state.config.prdPath !== destPath) {
+          await copyFile(state.config.prdPath, destPath).catch(() => undefined);
+          const copied = await access(destPath).then(() => true).catch(() => false);
+          if (copied) state.config.prdPath = destPath;
+        }
+
         const parsed = await parsePrd(state.config.prdPath);
         prdFeatures = parsed.features;
-      } catch {
-        /* ignore */
+        prdConstraints = parsed.constraints;
+        prdFeatureCriteria = parsed.featureCriteria ?? [];
+        if (!state.config.prdFilename) state.config.prdFilename = parsed.filename;
+
+        const prdContextBlock = [
+          `PRD file: ${state.config.prdFilename ?? state.config.prdPath}`,
+          parsed.overview,
+          prdConstraints.length
+            ? `Constraints:\n${prdConstraints.map((c) => `- ${c}`).join('\n')}`
+            : '',
+        ]
+          .filter(Boolean)
+          .join('\n\n');
+        state.config.context = state.config.context
+          ? `${state.config.context}\n\n--- PRD ---\n${prdContextBlock}`
+          : prdContextBlock;
+
+        this.emit({
+          type: 'log',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          payload: {
+            message: `[PRD] ${parsed.overview.replace(/\n+/g, ' · ').slice(0, 500)} — PRD-only mode (generic matrix skipped)`,
+          },
+        });
+      } catch (err) {
+        this.emit({
+          type: 'log',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          payload: { message: `[PRD] Parse failed: ${(err as Error).message}` },
+        });
       }
     }
 
-    state.plan = buildPlan(sessionId, state.config, prdFeatures);
+    (state as SessionState & { _prdResults?: PrdFeatureCoverage[]; _prdFeatureCriteria?: string[] })._prdResults =
+      prdCoverageResults;
+    (state as SessionState & { _prdFeatureCriteria?: string[] })._prdFeatureCriteria = prdFeatureCriteria;
+
+    state.plan = buildPlan(
+      sessionId,
+      state.config,
+      prdFeatures,
+      undefined,
+      prdConstraints,
+      prdFeatureCriteria,
+    );
     state.progress = { completedTasks: 0, totalTasks: state.plan.tasks.length, percent: 0 };
     state.status = 'running';
     state.authState = 'ready';
@@ -294,6 +361,8 @@ export class SessionOrchestrator {
   ): Promise<void> {
     const state = this.states.get(sessionId)!;
     const tasks = state.plan?.tasks ?? [];
+    /** When PRD auth smoke fails, remaining PRD feature tasks are skipped */
+    let prdAuthSmokeFailed = false;
 
     for (const task of tasks) {
       if (signal.aborted) break;
@@ -318,6 +387,44 @@ export class SessionOrchestrator {
         payload: { ...state.progress, status: state.status },
       });
 
+      // Fail-fast: skip deep PRD tasks after auth smoke failure
+      if (
+        prdAuthSmokeFailed &&
+        task.flowClass === 'prd-driven' &&
+        !task.meta?.isAuthSmoke
+      ) {
+        const bag = (state as SessionState & { _prdResults?: PrdFeatureCoverage[] })._prdResults;
+        bag?.push({
+          feature: task.meta?.prdFeature ?? task.title,
+          variant: task.meta?.prdVariant ?? 'happy',
+          status: 'skipped',
+          notes: 'Skipped — PRD auth smoke gate failed',
+          findingsCount: 0,
+          requirementId: task.meta?.prdRequirementId,
+          taskId: task.id,
+        });
+        this.emit({
+          type: 'log',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          payload: {
+            message: `[PRD] Skipping ${task.id} — auth smoke gate failed`,
+          },
+        });
+        state.progress.completedTasks += 1;
+        state.progress.percent = Math.round(
+          (state.progress.completedTasks / state.progress.totalTasks) * 100,
+        );
+        this.emit({
+          type: 'task:completed',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          payload: { taskId: task.id, skipped: true },
+        });
+        await saveSessionState(sessionsDir, state);
+        continue;
+      }
+
       const ctx: ExecutorContext = {
         sessionId,
         config: state.config,
@@ -325,8 +432,12 @@ export class SessionOrchestrator {
         classification: state.classification,
         discoveredApiEndpoints: state.discoveredApiEndpoints,
         onFinding: (partial) => {
-          const finding: Finding = {
+          const withFp = {
             ...partial,
+            fingerprint: partial.fingerprint ?? fingerprintFinding(partial),
+          };
+          const finding: Finding = {
+            ...withFp,
             id: randomUUID(),
             sessionId,
             createdAt: new Date().toISOString(),
@@ -346,6 +457,10 @@ export class SessionOrchestrator {
             timestamp: new Date().toISOString(),
             payload: { message },
           });
+        },
+        onPrdCoverageUpdate: (update: PrdFeatureCoverage) => {
+          const bag = (state as SessionState & { _prdResults?: PrdFeatureCoverage[] })._prdResults;
+          bag?.push(update);
         },
         onPreActionNeeded: (req: PreActionRequest): Record<string, string> | null => {
           const extras = state.config.credentials?.extras ?? {};
@@ -406,6 +521,9 @@ export class SessionOrchestrator {
             payload: classification,
           });
 
+          // PRD-only mode: never inject domain journeys / matrix-adjacent tasks
+          if (state.config.prdPath) return;
+
           // Dynamically inject journey tasks into the remaining plan
           if (state.plan) {
             injectJourneyTasks(state.plan, classification);
@@ -431,6 +549,25 @@ export class SessionOrchestrator {
         }
       }
 
+      // Detect PRD auth smoke failure → skip remaining PRD feature tasks
+      if (task.meta?.isAuthSmoke) {
+        const bag =
+          (state as SessionState & { _prdResults?: PrdFeatureCoverage[] })._prdResults ?? [];
+        const smoke = [...bag].reverse().find((r) => r.taskId === task.id || r.feature === 'Auth smoke gate');
+        if (smoke && (smoke.status === 'failed' || smoke.status === 'blocked')) {
+          prdAuthSmokeFailed = true;
+          this.emit({
+            type: 'log',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            payload: {
+              message:
+                '[PRD] Auth smoke gate FAILED — remaining PRD feature tasks will be skipped',
+            },
+          });
+        }
+      }
+
       state.progress.completedTasks += 1;
       state.progress.percent = Math.round(
         (state.progress.completedTasks / state.progress.totalTasks) * 100,
@@ -447,9 +584,120 @@ export class SessionOrchestrator {
     }
 
     if (!signal.aborted) {
+      // Finalize PRD coverage summary (chat + report)
+      if (state.config.prdPath) {
+        const results =
+          (state as SessionState & { _prdResults?: PrdFeatureCoverage[] })._prdResults ?? [];
+        const featuresExtracted = [
+          ...new Set(
+            (state.plan?.tasks ?? [])
+              .filter(
+                (t) =>
+                  t.flowClass === 'prd-driven' &&
+                  t.meta?.prdFeature &&
+                  !t.meta?.isAuthSmoke,
+              )
+              .map((t) => t.meta!.prdFeature!),
+          ),
+        ];
+        const criteriaList =
+          (state as SessionState & { _prdFeatureCriteria?: string[] })._prdFeatureCriteria ?? [];
+        const featureDetails = featuresExtracted.map((name, i) => {
+          const taskMeta = (state.plan?.tasks ?? []).find(
+            (t) => t.meta?.prdFeature === name && t.meta?.prdRequirementId,
+          )?.meta;
+          return {
+            requirementId: taskMeta?.prdRequirementId ?? `F${i + 1}`,
+            name,
+            criteria: taskMeta?.prdCriteria ?? criteriaList[i],
+          };
+        });
+
+        // Enrich coverage rows with criteria
+        for (const r of results) {
+          if (!r.criteria && r.requirementId) {
+            r.criteria = featureDetails.find((d) => d.requirementId === r.requirementId)?.criteria;
+          }
+        }
+
+        const constraintsMatch = state.config.context?.match(/Constraints:\n([\s\S]*?)(?:\n\n|$)/);
+        const constraintsExtracted = constraintsMatch
+          ? constraintsMatch[1]
+              .split('\n')
+              .map((l) => l.replace(/^- /, '').trim())
+              .filter(Boolean)
+          : [];
+
+        const gaps = [...new Set(results.filter((r) => r.status === 'gap').map((r) => r.feature))];
+        const blocked = [
+          ...new Set(results.filter((r) => r.status === 'blocked').map((r) => r.feature)),
+        ];
+        const passedCount = results.filter((r) => r.status === 'passed').length;
+        const failedCount = results.filter((r) => r.status === 'failed').length;
+        const testedCount = results.filter((r) =>
+          ['tested', 'passed', 'failed'].includes(r.status),
+        ).length;
+
+        state.findings = attachFingerprints(state.findings);
+        const prev = await loadPreviousSessionFindings(
+          sessionsDir,
+          state.config.targetUrl,
+          sessionId,
+        );
+        const findingDiff = diffFindingFingerprints(
+          state.findings,
+          prev?.findings ?? [],
+          prev?.sessionId,
+        );
+
+        const coverage: PrdCoverageSummary = {
+          prdFilename: state.config.prdFilename,
+          featuresExtracted,
+          constraintsExtracted,
+          featureDetails,
+          featureResults: results,
+          gaps,
+          blocked,
+          testedCount,
+          passedCount,
+          failedCount,
+          findingDiff,
+          markdown: formatPrdCoverageMarkdown({
+            prdFilename: state.config.prdFilename,
+            featuresExtracted,
+            constraintsExtracted,
+            featureDetails,
+            featureResults: results,
+            gaps,
+            blocked,
+            findingDiffMarkdown: findingDiff.markdown,
+          }),
+        };
+        state.prdCoverage = coverage;
+
+        this.emit({
+          type: 'log',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          payload: {
+            message: `[PRD] Finding diff vs previous: +${findingDiff.newFindings.length} new, -${findingDiff.fixedFindings.length} fixed, ${findingDiff.recurringFindings.length} recurring`,
+          },
+        });
+
+        this.emit({
+          type: 'prd:coverage',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          payload: { summary: chatSummaryFromCoverage(coverage), coverage },
+        });
+      } else {
+        state.findings = attachFingerprints(state.findings);
+      }
+
       state.status = 'completed';
       state.progress.percent = 100;
       state.updatedAt = new Date().toISOString();
+      await saveSessionState(sessionsDir, state);
       this.emit({
         type: 'session:completed',
         sessionId,

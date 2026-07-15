@@ -81,7 +81,37 @@ export async function uploadPrd(sessionId: string, file: File): Promise<void> {
     method: 'POST',
     body: form,
   });
-  if (!res.ok) throw new Error('Failed to upload PRD');
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error ?? 'Failed to upload PRD');
+  }
+}
+
+export async function uploadSetupPrd(
+  conversationId: string,
+  file: File,
+): Promise<import('@qa/shared').SetupChatResponse> {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await fetch(
+    `${API_BASE}/api/chat/setup/upload-prd?conversationId=${encodeURIComponent(conversationId)}`,
+    { method: 'POST', body: form },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error ?? 'Failed to upload PRD');
+  }
+  return res.json();
+}
+
+export async function fetchSessionReport(
+  sessionId: string,
+  format: 'md' | 'json' = 'md',
+): Promise<string | { reportMarkdown: string; prdCoverage: unknown }> {
+  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/report?format=${format}`);
+  if (!res.ok) throw new Error('Failed to load report');
+  if (format === 'json') return res.json();
+  return res.text();
 }
 
 export function connectSessionWs(

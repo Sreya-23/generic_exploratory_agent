@@ -212,6 +212,11 @@ export function LiveSessionPage() {
           </p>
         </div>
         <div className="live-actions">
+          {(session.status === 'completed' || session.status === 'failed') && (
+            <Link to={`/report/${session.id}`} className="btn btn-primary">
+              View Report
+            </Link>
+          )}
           {isActive && (
             <button className="btn btn-secondary" onClick={handlePause}>
               Pause

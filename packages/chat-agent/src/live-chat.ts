@@ -82,11 +82,21 @@ export function sessionEventToChatMessage(event: SessionEvent): ChatMessage | nu
 
     case 'session:completed': {
       const s = event.payload as SessionState;
+      const coverageLine = s.prdCoverage
+        ? `\n\n📋 **PRD coverage:** ${s.prdCoverage.passedCount} passed · ${s.prdCoverage.failedCount} failed · ${s.prdCoverage.gaps.length} gaps · ${s.prdCoverage.blocked.length} blocked\nOpen the session **Report** for the full coverage table.`
+        : '';
       return msg(
         'assistant',
-        `✅ Exploration complete — **${s.findings.length} findings** recorded.`,
+        `✅ Exploration complete — **${s.findings.length} findings** recorded.` +
+          (s.config.prdPath ? `\nMode was **PRD-only**.` : '') +
+          coverageLine,
         { kind: 'status' },
       );
+    }
+
+    case 'prd:coverage': {
+      const p = event.payload as { summary?: string };
+      return msg('assistant', p.summary ?? 'PRD coverage ready.', { kind: 'status' });
     }
 
     case 'session:failed': {

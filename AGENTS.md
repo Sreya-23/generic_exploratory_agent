@@ -9,6 +9,8 @@ Read this before making any changes.
 
 A **generic exploratory QA agent** that accepts any website URL, automatically detects its type and login mechanism, and runs a full matrix of UI, API, chaos, security, and performance tests — without manual test selection.
 
+**Optional PRD:** users may upload a PRD (PDF) from chat or classic setup. When a PRD is present, follow the **PRD-Driven Protocol** in `.cursor/skills/generic-exploratory-qa/SKILL.md` — auth smoke gate, then PRD-only feature testing (happy / negative / interruption) with verified assertions, requirement→task traceability, and coverage summary. When no PRD is uploaded, keep the existing generic matrix behaviour.
+
 ---
 
 ## Monorepo structure
@@ -52,7 +54,7 @@ npm run build -w packages/shared && npm run build
 ## Intelligence pipeline — how exploration works
 
 ```
-URL given
+URL given (+ optional PRD upload)
   ↓
 probeAuth()           Detect login type (password / Otp / oauth / magic-link / saml / none)
                       Uses waitUntil:'load' + 1.5s wait for SPA hydration
@@ -61,20 +63,25 @@ probeAuth()           Detect login type (password / Otp / oauth / magic-link / s
 performSessionLogin() ONE-TIME login per session, saves auth-state.json
                       Each subsequent task restores cookies from auth-state.json
   ↓
-recon.ts              Collect page signals + capture XHR/fetch network calls
-                      → ctx.discoveredApiEndpoints
+IF PRD uploaded:
+  parsePrd()          Extract features + constraints (PDF / md / txt)
   ↓
-classifySite()        Score signals against 7 site-type rules
-                      ecommerce / booking / saas-dashboard / auth-portal /
-                      blog-cms / social / fintech / generic
+  merge into context  Overview + constraints on SessionConfig.context
   ↓
-navigation.ts         BFS traversal (25 pages, 3 levels deep)
-                      Captures ALL real API calls during traversal
-                      → ctx.discoveredApiEndpoints (merged with recon's)
+  buildPrdOnlyPlan()  For each feature: happy + negative + interruption (NO generic matrix)
   ↓
-51 matrix tasks       UI, chaos, API, security, accessibility, performance, regression
-                      API executor uses real discovered endpoints — not guesses
+  prd-driven flow     Locate UI by keywords → run QA variants → coverage summary
+ELSE (no PRD — existing behaviour):
+  recon.ts            Collect page signals + capture XHR/fetch network calls
+  ↓
+  classifySite()      Score signals against site-type rules
+  ↓
+  navigation.ts       BFS traversal + API harvest
+  ↓
+  51 matrix tasks     UI, chaos, API, security, accessibility, performance, regression
 ```
+
+**Skill source of truth for PRD mode:** always follow `.cursor/skills/generic-exploratory-qa/SKILL.md` → section **PRD-Driven Protocol** when `config.prdPath` is set.
 
 ---
 
@@ -166,3 +173,5 @@ Both files are read by the AI assistant at runtime — keep them accurate.
 | Running same auth check in two flow classes | Use `reportedAuthPaths` Set for deduplication |
 | Forgetting to rebuild after package changes | Always `npm run build` before `npm run dev` |
 | Adding a new area to `FLOW_CLASSES` but not `ALL_AREAS` | Both must be updated in `planner/index.ts` |
+| Running full matrix when a PRD was uploaded | Use `buildPrdOnlyPlan` — PRD-only happy/negative/interruption |
+| Mapping `prd-driven` to generic `runNavigation` | Use `runPrdDrivenFlow` and record `onPrdCoverageUpdate` |
