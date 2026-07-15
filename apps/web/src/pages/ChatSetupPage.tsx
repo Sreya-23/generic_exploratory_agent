@@ -2,19 +2,29 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { ChatMessage, SetupChatResponse } from '@qa/shared';
 import { ChatPanel } from '../components/chat/ChatPanel';
-import { createSession, sendSetupChat, initSetupChat, startSession } from '../api/client';
+import {
+  createSession,
+  sendSetupChat,
+  initSetupChat,
+  startSession,
+  uploadSetupPrd,
+} from '../api/client';
 
 const SETUP_CONV_KEY = 'qa-setup-conversation-id';
 
 export function ChatSetupPage() {
   const navigate = useNavigate();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [, setConversationId] = useState<string>();
+  const [conversationId, setConversationId] = useState<string>();
   const [readyToStart, setReadyToStart] = useState(false);
   const [loading, setLoading] = useState(false);
   const [starting, setStarting] = useState(false);
   const [draftSummary, setDraftSummary] = useState('');
+  const [prdName, setPrdName] = useState<string | null>(null);
+  const [uploadingPrd, setUploadingPrd] = useState(false);
+  const [prdError, setPrdError] = useState('');
   const conversationIdRef = useRef<string | undefined>(undefined);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -48,10 +58,28 @@ export function ChatSetupPage() {
     setConversationId(res.conversationId);
     setMessages(res.messages);
     setReadyToStart(res.readyToStart);
+    if (res.draft.prdFilename) setPrdName(res.draft.prdFilename);
     if (res.draft.targetUrl) {
+      const prdBit = res.draft.prdFilename ? ` · PRD: ${res.draft.prdFilename}` : '';
       setDraftSummary(
-        `${res.draft.targetUrl} · ${res.draft.depth} · ${res.draft.areas.join(', ')}`,
+        `${res.draft.targetUrl} · ${res.draft.depth} · ${res.draft.areas.join(', ')}${prdBit}`,
       );
+    }
+  };
+
+  const handlePrdUpload = async (file: File | null) => {
+    if (!file || !conversationIdRef.current) return;
+    setUploadingPrd(true);
+    setPrdError('');
+    try {
+      const res = await uploadSetupPrd(conversationIdRef.current, file);
+      applyResponse(res);
+      setPrdName(file.name);
+    } catch (err) {
+      setPrdError((err as Error).message);
+    } finally {
+      setUploadingPrd(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
@@ -67,7 +95,8 @@ export function ChatSetupPage() {
         await handleStart(res);
       }
     } catch (err) {
-      if ((err as Error).message.includes('Failed to send message')) {
+      const errMsg = (err as Error).message;
+      if (errMsg.includes('Failed to send message') || errMsg.includes('Conversation')) {
         try {
           const fresh = await initSetupChat();
           conversationIdRef.current = fresh.conversationId;
@@ -84,6 +113,16 @@ export function ChatSetupPage() {
         } catch {
           /* ignore */
         }
+      } else {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `err-${Date.now()}`,
+            role: 'assistant',
+            content: `Something went wrong: ${errMsg}`,
+            timestamp: new Date().toISOString(),
+          },
+        ]);
       }
     } finally {
       setLoading(false);
@@ -125,13 +164,34 @@ export function ChatSetupPage() {
         <div>
           <h1>Exploratory QA Chat</h1>
           <p className="subtitle">
-            Describe what to test in plain language — I'll configure the exploration for you.
+            Describe what to test in plain language — optionally upload a PRD to test only those features.
           </p>
           {draftSummary && <p className="draft-summary">{draftSummary}</p>}
         </div>
         <a href="/setup" className="form-link">
           Prefer a form? Use classic setup →
         </a>
+      </div>
+
+      <div className="prd-upload-bar">
+        <label className="prd-upload-label">
+          <span>PRD file (optional — PDF)</span>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".pdf,.md,.txt,application/pdf,text/plain,text/markdown"
+            disabled={uploadingPrd || !conversationId}
+            onChange={(e) => handlePrdUpload(e.target.files?.[0] ?? null)}
+          />
+        </label>
+        {uploadingPrd && <span className="prd-upload-status">Uploading…</span>}
+        {prdName && !uploadingPrd && (
+          <span className="prd-upload-status prd-attached">Attached: {prdName}</span>
+        )}
+        {prdError && <span className="prd-upload-status prd-error">{prdError}</span>}
+        <p className="prd-upload-hint">
+          If uploaded, the agent tests only PRD features (happy + negative + interruption) and skips the generic matrix.
+        </p>
       </div>
 
       <ChatPanel

@@ -174,6 +174,7 @@ export const FLOW_TITLES: Record<string, string> = {
   // Journeys
   'journey': 'Domain Journey',
   'user-directed': 'User-Directed Flow',
+  'prd-driven': 'PRD Feature Test',
   // API
   'crud': 'CRUD Endpoints',
   'auth-matrix': 'Auth Matrix',

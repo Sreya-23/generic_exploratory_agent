@@ -259,7 +259,22 @@ export function buildPlan(
   config: SessionConfig,
   prdFeatures?: string[],
   classification?: SiteClassification,
+  prdConstraints?: string[],
+  prdFeatureCriteria?: string[],
 ): ExplorationPlan {
+  // ── PRD-only mode ──────────────────────────────────────────────────────────
+  // When a PRD was uploaded, run ONLY feature-focused QA (happy / negative /
+  // interruption). Do NOT run the generic A1–H3 matrix.
+  if (prdFeatures && prdFeatures.length > 0) {
+    return buildPrdOnlyPlan(
+      sessionId,
+      config,
+      prdFeatures,
+      prdConstraints ?? [],
+      prdFeatureCriteria ?? [],
+    );
+  }
+
   const plan = buildPlanFromContext(sessionId, config);
 
   // User-directed flow instructions get highest priority
@@ -282,28 +297,119 @@ export function buildPlan(
     });
   }
 
-  if (prdFeatures && prdFeatures.length > 0) {
-    const prdTasks: FlowTask[] = prdFeatures.slice(0, 10).map((feature, i) => ({
-      id: `prd-${i}`,
-      area: 'ui' as const,
-      flowClass: 'prd-driven',
-      title: `PRD: ${feature.slice(0, 80)}`,
-      description: feature,
-      priority: -10 + i,
-    }));
-
-    plan.tasks = [...prdTasks, ...plan.tasks];
-    plan.phases.unshift({
-      id: 'prd',
-      name: 'PRD-driven',
-      description: 'Flows extracted from uploaded PRD',
-      taskIds: prdTasks.map((t) => t.id),
-    });
-  }
-
   if (classification) {
     injectJourneyTasks(plan, classification);
   }
 
   return plan;
 }
+
+/**
+ * Build a QA plan from PRD features only.
+ * For each feature: happy path + negative/empty/invalid + interruption (back/refresh).
+ */
+export function buildPrdOnlyPlan(
+  sessionId: string,
+  config: SessionConfig,
+  features: string[],
+  constraints: string[],
+  featureCriteria: string[] = [],
+): ExplorationPlan {
+  const tasks: FlowTask[] = [
+    {
+      id: 'recon-site-map',
+      area: 'ui',
+      flowClass: 'recon',
+      title: 'Site reconnaissance (PRD context)',
+      description: 'Map the site so PRD feature tests can locate UI elements',
+      priority: 0,
+    },
+    {
+      id: 'prd-auth-smoke',
+      area: 'ui',
+      flowClass: 'prd-driven',
+      title: 'PRD auth smoke gate',
+      description:
+        'Fail fast if session restore / post-login landing is broken before deep PRD feature tests',
+      priority: 1,
+      meta: {
+        prdFeature: 'Auth smoke gate',
+        prdVariant: 'happy',
+        prdRequirementId: 'SMOKE',
+        isAuthSmoke: true,
+      },
+    },
+  ];
+
+  const limited = features.slice(0, 12);
+  const variants: Array<{ variant: 'happy' | 'negative' | 'interruption'; label: string }> = [
+    { variant: 'happy', label: 'Happy path' },
+    { variant: 'negative', label: 'Negative / empty / invalid' },
+    { variant: 'interruption', label: 'Interruption (back / refresh)' },
+  ];
+
+  let priority = 2;
+  const prdTaskIds: string[] = ['prd-auth-smoke'];
+
+  for (let i = 0; i < limited.length; i++) {
+    const feature = limited[i];
+    const requirementId = `F${i + 1}`;
+    for (const { variant, label } of variants) {
+      const id = `prd-${i}-${variant}`;
+      prdTaskIds.push(id);
+      tasks.push({
+        id,
+        area: 'ui',
+        flowClass: 'prd-driven',
+        title: `PRD [${requirementId}][${label}]: ${feature.slice(0, 60)}`,
+        description: feature,
+        priority: priority++,
+        meta: {
+          prdFeature: feature,
+          prdVariant: variant,
+          prdConstraints: constraints.slice(0, 10),
+          prdRequirementId: requirementId,
+          prdCriteria: featureCriteria[i]?.slice(0, 180),
+        },
+      });
+    }
+  }
+
+  // Optional user-directed extras still allowed alongside PRD
+  if (config.flowInstructions && config.flowInstructions.length > 0) {
+    for (let i = 0; i < config.flowInstructions.length; i++) {
+      const instruction = config.flowInstructions[i];
+      tasks.push({
+        id: `user-directed-${i}-${randomUUID().slice(0, 6)}`,
+        area: 'ui',
+        flowClass: 'user-directed',
+        title: instruction.length > 60 ? `${instruction.slice(0, 57)}...` : instruction,
+        description: instruction,
+        priority: priority++,
+      });
+    }
+  }
+
+  const phases: PlanPhase[] = [
+    {
+      id: 'recon',
+      name: 'Recon',
+      description: 'Map site structure for PRD feature discovery',
+      taskIds: ['recon-site-map'],
+    },
+    {
+      id: 'prd',
+      name: 'PRD-driven QA',
+      description: `Auth smoke + ${limited.length} PRD feature(s) — happy, negative, interruption (generic matrix skipped)`,
+      taskIds: prdTaskIds,
+    },
+  ];
+
+  return {
+    sessionId,
+    phases,
+    tasks,
+    generatedAt: new Date().toISOString(),
+  };
+}
+

@@ -11,7 +11,7 @@ import type { SessionConfig } from '@qa/shared';
 import { EXPLORATION_AREAS, SESSION_DEPTHS } from '@qa/shared';
 import { orchestrator } from '@qa/agent-core';
 import { liveChatStore } from '@qa/chat-agent';
-import { registerChatRoutes, bridgeSessionEventToChat } from './routes/chat.js';
+import { registerChatRoutes, bridgeSessionEventToChat, registerPrdAndReportRoutes } from './routes/chat.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '../../..');
@@ -38,7 +38,7 @@ await clearSessionsDir();
 const app = Fastify({ logger: true });
 
 await app.register(cors, { origin: true });
-await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } });
+await app.register(multipart, { limits: { fileSize: 20 * 1024 * 1024 } });
 await app.register(websocket);
 
 await app.register(fastifyStatic, {
@@ -59,6 +59,9 @@ app.get('/', async () => ({
     sessions: 'GET /api/sessions',
     createSession: 'POST /api/sessions',
     startSession: 'POST /api/sessions/:id/start',
+    uploadPrd: 'POST /api/sessions/:id/upload-prd',
+    setupUploadPrd: 'POST /api/chat/setup/upload-prd?conversationId=',
+    report: 'GET /api/sessions/:id/report?format=md|json',
     liveUpdates: 'WS /api/sessions/:id/ws',
     chatSetup: 'POST /api/chat/setup',
     sessionChat: 'GET|POST /api/sessions/:id/chat',
@@ -72,6 +75,7 @@ app.get('/api/meta', async () => ({
 }));
 
 await registerChatRoutes(app);
+registerPrdAndReportRoutes(app, SESSIONS_DIR);
 
 app.get('/api/sessions', async () => orchestrator.listSessions());
 
@@ -100,6 +104,9 @@ app.post<{ Body: SessionConfig }>('/api/sessions', async (req) => {
     credentials: config.credentials ?? { type: 'none' },
     openApiUrl: config.openApiUrl,
     prdPath: config.prdPath,
+    prdFilename: config.prdFilename,
+    flowInstructions: config.flowInstructions,
+    selectedFlowClasses: config.selectedFlowClasses,
   });
   return session;
 });
@@ -129,14 +136,22 @@ app.post<{ Params: { id: string } }>(
     if (!data) return reply.status(400).send({ error: 'No file uploaded' });
 
     const buffer = await data.toBuffer();
-    const ext = data.filename?.split('.').pop() ?? 'txt';
+    const filename = data.filename ?? 'prd.pdf';
+    const ext = filename.split('.').pop()?.toLowerCase() ?? 'pdf';
+    if (!['pdf', 'md', 'txt'].includes(ext)) {
+      return reply.status(400).send({
+        error: 'Unsupported file type. Upload a .pdf, .md, or .txt PRD.',
+      });
+    }
+
     const prdPath = join(SESSIONS_DIR, req.params.id, `prd.${ext}`);
     await mkdir(join(SESSIONS_DIR, req.params.id), { recursive: true });
     const { writeFile } = await import('node:fs/promises');
     await writeFile(prdPath, buffer);
 
     session.config.prdPath = prdPath;
-    return { prdPath, filename: data.filename };
+    session.config.prdFilename = filename;
+    return { prdPath, filename };
   },
 );
 

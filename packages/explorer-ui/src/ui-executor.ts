@@ -20,6 +20,7 @@ import { runEmptyStates } from './flows/empty-states.js';
 import { runBackDuringAction } from './flows/interruption.js';
 import { runJourneyFlow } from './flows/journey.js';
 import { runUserDirectedFlow } from './flows/user-directed.js';
+import { runPrdDrivenFlow } from './flows/prd-driven.js';
 import { runViewport } from './flows/viewport.js';
 import { runErrorUi } from './flows/error-ui.js';
 import { runAutofill } from './flows/autofill.js';
@@ -34,6 +35,11 @@ import {
 } from './flows/session-flows.js';
 import { runGoldenPath, runVisualRegression } from './flows/regression.js';
 import { performLogin } from './auth/login.js';
+import {
+  ensureAuthenticatedLanding,
+  finalizePostLoginLanding,
+  resolveExplorationStartUrl,
+} from './auth/post-login.js';
 
 let sharedBrowser: Browser | null = null;
 
@@ -146,7 +152,13 @@ export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean
         return false;
       }
       await saveSessionState(context, sessionDir);
-      ctx.onLog(`[Auth/OAuth] Session saved. Post-login URL: ${page.url()}`);
+      const postLoginUrl = await finalizePostLoginLanding(
+        page,
+        sessionDir,
+        ctx.config.targetUrl,
+        (m) => ctx.onLog(m),
+      );
+      ctx.onLog(`[Auth/OAuth] Session saved. Post-login URL: ${postLoginUrl}`);
       await context.close();
       return true;
     }
@@ -183,7 +195,13 @@ export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean
         await page.waitForTimeout(2000);
       }
       await saveSessionState(context, sessionDir);
-      ctx.onLog(`[Auth/MagicLink] Session saved. Post-login URL: ${page.url()}`);
+      const postLoginUrl = await finalizePostLoginLanding(
+        page,
+        sessionDir,
+        ctx.config.targetUrl,
+        (m) => ctx.onLog(m),
+      );
+      ctx.onLog(`[Auth/MagicLink] Session saved. Post-login URL: ${postLoginUrl}`);
       await context.close();
       return true;
     }
@@ -260,7 +278,12 @@ export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean
 
     // Save authenticated session state for all tasks
     await saveSessionState(context, sessionDir);
-    const postLoginUrl = page.url();
+    const postLoginUrl = await finalizePostLoginLanding(
+      page,
+      sessionDir,
+      ctx.config.targetUrl,
+      (m) => ctx.onLog(m),
+    );
     ctx.onLog(`[Auth] Session saved. Post-login URL: ${postLoginUrl}`);
     await context.close();
     return true;
@@ -330,7 +353,7 @@ const FLOW_HANDLERS: Record<
   'back-during-post': runBackDuringAction,
   'refresh-during-request': runBackDuringAction,
   'context-driven': runNavigation,
-  'prd-driven': runNavigation,
+  'prd-driven': runPrdDrivenFlow,
   'journey': runJourneyFlow,
   'user-directed': runUserDirectedFlow,
   // A6 — Viewport
@@ -376,21 +399,48 @@ export class UiExecutor implements BaseExecutor {
     ctx.onLog(`[UI] Starting: ${task.title}`);
 
     let page: Page | null = null;
+    const TASK_TIMEOUT_MS = 90_000;
+    const heartbeat = setInterval(() => {
+      ctx.onLog(`[UI] Still working on: ${task.title.slice(0, 80)}…`);
+    }, 10_000);
+
     try {
       page = await createPage(wrappedCtx);
-      await page.goto(ctx.config.targetUrl, {
+      const startUrl = resolveExplorationStartUrl(ctx);
+      await page.goto(startUrl, {
         waitUntil: 'domcontentloaded',
         timeout: 30000,
       });
-      await loginIfNeeded(page, wrappedCtx);
+
+      // Cookies restored but landed on login form (e.g. Sauce Demo `/`) → jump to app
+      const landed = await ensureAuthenticatedLanding(page, wrappedCtx);
+      if (!landed) {
+        await loginIfNeeded(page, wrappedCtx);
+        await ensureAuthenticatedLanding(page, wrappedCtx);
+      }
 
       const handler = FLOW_HANDLERS[task.flowClass];
-      if (handler) {
-        await handler(page, wrappedCtx, task);
-      } else {
-        ctx.onLog(`[UI] No handler for flow: ${task.flowClass}, running navigation fallback`);
-        await runNavigation(page, wrappedCtx, task);
-      }
+      const run = async () => {
+        if (handler) {
+          await handler(page!, wrappedCtx, task);
+        } else {
+          ctx.onLog(`[UI] No handler for flow: ${task.flowClass}, running navigation fallback`);
+          await runNavigation(page!, wrappedCtx, task);
+        }
+      };
+
+      await Promise.race([
+        run(),
+        new Promise<never>((_, reject) => {
+          setTimeout(() => {
+            reject(
+              new Error(
+                `Task timeout after ${TASK_TIMEOUT_MS / 1000}s — aborted to keep the session moving`,
+              ),
+            );
+          }, TASK_TIMEOUT_MS);
+        }),
+      ]);
 
       return { taskId: task.id, success: true, findingsCount };
     } catch (err) {
@@ -417,6 +467,7 @@ export class UiExecutor implements BaseExecutor {
       }
       return { taskId: task.id, success: false, findingsCount, error: msg };
     } finally {
+      clearInterval(heartbeat);
       if (page) await page.context().close();
     }
   }

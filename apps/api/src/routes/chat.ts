@@ -1,15 +1,18 @@
 import type { FastifyInstance } from 'fastify';
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import {
   getOrCreateSetupConversation,
   processSetupMessage,
   applyProbeToConversation,
+  attachPrdToSetupConversation,
   liveChatStore,
   processLiveMessage,
   sessionEventToChatMessage,
 } from '@qa/chat-agent';
 import { probeAuth } from '@qa/explorer-ui';
 import type { SessionCredentials, SessionEvent } from '@qa/shared';
-import { orchestrator } from '@qa/agent-core';
+import { orchestrator, generateSessionReportMarkdown } from '@qa/agent-core';
 
 function extractUrlFromMessage(text: string): string | undefined {
   const match = text.match(/https?:\/\/[^\s<>"']+/i);
@@ -38,8 +41,35 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       const shouldProbe = !!urlInMessage && !conversation.draft.authProbe;
 
       if (shouldProbe && urlInMessage) {
-        const probe = await probeAuth(urlInMessage);
-        return applyProbeToConversation(conversation, probe);
+        try {
+          const probe = await probeAuth(urlInMessage);
+          return applyProbeToConversation(conversation, probe);
+        } catch (err) {
+          const msg = (err as Error).message ?? String(err);
+          const looksLikeMissingBrowser =
+            /Executable doesn't exist|playwright install|browserType\.launch/i.test(msg);
+          conversation.draft.targetUrl = urlInMessage;
+          conversation.messages.push({
+            id: `probe-err-${Date.now()}`,
+            role: 'assistant',
+            content: looksLikeMissingBrowser
+              ? `⚠️ I saved your URL (**${urlInMessage}**), but couldn't open a browser to auto-detect login.\n\n` +
+                `Playwright Chromium is missing. On the server, run:\n\`\`\`\nnpx playwright install chromium\n\`\`\`\n` +
+                `Then restart \`npm run dev\` and send the URL again.\n\n` +
+                `Meanwhile you can still continue: tell me if login is needed, e.g. \`username: standard_user password: secret_sauce\`.`
+              : `⚠️ I saved your URL (**${urlInMessage}**), but auth probe failed:\n\`${msg.slice(0, 200)}\`\n\n` +
+                `You can continue manually — provide credentials if needed, then say **start**.`,
+            timestamp: new Date().toISOString(),
+            meta: { kind: 'setup' },
+          });
+          return {
+            conversationId: conversation.id,
+            messages: conversation.messages,
+            draft: conversation.draft,
+            readyToStart: false,
+            missing: conversation.draft.targetUrl ? [] : ['target URL'],
+          };
+        }
       }
 
       return response;
@@ -114,7 +144,6 @@ export async function registerChatRoutes(app: FastifyInstance): Promise<void> {
       }
 
       if (result.action === 'update_auth' && result.credentials) {
-        // Handles both auth state updates and extras (card, phone, etc.) updates
         orchestrator.updateCredentials(req.params.id, result.credentials, result.authState);
       }
 
@@ -152,4 +181,64 @@ export function bridgeSessionEventToChat(event: SessionEvent): SessionEvent | nu
     timestamp: chatMsg.timestamp,
     payload: chatMsg,
   };
+}
+
+/** PRD upload during setup chat + session report download */
+export function registerPrdAndReportRoutes(app: FastifyInstance, sessionsDir: string): void {
+  app.post<{ Querystring: { conversationId?: string } }>(
+    '/api/chat/setup/upload-prd',
+    async (req, reply) => {
+      const conversationId = req.query.conversationId;
+      if (!conversationId) {
+        return reply.status(400).send({ error: 'conversationId query param is required' });
+      }
+
+      try {
+        getOrCreateSetupConversation(conversationId);
+      } catch (err) {
+        return reply.status(404).send({ error: (err as Error).message });
+      }
+
+      const data = await req.file();
+      if (!data) return reply.status(400).send({ error: 'No file uploaded' });
+
+      const buffer = await data.toBuffer();
+      const filename = data.filename ?? 'prd.pdf';
+      const ext = filename.split('.').pop()?.toLowerCase() ?? 'pdf';
+      if (!['pdf', 'md', 'txt'].includes(ext)) {
+        return reply.status(400).send({
+          error: 'Unsupported file type. Upload a .pdf, .md, or .txt PRD.',
+        });
+      }
+
+      const setupDir = join(sessionsDir, `setup-${conversationId}`);
+      await mkdir(setupDir, { recursive: true });
+      const prdPath = join(setupDir, `prd.${ext}`);
+      const { writeFile } = await import('node:fs/promises');
+      await writeFile(prdPath, buffer);
+
+      return attachPrdToSetupConversation(conversationId, prdPath, filename);
+    },
+  );
+
+  app.get<{ Params: { id: string }; Querystring: { format?: string } }>(
+    '/api/sessions/:id/report',
+    async (req, reply) => {
+      const session = orchestrator.getSession(req.params.id);
+      if (!session) return reply.status(404).send({ error: 'Session not found' });
+
+      const format = req.query.format ?? 'md';
+      if (format === 'json') {
+        return {
+          session,
+          prdCoverage: session.prdCoverage ?? null,
+          reportMarkdown: generateSessionReportMarkdown(session),
+        };
+      }
+
+      const md = generateSessionReportMarkdown(session);
+      reply.header('content-type', 'text/markdown; charset=utf-8');
+      return md;
+    },
+  );
 }

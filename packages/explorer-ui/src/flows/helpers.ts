@@ -5,17 +5,25 @@ import type { Page } from 'playwright';
 
 /**
  * Returns true if the current page looks like a login/auth wall.
- * Used to suppress false-positive findings (no nav, no links) on login pages.
+ * Only counts *visible* password / OTP fields so hidden template fields
+ * don't false-positive. Used to suppress false findings on real login pages.
  */
 export async function isLoginWallPage(page: Page): Promise<boolean> {
-  const pwCount = await page.locator('input[type="password"]').count();
-  if (pwCount > 0) return true;
+  const password = page.locator('input[type="password"]');
+  const pwCount = await password.count();
+  for (let i = 0; i < pwCount; i++) {
+    if (await password.nth(i).isVisible().catch(() => false)) return true;
+  }
 
-  // Also catch OTP-only walls (no password field but has a 6-digit code input)
-  const otpInput = await page
-    .locator('input[autocomplete="one-time-code"], input[maxlength="6"][type="text"]')
-    .count();
-  return otpInput > 0;
+  const otp = page.locator(
+    'input[autocomplete="one-time-code"], input[maxlength="6"][type="text"]',
+  );
+  const otpCount = await otp.count();
+  for (let i = 0; i < otpCount; i++) {
+    if (await otp.nth(i).isVisible().catch(() => false)) return true;
+  }
+
+  return false;
 }
 
 /**

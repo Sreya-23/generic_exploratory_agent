@@ -83,7 +83,10 @@ export type AuthState =
 export interface SessionConfig {
   targetUrl: string;
   context?: string;
+  /** Absolute path to uploaded PRD file (.pdf, .md, .txt). When set, exploration is PRD-only. */
   prdPath?: string;
+  /** Original filename for display (e.g. in chat / report). */
+  prdFilename?: string;
   depth: SessionDepth;
   areas: ExplorationArea[];
   credentials?: SessionCredentials;
@@ -92,6 +95,59 @@ export interface SessionConfig {
   flowInstructions?: string[];
   /** Explicit list of flowClass strings to run (pinned from matrix IDs) */
   selectedFlowClasses?: string[];
+}
+
+/** QA variant run against a single PRD feature */
+export type PrdTestVariant = 'happy' | 'negative' | 'interruption';
+
+export type PrdFeatureStatus = 'tested' | 'passed' | 'failed' | 'blocked' | 'skipped' | 'gap';
+
+export interface PrdFeatureCoverage {
+  feature: string;
+  variant: PrdTestVariant;
+  status: PrdFeatureStatus;
+  notes: string;
+  findingsCount: number;
+  /** Stable PRD requirement id (e.g. F1, SMOKE) for traceability */
+  requirementId?: string;
+  /** FlowTask.id that produced this result */
+  taskId?: string;
+  /** Truncated acceptance criteria / user story from the PRD */
+  criteria?: string;
+}
+
+export interface PrdFeatureDetail {
+  requirementId: string;
+  name: string;
+  /** User story or acceptance snippet from the PRD */
+  criteria?: string;
+}
+
+export interface FindingFingerprintDiff {
+  previousSessionId?: string;
+  newFindings: string[];
+  fixedFindings: string[];
+  recurringFindings: string[];
+  markdown: string;
+}
+
+export interface PrdCoverageSummary {
+  prdFilename?: string;
+  featuresExtracted: string[];
+  constraintsExtracted: string[];
+  /** F1…Fn with truncated criteria for report traceability */
+  featureDetails?: PrdFeatureDetail[];
+  featureResults: PrdFeatureCoverage[];
+  /** Features with no matching UI found */
+  gaps: string[];
+  /** Features blocked (login, sensitive gate, etc.) */
+  blocked: string[];
+  testedCount: number;
+  passedCount: number;
+  failedCount: number;
+  /** Diff vs previous session for same target (when available) */
+  findingDiff?: FindingFingerprintDiff;
+  markdown: string;
 }
 
 export interface Finding {
@@ -108,6 +164,18 @@ export interface Finding {
   reproRate: string;
   automationCandidate: boolean;
   createdAt: string;
+  /** PRD requirement id when finding came from PRD-driven QA */
+  requirementId?: string;
+  /** FlowTask.id when finding came from a planned task */
+  taskId?: string;
+  /** Stable fingerprint for cross-session diff (area|normalized-title) */
+  fingerprint?: string;
+  /**
+   * When set, this is a known demo/environment quirk — not a production-severity defect.
+   * Severity is usually downgraded to info.
+   */
+  quarantineReason?: string;
+  tags?: string[];
 }
 
 export interface FlowTask {
@@ -117,6 +185,18 @@ export interface FlowTask {
   title: string;
   description: string;
   priority: number;
+  /** Optional metadata — used heavily for PRD-driven tasks */
+  meta?: {
+    prdFeature?: string;
+    prdVariant?: PrdTestVariant;
+    prdConstraints?: string[];
+    /** e.g. F1, F2 — maps PRD feature → tasks → findings */
+    prdRequirementId?: string;
+    /** Truncated acceptance criteria from PRD */
+    prdCriteria?: string;
+    /** When true, this task is the pre-PRD auth smoke gate */
+    isAuthSmoke?: boolean;
+  };
 }
 
 export interface ExplorationPlan {
@@ -149,6 +229,8 @@ export interface SessionState {
    * (including API executor which runs later) can access them.
    */
   discoveredApiEndpoints?: string[];
+  /** Populated when a PRD was uploaded — coverage of PRD features vs what was tested */
+  prdCoverage?: PrdCoverageSummary;
   createdAt: string;
   updatedAt: string;
   error?: string;
@@ -179,7 +261,8 @@ export type SessionEventType =
   | 'chat:message'
   | 'chat:history'
   | 'auth:required'
-  | 'auth:otp_required';
+  | 'auth:otp_required'
+  | 'prd:coverage';
 
 export interface SessionEvent {
   type: SessionEventType;
@@ -232,6 +315,8 @@ export interface ExecutorContext {
    * The orchestrator also emits a live chat message prompting the user to provide missing data.
    */
   onPreActionNeeded?: (req: PreActionRequest) => Record<string, string> | null;
+  /** Called by PRD-driven flows to record per-feature coverage */
+  onPrdCoverageUpdate?: (update: PrdFeatureCoverage) => void;
 }
 
 export interface ExecutorResult {
@@ -276,6 +361,9 @@ export interface SetupDraft {
   flowInstructions?: string[];
   /** Explicitly selected matrix flow IDs (e.g. "A6", "B2", "C4") mapped to flowClass strings */
   selectedFlowClasses?: string[];
+  /** Absolute path to PRD uploaded during setup chat (optional) */
+  prdPath?: string;
+  prdFilename?: string;
 }
 
 export interface SetupChatResponse {

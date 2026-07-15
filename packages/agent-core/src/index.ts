@@ -1,3 +1,12 @@
-export { buildPlan, buildGenericPlan, buildPlanFromContext } from './planner/index.js';
-export { saveSessionState } from './reporter/index.js';
+export { buildPlan, buildGenericPlan, buildPlanFromContext, buildPrdOnlyPlan } from './planner/index.js';
+export {
+  saveSessionState,
+  generateSessionReportMarkdown,
+  chatSummaryFromCoverage,
+} from './reporter/index.js';
+export {
+  fingerprintFinding,
+  diffFindingFingerprints,
+  loadPreviousSessionFindings,
+} from './reporter/finding-diff.js';
 export { SessionOrchestrator, orchestrator } from './orchestrator/run-session.js';

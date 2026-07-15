@@ -98,13 +98,18 @@ export function SessionSetupPage() {
             />
           </label>
           <label>
-            PRD file (optional)
+            PRD file (optional — PDF recommended)
             <input
               type="file"
-              accept=".md,.txt,.pdf,.doc,.docx"
+              accept=".pdf,.md,.txt,application/pdf,text/plain,text/markdown"
               onChange={(e) => setPrdFile(e.target.files?.[0] ?? null)}
             />
+            <span className="field-hint">
+              If provided, exploration runs <strong>PRD-only</strong>: happy path, negative/empty/invalid,
+              and interruption tests for each extracted feature (generic matrix skipped).
+            </span>
           </label>
+          {prdFile && <p className="prd-upload-status prd-attached">Selected: {prdFile.name}</p>}
         </section>
 
         <section className="form-section">
