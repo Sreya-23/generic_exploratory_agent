@@ -67,6 +67,8 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | A11 | File upload | `file-upload` | ✅ | Wrong MIME type, 10MB+ file, empty file, cancel mid-upload |
 | A12 | Pagination | `pagination-ui` | ✅ | Last page, jump pages, prev/next disabled states, refresh mid-scroll |
 | A13 | Multi-step wizard | `wizard` | ✅ | URL step-skip, back on step 3, data persistence across steps |
+| A14 | Malicious file upload content | `file-upload-security` | 📋 | Double extension (`.jpg.exe`), script embedded in SVG, zip bomb, polyglot file — extends A11's MIME/size-only checks |
+| A15 | Internationalization & RTL | `i18n-rtl` | 📋 | RTL layout rendering, bidi/non-Latin text input, locale-specific date/number formats |
 
 ## Navigation & Session
 
@@ -80,6 +82,7 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | B6 | Session timeout mid-flow | `session-timeout` | ✅ | **Two-phase**: Phase 1 clears cookies only (real-world expiry) — if still authenticated → HIGH finding (auth in localStorage). Phase 2 clears storage too — confirms where auth lives. Also checks leftover storage keys after logout |
 | B7 | Logout in another tab | `multi-tab-logout` | ✅ | Two-context test; reloads tab 1 after tab 2 logs out |
 | B8 | Bookmark stale URL | — | 📋 | Requires persisted session IDs from prior run |
+| B9 | Concurrent edit / lost update | `concurrent-write` | 📋 | Two sessions/tabs edit the same resource simultaneously; checks for last-write-wins silently discarding one edit vs a conflict warning |
 
 ## Network & Chaos
 
@@ -104,6 +107,9 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | D6 | Type confusion | `boundary` | 🔄 | API probe only — sends wrong types (string for int etc.) |
 | D7 | Rate limiting | `rate-limit` | ✅ | 20 rapid requests to target site's own endpoint (not local server); checks for 429 |
 | D8 | Error shape consistency | — | 📋 | Needs API contract/schema to compare error formats |
+| D9 | Token/clock-skew edge cases | `token-expiry` | 📋 | Near-expiry JWT, token expired by 1s, server tolerance for client clock skew |
+| D10 | CSRF protection | `csrf-probe` | 📋 | State-changing request replayed without CSRF token / custom header / Origin check |
+| D11 | GraphQL-specific probes | `graphql-probe` | 📋 | Introspection query exposure, batch-query cost abuse, query-depth limit bypass — only runs if a GraphQL endpoint is discovered |
 
 ## Security
 
@@ -114,6 +120,18 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | F3 | Vertical privilege | `vertical-privilege` | ✅ | Low-role user accessing admin endpoints |
 | F4 | XSS in inputs | `xss-probe` | 🔄 | Basic payload injection; reflection check only |
 | F5 | Mass assignment | `mass-assignment` | ✅ | Extra fields in POST body (role, isAdmin, price) |
+| F6 | Security headers audit | `security-headers` | 📋 | Presence/misconfig of CSP, X-Frame-Options, HSTS, X-Content-Type-Options, Referrer-Policy |
+| F7 | Cookie security flags | `cookie-flags` | 📋 | Secure / HttpOnly / SameSite attributes on session cookies |
+| F8 | Clickjacking | `clickjacking-probe` | 📋 | Page frameable via iframe; missing frame-busting / CSP `frame-ancestors` |
+| F9 | Open redirect | `open-redirect` | 📋 | Manipulate redirect/return-url query params to point at an external domain |
+
+## Accessibility
+
+| ID | Flow | Flow Class | Status | What it does |
+|----|------|-----------|--------|--------------|
+| E1 | Labels & ARIA | `labels` | 📋 | Planned — no entry in `FLOW_HANDLERS`; task currently falls back to the generic `navigation` flow, producing no accessibility-specific findings |
+| E2 | Keyboard access | `keyboard` | 📋 | Planned — same fallback; not the same check as `A5 keyboard-nav`, which only covers Tab order/focus trap, not a11y semantics |
+| E3 | Colour contrast | `contrast` | 📋 | Planned — same fallback; no contrast-ratio computation implemented anywhere in the codebase |
 
 ## Performance
 
@@ -132,6 +150,15 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | H2 | API schema drift | `schema-drift` | ✅ | Compares response shape against known endpoints; flags missing/added fields |
 | H3 | Visual regression | `visual-regression` | ✅ | Pixel-diff against golden snapshot; reports if diff > threshold |
 
+## Business Logic
+
+| ID | Flow | Flow Class | Status | What it does |
+|----|------|-----------|--------|--------------|
+| I1 | Client-side price/total tampering | `price-tamper` | 📋 | Modify cart total/quantity/price via devtools or intercepted request before submit; server must recompute from source of truth, not trust the client value |
+| I2 | Negative/zero quantity or amount | `negative-value` | 📋 | Submit -1 quantity, 0-amount transfer, negative discount — checks server-side bounds validation |
+| I3 | Coupon/discount reuse or stacking | `coupon-abuse` | 📋 | Apply a single-use coupon twice, or stack discounts meant to be mutually exclusive |
+| I4 | Expired / future-dated business logic | `date-boundary-logic` | 📋 | Book a past date, use an expired offer, select a date across a DST boundary |
+
 ---
 
 ## Not Implemented (📋 Planned)
@@ -142,3 +169,5 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | B8 | Needs session IDs persisted from a prior run to simulate stale bookmarks |
 | D8 | Needs an API contract (OpenAPI/Swagger) to compare error shape against |
 | G4 | Needs server-level restart/cold-start hooks outside the browser |
+| E1–E3 | `accessibility` is a real area (`FLOW_CLASSES.accessibility`) but is deliberately excluded from `ALL_AREAS` in `planner/index.ts` (2026-07-15) so it's no longer scheduled by default — `labels`/`keyboard`/`contrast` have no entry in `FLOW_HANDLERS` and would otherwise silently run the generic navigation check instead, wasting task budget. Still runnable explicitly (`selectedFlowClasses`, e.g. "run E1, E2, E3"). Needs real handlers (axe-core-style label/ARIA audit, dedicated keyboard-semantics check, contrast-ratio computation) before this can be marked ✅ or re-added to defaults |
+| A14, A15, B9, D9–D11, F6–F9, I1–I4 | New cases proposed 2026-07-15 — none have a `FLOW_CLASSES` entry, `FLOW_HANDLERS` implementation, or planner scheduling yet. Highest-value first builds: F6 (security-headers, cheap — one `page.on('response')` header read), I1 (price-tamper, catches real business-logic bugs), D9 (token-expiry, reuses existing auth-matrix plumbing) |

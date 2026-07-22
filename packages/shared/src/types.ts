@@ -231,6 +231,11 @@ export interface SessionState {
   discoveredApiEndpoints?: string[];
   /** Populated when a PRD was uploaded — coverage of PRD features vs what was tested */
   prdCoverage?: PrdCoverageSummary;
+  /**
+   * URL reached after successful session login (e.g. /inventory.html).
+   * Tasks should open this instead of the login URL so exploration runs inside the app.
+   */
+  postLoginUrl?: string;
   createdAt: string;
   updatedAt: string;
   error?: string;
@@ -305,6 +310,8 @@ export interface ExecutorContext {
    * API executor uses these instead of generic guesses.
    */
   discoveredApiEndpoints?: string[];
+  /** Authenticated landing URL from performSessionLogin — prefer over targetUrl for exploration. */
+  postLoginUrl?: string;
   onFinding: (finding: Omit<Finding, 'id' | 'sessionId' | 'createdAt'>) => void;
   onLog: (message: string) => void;
   onClassification?: (c: SiteClassification) => void;

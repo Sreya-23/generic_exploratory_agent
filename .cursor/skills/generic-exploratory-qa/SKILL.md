@@ -1,3 +1,4 @@
+
 ---
 name: generic-exploratory-qa
 description: >-
@@ -8,6 +9,11 @@ description: >-
 ---
 
 # Generic Exploratory QA
+
+For **complete, site-nature-driven** exploration (all relevant tabs/fields, consent
+before pay/transfer/send, fintech-careful policies), use the sibling skill
+[site-nature-exploratory-qa](../site-nature-exploratory-qa/SKILL.md) instead of
+(or in addition to) this generic matrix baseline.
 
 ## Quick Start
 
@@ -133,9 +139,15 @@ After the URL is given and start is clicked, the agent runs ALL of these:
 - **Network & Chaos** (C1–C6): slow network, offline, flaky network, WebSocket disconnect
 - **API** (D1–D7): CRUD, auth matrix, rate limiting, idempotency
 - **Security** (F1–F5): IDOR, privilege escalation, XSS, mass assignment
-- **Accessibility** (labels, keyboard, contrast)
 - **Performance** (G1–G3): spike load, large payload, N+1 patterns
 - **Regression** (H1–H3): golden path snapshots, visual regression, schema drift
+
+> **Accessibility (E1–E3) is not scheduled by default and not yet a real check.** The `labels`/`keyboard`/`contrast`
+> flow classes have no entry in `FLOW_HANDLERS` ([ui-executor.ts](../../../packages/explorer-ui/src/ui-executor.ts))
+> — they'd silently fall back to the generic navigation flow instead of running an accessibility-specific
+> audit. `planner/index.ts` deliberately excludes `accessibility` from `ALL_AREAS` so default runs don't
+> waste task budget on that fallback. Still runnable explicitly (`"run E1, E2, E3"`) once real handlers exist.
+> Don't report accessibility as covered until then.
 
 ### Power-user: select specific tests
 
@@ -159,13 +171,15 @@ Matrix IDs map to these flow classes:
 
 | Section | IDs | Flow classes |
 |---------|-----|-------------|
-| UI & Interaction | A1–A13 | navigation, form-validation, input-boundary, double-click, keyboard-nav, viewport, modal-lifecycle, empty-states, error-ui, autofill, file-upload, pagination-ui, wizard |
-| Navigation & Session | B1–B7 | back-during-post, forward-after-back, refresh-during-request, deep-link, session-timeout, multi-tab-logout |
+| UI & Interaction | A1–A15 | navigation, form-validation, input-boundary, double-click, keyboard-nav, viewport, modal-lifecycle, empty-states, error-ui, autofill, file-upload, pagination-ui, wizard, file-upload-security 📋, i18n-rtl 📋 |
+| Navigation & Session | B1–B9 | back-during-post, forward-after-back, refresh-during-request, deep-link, session-timeout, multi-tab-logout, concurrent-write 📋 |
 | Network & Chaos | C1–C6 | slow-network, offline-mid-request, offline-recovery, flaky-network, timeout-retry, websocket-disconnect |
-| API | D1–D7 | crud, auth-matrix, idempotency, pagination, rate-limit |
-| Security | F1–F5 | idor-probe, horizontal-privilege, vertical-privilege, xss-probe, mass-assignment |
+| API | D1–D11 | crud, auth-matrix, idempotency, pagination, rate-limit, token-expiry 📋, csrf-probe 📋, graphql-probe 📋 |
+| Security | F1–F9 | idor-probe, horizontal-privilege, vertical-privilege, xss-probe, mass-assignment, security-headers 📋, cookie-flags 📋, clickjacking-probe 📋, open-redirect 📋 |
 | Performance | G1–G3 | spike-load, large-payload, n-plus-one |
 | Regression | H1–H3 | golden-path, visual-regression, schema-drift |
+| Accessibility | E1–E3 | labels, keyboard, contrast — 📋 **planned, no handler yet; falls back to `navigation`** |
+| Business Logic | I1–I4 | price-tamper, negative-value, coupon-abuse, date-boundary-logic — 📋 **planned, proposed 2026-07-15, no `FLOW_CLASSES` entry yet** |
 
 ### What the agent accepts as credentials / inputs
 
@@ -369,8 +383,9 @@ resolveEndpointPaths() returns: real endpoints if available, generic guesses onl
 | Chaos | Network failure, back mid-POST, double-submit |
 | Security | IDOR, auth bypass, XSS probes |
 | Regression | Golden path vs baseline |
-| Accessibility | Labels, tab order, contrast |
+| Accessibility | Labels, tab order, contrast — 📋 planned, currently falls back to navigation |
 | Performance | Load time, rate limits |
+| Business Logic | Price/quantity tampering, coupon abuse, date-boundary logic — 📋 planned, no handler yet |
 
 Full catalog: [exploration-matrix.md](exploration-matrix.md)
 
@@ -409,7 +424,8 @@ packages/
   agent-core/src/
     intelligence/
       classify-site.ts             # classifySite(signals) → SiteClassification (7 site types)
-    planner/index.ts               # buildGenericPlan — ALL_AREAS including accessibility
+    planner/index.ts               # buildGenericPlan — ALL_AREAS excludes accessibility by default
+                                   # (no FLOW_HANDLERS yet; still selectable explicitly)
                                    # areaForFlow() handles accessibility area
     orchestrator/run-session.ts    # performSessionLogin() called ONCE before tasks start
                                    # state.discoveredApiEndpoints persisted after each task

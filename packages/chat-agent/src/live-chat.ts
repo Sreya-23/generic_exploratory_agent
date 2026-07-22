@@ -7,7 +7,7 @@ import type {
   SessionEvent,
   SessionState,
 } from '@qa/shared';
-import { mergeCredentials, parseAuthFields, credentialsComplete, effectiveAuthState, authPromptForState } from './auth-chat.js';
+import { mergeCredentials, parseAuthFields, credentialsComplete, effectiveAuthState, authPromptForState, detectAuthCorrection, clearAuthField } from './auth-chat.js';
 
 /** Parse key:value extras from free-form text. Returns null if nothing found. */
 function parseExtras(text: string, existing?: Record<string, string>): Record<string, string> | null {
@@ -138,6 +138,24 @@ export function processLiveMessage(
       needsLogin: true,
     };
 
+    // User wants to re-enter username/password/otp after a mistake
+    const correction = detectAuthCorrection(userText);
+    if (correction) {
+      const cleared = clearAuthField(draft.credentials, correction);
+      const nextState = effectiveAuthState({ ...draft, credentials: cleared });
+      const fieldLabel =
+        correction === 'username' ? 'username / email' : correction === 'password' ? 'password' : 'OTP';
+      const prompt = authPromptForState({ ...draft, credentials: cleared, authState: nextState });
+      messages.push(
+        msg(
+          'assistant',
+          `No problem — cleared the previous ${fieldLabel}. Enter it again.\n\n${prompt}`,
+          { kind: 'auth' },
+        ),
+      );
+      return { messages, action: 'update_auth', credentials: cleared, authState: nextState };
+    }
+
     const patch = parseAuthFields(userText, draft);
     if (Object.keys(patch).length > 0) {
       const merged = mergeCredentials(draft.credentials, patch);
@@ -164,8 +182,9 @@ export function processLiveMessage(
     messages.push(
       msg(
         'assistant',
-        authPromptForState({ ...draft, authState: session.authState }) ||
-          `Please provide login details:\n- \`email: user@test.com\`\n- \`password: secret\`\n- \`otp: 123456\``,
+        (authPromptForState({ ...draft, authState: session.authState }) ||
+          `Please provide login details:\n- \`email: user@test.com\`\n- \`password: secret\`\n- \`otp: 123456\``) +
+          `\n\n_Tip: Mistyped the username? Say **"change username"** or send \`username: correct_user\`._`,
         { kind: 'auth' },
       ),
     );

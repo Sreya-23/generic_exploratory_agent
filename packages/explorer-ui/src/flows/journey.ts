@@ -571,13 +571,33 @@ async function runAuthPortalJourney(page: Page, ctx: ExecutorContext): Promise<v
 
   ctx.onLog('[Journey/auth-portal] Valid login succeeded');
 
-  // Logout test
+  // Logout is often inside a hamburger / sidebar (e.g. Sauce Demo #react-burger-menu-btn)
+  const menuTriggers = [
+    '#react-burger-menu-btn',
+    'button[id*="menu" i]',
+    '[class*="burger"]',
+    '[class*="hamburger"]',
+    '[aria-label*="menu" i]',
+    'button:has-text("Open Menu")',
+  ];
+  for (const sel of menuTriggers) {
+    const trigger = page.locator(sel).first();
+    if ((await trigger.count()) > 0 && (await trigger.isVisible().catch(() => false))) {
+      await trigger.click().catch(() => {});
+      await page.waitForTimeout(400);
+      break;
+    }
+  }
+
   const logoutLink = page.locator(
-    'a:has-text("Logout"), a:has-text("Log out"), button:has-text("Logout"), #logout_sidebar_link, [data-test="logout"]',
+    'a:has-text("Logout"), a:has-text("Log out"), button:has-text("Logout"), ' +
+      '#logout_sidebar_link, [data-test="logout"], [data-testid="logout"]',
   ).first();
 
-  if (await logoutLink.count() > 0) {
-    await logoutLink.click();
+  if ((await logoutLink.count()) > 0) {
+    await logoutLink.click({ force: true, timeout: 5000 }).catch(async () => {
+      await logoutLink.evaluate((el) => (el as HTMLElement).click()).catch(() => {});
+    });
     await page.waitForLoadState('domcontentloaded').catch(() => {});
     await page.waitForTimeout(800);
     const s3 = await shot(page, ctx, 'auth-after-logout');
@@ -588,7 +608,7 @@ async function runAuthPortalJourney(page: Page, ctx: ExecutorContext): Promise<v
         severity: 'medium',
         area: 'UI-Journey',
         title: 'Logout does not redirect to login page',
-        steps: ['Login with valid credentials', 'Click Logout'],
+        steps: ['Login with valid credentials', 'Open menu if needed', 'Click Logout'],
         expected: 'Redirected to login page',
         actual: `Landed on: ${page.url()}`,
         evidence: [s3],
@@ -598,6 +618,8 @@ async function runAuthPortalJourney(page: Page, ctx: ExecutorContext): Promise<v
     } else {
       ctx.onLog('[Journey/auth-portal] Logout correctly returns to login page');
     }
+  } else {
+    ctx.onLog('[Journey/auth-portal] No logout control found after opening menus');
   }
 }
 

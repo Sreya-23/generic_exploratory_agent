@@ -103,6 +103,81 @@ export function applyAuthProbe(draft: SetupDraft, probe: AuthProbeResult): Setup
   return draft;
 }
 
+/** Strip accidental wrapping quotes from a credential value. */
+export function cleanCredentialValue(value: string): string {
+  return value.trim().replace(/^['"`]+|['"`]+$/g, '').trim();
+}
+
+/**
+ * Detect "I entered the wrong username / let me re-enter password" style messages.
+ * Returns which field the user wants to correct, or null.
+ */
+export function detectAuthCorrection(text: string): 'username' | 'password' | 'otp' | null {
+  const t = text.toLowerCase().trim();
+  if (!t) return null;
+
+  // Explicit field labels always win (handled by parseAuthFields); this is for intent-only messages.
+  // Allow common typos: usename, user name, agin, mistakely, etc.
+  const userWord = String.raw`(?:user\s*names?|usernames?|usenames?|e-?mails?|logins?|user\b)`;
+  const passWord = String.raw`(?:pass(?:words?)?|pwd)`;
+  const otpWord = String.raw`(?:otp|codes?|verification)`;
+  const againWord = String.raw`(?:again|agin|re-?enter|reenter|change|correct|update|fix|reset|clear|mistak\w*|wrong|incorrect)`;
+
+  const wantsUsername =
+    new RegExp(`(?:${againWord}).{0,40}${userWord}`, 'i').test(t) ||
+    new RegExp(`${userWord}.{0,40}${againWord}`, 'i').test(t) ||
+    new RegExp(`(?:give|provide|enter|type|let me).{0,24}(?:the\\s+)?${userWord}`, 'i').test(t);
+
+  const wantsPassword =
+    new RegExp(`(?:${againWord}).{0,40}${passWord}`, 'i').test(t) ||
+    new RegExp(`${passWord}.{0,40}${againWord}`, 'i').test(t) ||
+    new RegExp(`(?:give|provide|enter|type|let me).{0,24}(?:the\\s+)?${passWord}.{0,15}(?:again|agin|re-?enter)`, 'i').test(t);
+
+  const wantsOtp =
+    new RegExp(`(?:${againWord}).{0,40}${otpWord}`, 'i').test(t) ||
+    new RegExp(`${otpWord}.{0,40}${againWord}`, 'i').test(t);
+
+  // Prefer the most specific field mentioned; username before password if both match vaguely.
+  if (wantsUsername && !wantsPassword) return 'username';
+  if (wantsPassword && !wantsUsername) return 'password';
+  if (wantsOtp) return 'otp';
+  if (wantsUsername) return 'username';
+  if (wantsPassword) return 'password';
+
+  // Vague "I made a mistake / reenter" while collecting auth — default to username
+  // (most common: user just saved username and wants to fix it before password)
+  if (
+    /(?:mistak\w*|wrong|re-?enter|reenter|start over|try again|do again)/i.test(t) &&
+    t.split(/\s+/).length <= 12
+  ) {
+    return 'username';
+  }
+
+  return null;
+}
+
+/**
+ * Clear a credential field so the user can re-enter it.
+ * Clearing username also clears password/otp (dependent fields).
+ */
+export function clearAuthField(
+  creds: SessionCredentials,
+  field: 'username' | 'password' | 'otp',
+): SessionCredentials {
+  const next = { ...creds };
+  if (field === 'username') {
+    delete next.username;
+    delete next.password;
+    delete next.otp;
+  } else if (field === 'password') {
+    delete next.password;
+    delete next.otp;
+  } else {
+    delete next.otp;
+  }
+  return next;
+}
+
 export function parseAuthFields(
   text: string,
   draft: SetupDraft,
@@ -137,37 +212,37 @@ export function parseAuthFields(
     /^(?:e-?mail|users?names?|user(?:name)?|login|account)\s*[:=]\s*(.+)$/i,
   );
   if (userLabelMatch) {
-    patch.username = userLabelMatch[1].trim();
+    patch.username = cleanCredentialValue(userLabelMatch[1]);
     patch.type = 'login';
   }
 
   const passLabelMatch = trimmed.match(/^(?:pass(?:words?)?|pwd)\s*[:=]\s*(.+)$/i);
   if (passLabelMatch) {
-    patch.password = passLabelMatch[1].trim();
+    patch.password = cleanCredentialValue(passLabelMatch[1]);
     patch.type = 'login';
   }
 
   const otpLabelMatch = trimmed.match(/^(?:otp|code|verification)\s*[:=]\s*(.+)$/i);
   if (otpLabelMatch) {
-    patch.otp = otpLabelMatch[1].trim();
+    patch.otp = cleanCredentialValue(otpLabelMatch[1]);
     patch.type = 'login';
   }
 
   const emailMatch = trimmed.match(/(?:email|users?names?|user(?:name)?)\s*[:=]\s*(\S+)/i);
   if (emailMatch) {
-    patch.username = emailMatch[1];
+    patch.username = cleanCredentialValue(emailMatch[1]);
     patch.type = 'login';
   }
 
   const passMatch = trimmed.match(/(?:pass(?:word)?)\s*[:=]\s*(\S+)/i);
   if (passMatch) {
-    patch.password = passMatch[1];
+    patch.password = cleanCredentialValue(passMatch[1]);
     patch.type = 'login';
   }
 
   const otpMatch = trimmed.match(/(?:otp|code)\s*[:=]\s*(\S+)/i);
   if (otpMatch) {
-    patch.otp = otpMatch[1];
+    patch.otp = cleanCredentialValue(otpMatch[1]);
     patch.type = 'login';
   }
 
@@ -212,27 +287,28 @@ export function parseAuthFields(
   );
   if (combo) {
     patch.type = 'login';
-    patch.username = combo[1];
-    patch.password = combo[2];
-    if (combo[3]) patch.otp = combo[3];
+    patch.username = cleanCredentialValue(combo[1]);
+    patch.password = cleanCredentialValue(combo[2]);
+    if (combo[3]) patch.otp = cleanCredentialValue(combo[3]);
     patch.authMethod = combo[3] ? 'password-otp' : 'password';
   }
 
   // Bare OTP
   if (/^\d{4,8}$/.test(trimmed) && authState === 'awaiting_otp') {
-    patch.otp = trimmed;
+    patch.otp = cleanCredentialValue(trimmed);
     patch.type = 'login';
   }
 
-  // Bare password
+  // Bare password — never treat correction-intent phrases as a password
   if (
     authState === 'awaiting_password' &&
     !passMatch &&
+    !detectAuthCorrection(trimmed) &&
     trimmed.length >= 2 &&
     !trimmed.includes(' ') &&
     !/^(start|public|password|otp)$/i.test(trimmed)
   ) {
-    patch.password = trimmed;
+    patch.password = cleanCredentialValue(trimmed);
     patch.type = 'login';
   }
 
@@ -244,12 +320,14 @@ export function parseAuthFields(
   ) {
     const afterColon = trimmed.split(':').slice(1).join(':').trim();
     if (afterColon) {
-      patch.username = afterColon;
+      patch.username = cleanCredentialValue(afterColon);
       patch.type = 'login';
     }
   }
 
   // Bare username / email (no prefix required)
+  // Also allow while awaiting_password if the message is clearly a labeled username
+  // (handled above) OR a bare token when user is correcting — correction clears state first.
   if (
     authState === 'awaiting_username' &&
     !patch.username &&
@@ -257,20 +335,38 @@ export function parseAuthFields(
     trimmed.length >= 2 &&
     !/^(start|public|password|otp|api)$/i.test(trimmed)
   ) {
-    patch.username = trimmed.replace(/^(?:email|users?names?|user(?:name)?)\s*[:=]\s*/i, '');
+    patch.username = cleanCredentialValue(
+      trimmed.replace(/^(?:email|users?names?|user(?:name)?)\s*[:=]\s*/i, ''),
+    );
     patch.type = 'login';
   }
 
   if (
     authState === 'awaiting_password' &&
     !patch.password &&
+    !detectAuthCorrection(trimmed) &&
     /^[^:]{1,24}\s*:\s*\S+\s*$/.test(trimmed)
   ) {
     const afterColon = trimmed.split(':').slice(1).join(':').trim();
-    if (afterColon) {
-      patch.password = afterColon;
+    // If the label looks like username/email, treat as username correction instead
+    const label = trimmed.split(':')[0].trim().toLowerCase();
+    if (/^(e-?mail|users?names?|user(?:name)?|login|account)$/i.test(label)) {
+      patch.username = cleanCredentialValue(afterColon);
+      patch.type = 'login';
+    } else if (afterColon) {
+      patch.password = cleanCredentialValue(afterColon);
       patch.type = 'login';
     }
+  }
+
+  // Allow `username: ...` while awaiting password to overwrite a mistaken username
+  if (
+    authState === 'awaiting_password' &&
+    patch.username &&
+    !patch.password
+  ) {
+    // Clearing password so nextAuthState asks for password again after username fix
+    patch.password = undefined;
   }
 
   if (patch.username || patch.password || patch.otp) {
@@ -291,12 +387,22 @@ export function mergeCredentials(
   current: SessionCredentials,
   patch: Partial<SessionCredentials>,
 ): SessionCredentials {
-  return {
+  const merged: SessionCredentials = {
     ...current,
     ...patch,
     type: patch.type ?? current.type,
     authMethod: patch.authMethod ?? current.authMethod,
   };
+  // Explicit undefined in patch means "clear this field" (e.g. username correction)
+  if ('password' in patch && patch.password === undefined) delete merged.password;
+  if ('otp' in patch && patch.otp === undefined) delete merged.otp;
+  if ('username' in patch && patch.username === undefined) delete merged.username;
+  // Changing username invalidates dependent secrets unless a new password was also provided
+  if (patch.username && !('password' in patch && patch.password !== undefined)) {
+    delete merged.password;
+    delete merged.otp;
+  }
+  return merged;
 }
 
 export function parseLiveCredentials(

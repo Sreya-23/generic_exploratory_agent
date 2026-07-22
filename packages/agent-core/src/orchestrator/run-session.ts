@@ -320,6 +320,22 @@ export class SessionOrchestrator {
       const loginOk = await performSessionLogin(loginCtx);
       if (!loginOk) {
         loginCtx.onLog('[Auth] Pre-session login failed or waiting for OTP — tasks will attempt re-login individually');
+      } else if (loginCtx.postLoginUrl) {
+        state.postLoginUrl = loginCtx.postLoginUrl;
+        loginCtx.onLog(`[Auth] Exploration will start from authenticated URL: ${state.postLoginUrl}`);
+      } else {
+        // Recover post-login URL from disk if set during saveSessionState
+        try {
+          const { readFileSync, existsSync } = await import('node:fs');
+          const { join } = await import('node:path');
+          const metaPath = join(sessionsDir, sessionId, 'auth-meta.json');
+          if (existsSync(metaPath)) {
+            const meta = JSON.parse(readFileSync(metaPath, 'utf-8')) as { postLoginUrl?: string };
+            if (meta.postLoginUrl) state.postLoginUrl = meta.postLoginUrl;
+          }
+        } catch {
+          /* ignore */
+        }
       }
     }
     // ─────────────────────────────────────────────────────────────────────────
@@ -431,6 +447,7 @@ export class SessionOrchestrator {
         sessionsDir,
         classification: state.classification,
         discoveredApiEndpoints: state.discoveredApiEndpoints,
+        postLoginUrl: state.postLoginUrl,
         onFinding: (partial) => {
           const withFp = {
             ...partial,
@@ -543,6 +560,9 @@ export class SessionOrchestrator {
             const existing = new Set(state.discoveredApiEndpoints ?? []);
             for (const e of ctx.discoveredApiEndpoints) existing.add(e);
             state.discoveredApiEndpoints = [...existing];
+          }
+          if (ctx.postLoginUrl) {
+            state.postLoginUrl = ctx.postLoginUrl;
           }
         } catch (err) {
           ctx.onLog(`Task failed: ${(err as Error).message}`);
