@@ -37,11 +37,14 @@ const RULES: SiteRule[] = [
       const medium = countMatches(text, [
         'product', 'price', 'shop', 'store', 'sale', 'discount',
         'wishlist', 'quantity', 'shipping', 'delivery',
+        'backpack', 'fleece', 'bike light', 'bolt t-shirt', 'onesie', 'inventory',
       ]);
       const urlScore = countMatches(s.urlPaths.join(' '), [
-        '/cart', '/checkout', '/products', '/shop', '/store', '/order',
+        '/cart', '/checkout', '/products', '/shop', '/store', '/order', '/inventory',
       ]);
-      return strong * 0.25 + medium * 0.07 + urlScore * 0.15;
+      // Title hints (e.g. Swag Labs demo store)
+      const titleBoost = /swag|shop|store|commerce|cart/i.test(s.title) ? 0.15 : 0;
+      return strong * 0.25 + medium * 0.07 + urlScore * 0.15 + titleBoost;
     },
   },
   {
@@ -115,8 +118,12 @@ const RULES: SiteRule[] = [
       ]);
       const isLoginHeavy = strong >= 2 && hasPasswordInput;
       // Penalise if the site also has cart/product signals (ecommerce wins)
-      const hasEcommerce = countMatches(text, ['add to cart', 'checkout', 'product']) > 0;
-      return (isLoginHeavy ? 0.6 : strong * 0.1) + (hasPasswordInput ? 0.2 : 0) - (hasEcommerce ? 0.3 : 0);
+      const hasEcommerce = countMatches(text, [
+        'add to cart', 'checkout', 'product', 'inventory', 'backpack', 'fleece', 'sauce labs', 'swag labs',
+      ]) > 0;
+      // Login-only pages should not permanently classify the whole product as auth-portal
+      // when ecommerce signals exist (common: recon ran on /login before session restore)
+      return (isLoginHeavy ? 0.6 : strong * 0.1) + (hasPasswordInput ? 0.2 : 0) - (hasEcommerce ? 0.5 : 0);
     },
   },
   {

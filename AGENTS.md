@@ -1,3 +1,4 @@
+
 # AGENTS.md — Generic Exploratory QA Agent
 
 This file guides AI coding assistants working on this codebase.
@@ -78,7 +79,13 @@ ELSE (no PRD — existing behaviour):
   ↓
   navigation.ts       BFS traversal + API harvest
   ↓
-  51 matrix tasks     UI, chaos, API, security, accessibility, performance, regression
+  Matrix tasks        UI, chaos, API, security, performance, regression (ALL_AREAS)
+                      API executor uses real discovered endpoints — not guesses
+                      NOTE: `accessibility` is excluded from ALL_AREAS on purpose — its
+                      flow classes (labels/keyboard/contrast) have no entry in
+                      FLOW_HANDLERS yet and would silently fall back to the navigation
+                      flow A1 already runs. Still runnable via `selectedFlowClasses`
+                      (e.g. "run E1, E2, E3") once real handlers exist.
 ```
 
 **Skill source of truth for PRD mode:** always follow `.cursor/skills/generic-exploratory-qa/SKILL.md` → section **PRD-Driven Protocol** when `config.prdPath` is set.
@@ -136,7 +143,8 @@ When adding new cross-task shared data, add the field to both `SessionState` (ty
 4. Add flow class string to the right area in `packages/shared/src/constants.ts` `FLOW_CLASSES`
 5. Add display title to `FLOW_TITLES` in `constants.ts`
 6. Add to phase categorization in `planner/index.ts`
-7. Run `npm run build` and verify
+7. **Only add the area to `ALL_AREAS` once every flow class in it has a real `FLOW_HANDLERS` entry.** A flow class with no handler falls back to the generic `navigation` flow — scheduling it by default just duplicates A1 for no new signal (this is why `accessibility` is excluded from `ALL_AREAS` today). New/candidate IDs proposed but not yet built (A14–A15, B9, D9–D11, F6–F9, I1–I4 — see [exploration-matrix.md](.cursor/skills/generic-exploratory-qa/exploration-matrix.md)) must stay out of `ALL_AREAS` until handlers exist.
+8. Run `npm run build` and verify
 
 ---
 
@@ -153,10 +161,11 @@ When adding new cross-task shared data, add the field to both `SessionState` (ty
 
 ## Skill and matrix documentation
 
-- **`.cursor/skills/generic-exploratory-qa/SKILL.md`** — primary reference for how the agent works. Update whenever adding new capabilities, auth types, or detection rules.
-- **`.cursor/skills/generic-exploratory-qa/exploration-matrix.md`** — catalog of all test IDs (A1–H3). Update status column when implementing new flows.
+- **`.cursor/skills/generic-exploratory-qa/SKILL.md`** — generic baseline: auth, matrix A1–H3 (+ candidate A14–A15, B9, D9–D11, F6–F9, I1–I4), false-positive rules. Update when adding capabilities or detection rules.
+- **`.cursor/skills/generic-exploratory-qa/exploration-matrix.md`** — catalog of all test IDs, including a "Not Implemented (📋 Planned)" table. Update the status column (📋 → 🔄 → ✅) as flows get built, never mark ✅ before a real `FLOW_HANDLERS` entry exists and is wired into `ALL_AREAS`.
+- **`.cursor/skills/site-nature-exploratory-qa/SKILL.md`** — **site-nature / complete exploration**: map every relevant tab/field, explore each surface, consent before crucial actions. Use when the user wants nature-specific (e.g. fintech-careful) coverage, not only the generic matrix. Currently a design spec, not live behaviour — see its own "Implementation status" section. Policies: `site-policies.md`.
 
-Both files are read by the AI assistant at runtime — keep them accurate.
+Keep these accurate — coding agents read them at runtime. Status markers (✅/🔄/📋) are load-bearing: they're how an agent knows whether "run E1" will do anything real or just fall back to `navigation`.
 
 ---
 
@@ -175,3 +184,5 @@ Both files are read by the AI assistant at runtime — keep them accurate.
 | Adding a new area to `FLOW_CLASSES` but not `ALL_AREAS` | Both must be updated in `planner/index.ts` |
 | Running full matrix when a PRD was uploaded | Use `buildPrdOnlyPlan` — PRD-only happy/negative/interruption |
 | Mapping `prd-driven` to generic `runNavigation` | Use `runPrdDrivenFlow` and record `onPrdCoverageUpdate` |
+| Adding a new area/flow class to `FLOW_CLASSES` and also to `ALL_AREAS` before it has a `FLOW_HANDLERS` entry | Build the handler first. Unhandled flow classes silently fall back to `navigation` — scheduling them by default wastes task budget re-running A1 (see `accessibility`, excluded from `ALL_AREAS` in `planner/index.ts` for exactly this reason) |
+| Marking a matrix ID ✅ in `exploration-matrix.md` before the handler is registered and scheduled | Only mark ✅ once `FLOW_HANDLERS` has a real implementation AND the area is in `ALL_AREAS` (or explicitly documented as opt-in) |

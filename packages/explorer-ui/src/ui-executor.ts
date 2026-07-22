@@ -34,7 +34,7 @@ import {
   runMultiTabLogout,
 } from './flows/session-flows.js';
 import { runGoldenPath, runVisualRegression } from './flows/regression.js';
-import { performLogin } from './auth/login.js';
+import { performLogin, detectLoginWall } from './auth/login.js';
 import {
   ensureAuthenticatedLanding,
   finalizePostLoginLanding,
@@ -51,13 +51,25 @@ async function getBrowser(): Promise<Browser> {
 }
 
 /**
- * Save authenticated session state (cookies + storage) to disk so all
- * subsequent tasks can restore it instead of re-logging in.
+ * Save authenticated session state (cookies + localStorage + sessionStorage).
+ * Playwright storageState covers cookies/localStorage; sessionStorage is saved
+ * separately because many SPAs (e.g. Sauce Demo) keep auth there.
  */
-async function saveSessionState(context: BrowserContext, sessionDir: string): Promise<void> {
+async function saveSessionState(context: BrowserContext, sessionDir: string, page?: Page): Promise<void> {
   const stateFile = join(sessionDir, 'auth-state.json');
   const state = await context.storageState();
   writeFileSync(stateFile, JSON.stringify(state, null, 2));
+
+  if (page) {
+    const sessionStorageJson = await page.evaluate(() => JSON.stringify(sessionStorage)).catch(() => '{}');
+    writeFileSync(join(sessionDir, 'session-storage.json'), sessionStorageJson);
+
+    const postLoginUrl = page.url();
+    writeFileSync(
+      join(sessionDir, 'auth-meta.json'),
+      JSON.stringify({ postLoginUrl, savedAt: new Date().toISOString() }, null, 2),
+    );
+  }
 }
 
 /**
@@ -68,8 +80,31 @@ function savedSessionStatePath(ctx: ExecutorContext): string | null {
   return existsSync(stateFile) ? stateFile : null;
 }
 
+async function restoreSessionStorage(context: BrowserContext, sessionDir: string, targetUrl: string): Promise<void> {
+  const ssFile = join(sessionDir, 'session-storage.json');
+  if (!existsSync(ssFile)) return;
+  try {
+    const raw = readFileSync(ssFile, 'utf-8');
+    const entries = Object.entries(JSON.parse(raw) as Record<string, string>);
+    if (entries.length === 0) return;
+    const { hostname } = new URL(targetUrl);
+    await context.addInitScript(
+      ({ hostname: host, entries: pairs }) => {
+        if (window.location.hostname !== host) return;
+        for (const [key, value] of pairs) {
+          window.sessionStorage.setItem(key, value);
+        }
+      },
+      { hostname, entries },
+    );
+  } catch {
+    /* ignore corrupt session storage */
+  }
+}
+
 async function createPage(ctx: ExecutorContext, restoreAuth = true): Promise<Page> {
   const browser = await getBrowser();
+  const sessionDir = join(ctx.sessionsDir, ctx.sessionId);
 
   // Restore authenticated session state if available (avoids re-login for every task)
   const savedState = restoreAuth ? savedSessionStatePath(ctx) : null;
@@ -83,6 +118,10 @@ async function createPage(ctx: ExecutorContext, restoreAuth = true): Promise<Pag
   }
 
   const context = await browser.newContext(contextOptions);
+
+  if (restoreAuth && savedState) {
+    await restoreSessionStorage(context, sessionDir, ctx.config.targetUrl);
+  }
 
   const { config } = ctx;
   if (config.credentials?.type === 'bearer' && config.credentials.bearerToken) {
@@ -151,13 +190,14 @@ export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean
         await context.close();
         return false;
       }
-      await saveSessionState(context, sessionDir);
+      await saveSessionState(context, sessionDir, page);
       const postLoginUrl = await finalizePostLoginLanding(
         page,
         sessionDir,
         ctx.config.targetUrl,
         (m) => ctx.onLog(m),
       );
+      ctx.postLoginUrl = postLoginUrl;
       ctx.onLog(`[Auth/OAuth] Session saved. Post-login URL: ${postLoginUrl}`);
       await context.close();
       return true;
@@ -194,13 +234,14 @@ export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean
         await page.goto(linkUrl, { waitUntil: 'load', timeout: 30000 }).catch(() => {});
         await page.waitForTimeout(2000);
       }
-      await saveSessionState(context, sessionDir);
+      await saveSessionState(context, sessionDir, page);
       const postLoginUrl = await finalizePostLoginLanding(
         page,
         sessionDir,
         ctx.config.targetUrl,
         (m) => ctx.onLog(m),
       );
+      ctx.postLoginUrl = postLoginUrl;
       ctx.onLog(`[Auth/MagicLink] Session saved. Post-login URL: ${postLoginUrl}`);
       await context.close();
       return true;
@@ -277,13 +318,14 @@ export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean
     }
 
     // Save authenticated session state for all tasks
-    await saveSessionState(context, sessionDir);
+    await saveSessionState(context, sessionDir, page);
     const postLoginUrl = await finalizePostLoginLanding(
       page,
       sessionDir,
       ctx.config.targetUrl,
       (m) => ctx.onLog(m),
     );
+    ctx.postLoginUrl = postLoginUrl;
     ctx.onLog(`[Auth] Session saved. Post-login URL: ${postLoginUrl}`);
     await context.close();
     return true;
@@ -319,17 +361,24 @@ async function clickSubmitOnPage(page: Page): Promise<void> {
 }
 
 async function loginIfNeeded(page: Page, ctx: ExecutorContext): Promise<void> {
-  // Session-level login is now handled by performSessionLogin() before tasks start.
-  // If auth-state.json exists, the page already has session cookies restored via
-  // createPage(). This function is kept as a safety fallback for edge cases only.
-  const statePath = savedSessionStatePath(ctx);
-  if (statePath) return; // Session already restored via storageState in createPage()
+  const onLoginWall = await detectLoginWall(page);
+  if (!onLoginWall) return;
 
   const creds = ctx.config.credentials;
   if (!creds || creds.type === 'none') return;
+  if (!creds.username || (creds.authMethod !== 'otp' && !creds.password && !creds.otp)) return;
 
+  ctx.onLog('[Auth] Still on login wall after session restore — re-logging in for this task');
   const result = await performLogin(page, creds);
-  ctx.onLog(`[Auth/fallback] ${result.message}`);
+  ctx.onLog(`[Auth] ${result.message}`);
+
+  if (result.success) {
+    await page.waitForTimeout(1000);
+    if (!(await detectLoginWall(page))) {
+      ctx.postLoginUrl = page.url();
+      await saveSessionState(page.context(), join(ctx.sessionsDir, ctx.sessionId), page);
+    }
+  }
 }
 
 async function screenshot(page: Page, ctx: ExecutorContext, name: string): Promise<string> {

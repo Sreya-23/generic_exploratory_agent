@@ -12,7 +12,9 @@ import {
   applyAuthProbe,
   authPromptForState,
   authPromptFromProbe,
+  clearAuthField,
   credentialsComplete,
+  detectAuthCorrection,
   effectiveAuthState,
   mergeCredentials,
   nextAuthState,
@@ -401,7 +403,12 @@ function buildAssistantReply(
 
   if (!credentialsComplete(draft) && authState !== 'ready') {
     const prompt = authPromptForState(draft);
-    if (prompt) return prompt;
+    if (prompt) {
+      return (
+        `${prompt}\n\n` +
+        `_Tip: Mistyped something? Say **"change username"** or **"change password"**, or resend \`username: ...\`._`
+      );
+    }
   }
 
   if (missing.length === 0) {
@@ -502,8 +509,17 @@ export function processSetupMessage(
     conversation.draft.authState = nextAuthState(conversation.draft);
   }
 
+  // User wants to re-enter a mistaken username/password/otp
+  const correction = detectAuthCorrection(text);
+  let justCorrected: 'username' | 'password' | 'otp' | null = null;
+  if (correction && conversation.draft.needsLogin) {
+    conversation.draft.credentials = clearAuthField(conversation.draft.credentials, correction);
+    conversation.draft.authState = nextAuthState(conversation.draft);
+    justCorrected = correction;
+  }
+
   // Parse standard auth fields (skip if this was a yes/no answer to the credentials question)
-  const isYesNoReply = isNoCredentials(text) || isYesCredentials(text);
+  const isYesNoReply = isNoCredentials(text) || isYesCredentials(text) || !!justCorrected;
   const authPatch = isYesNoReply ? {} : parseAuthFields(text, conversation.draft);
   if (Object.keys(authPatch).length > 0) {
     conversation.draft.credentials = mergeCredentials(conversation.draft.credentials, authPatch);
@@ -571,6 +587,16 @@ export function processSetupMessage(
       `- **"run all"** — run the complete matrix\n` +
       `- **"run all UI tests"** — run by section\n\n` +
       `Current config:\n${summarizeDraft(conversation.draft)}`;
+  } else if (justCorrected) {
+    const fieldLabel =
+      justCorrected === 'username'
+        ? 'username / email'
+        : justCorrected === 'password'
+          ? 'password'
+          : 'OTP';
+    reply =
+      `No problem — cleared the previous ${fieldLabel}. Enter it again.\n\n` +
+      authPromptForState(conversation.draft);
   } else {
     reply = buildAssistantReply(conversation.draft, text, replyPatch);
   }

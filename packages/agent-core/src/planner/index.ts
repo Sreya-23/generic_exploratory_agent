@@ -29,13 +29,18 @@ function tasksForArea(area: keyof typeof FLOW_CLASSES, startPriority: number): F
   }));
 }
 
-/** All areas that are always explored by default */
+/**
+ * All areas that are always explored by default.
+ * 'accessibility' is deliberately excluded: labels/keyboard/contrast have no
+ * FLOW_HANDLERS entry, so they'd silently fall back to the navigation flow
+ * A1 already runs — pure wasted task budget. Still runnable explicitly via
+ * `selectedFlowClasses` (e.g. "run E1, E2, E3") once real handlers exist.
+ */
 const ALL_AREAS: (keyof typeof FLOW_CLASSES)[] = [
   'ui',
   'chaos',
   'api',
   'security',
-  'accessibility',
   'performance',
   'regression',
 ];
