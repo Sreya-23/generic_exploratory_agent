@@ -1,6 +1,15 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { PrdCoverageSummary, SessionState } from '@qa/shared';
+import { generateSessionReport, type SessionReport } from './generate-report.js';
+
+export { generateSessionReport, dedupeFindings } from './generate-report.js';
+export type {
+  SessionReport,
+  SeverityCounts,
+  FlowCoverageRow,
+  AreaFindingGroup,
+} from './generate-report.js';
 
 export async function ensureSessionDir(sessionsDir: string, sessionId: string): Promise<string> {
   const dir = join(sessionsDir, sessionId);
@@ -65,8 +74,8 @@ export function generateSessionReportMarkdown(state: SessionState): string {
       lines.push(`- **Expected:** ${f.expected}`);
       lines.push(`- **Actual:** ${f.actual}`);
       if (f.steps.length) {
-        lines.push(`- **Steps:**`);
-        for (const s of f.steps) lines.push(`  1. ${s}`);
+        lines.push(`- **Steps to reproduce:**`);
+        for (const [i, s] of f.steps.entries()) lines.push(`  ${i + 1}. ${s}`);
       }
       lines.push('');
     }
@@ -97,4 +106,21 @@ export function chatSummaryFromCoverage(coverage: PrdCoverageSummary): string {
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+/** Build Markdown + HTML report from session findings and write to the session folder. */
+export async function writeSessionReport(
+  sessionsDir: string,
+  state: SessionState,
+): Promise<SessionReport> {
+  const report = generateSessionReport(state);
+  const dir = await ensureSessionDir(sessionsDir, state.id);
+  await writeFile(join(dir, 'report.md'), report.markdown, 'utf8');
+  await writeFile(join(dir, 'report.html'), report.html, 'utf8');
+  await writeFile(
+    join(dir, 'report-summary.json'),
+    JSON.stringify(report.summary, null, 2),
+    'utf8',
+  );
+  return report;
 }

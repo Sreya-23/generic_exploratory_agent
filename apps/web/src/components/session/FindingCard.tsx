@@ -9,6 +9,9 @@ const SEVERITY_CLASS: Record<Finding['severity'], string> = {
 };
 
 export function FindingCard({ finding }: { finding: Finding }) {
+  const steps =
+    finding.steps.length > 0 ? finding.steps : ['(no steps recorded)'];
+
   return (
     <article className={`finding-card ${SEVERITY_CLASS[finding.severity]}`}>
       <header>
@@ -16,10 +19,15 @@ export function FindingCard({ finding }: { finding: Finding }) {
         <span className="finding-area">{finding.area}</span>
       </header>
       <h3>{finding.title}</h3>
+      {finding.preconditions && (
+        <p className="finding-preconditions">
+          <strong>Preconditions:</strong> {finding.preconditions}
+        </p>
+      )}
       <div className="finding-steps">
-        <strong>Steps:</strong>
+        <strong>Steps to reproduce:</strong>
         <ol>
-          {finding.steps.map((s, i) => (
+          {steps.map((s, i) => (
             <li key={i}>{s}</li>
           ))}
         </ol>

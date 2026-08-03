@@ -82,14 +82,17 @@ export function sessionEventToChatMessage(event: SessionEvent): ChatMessage | nu
 
     case 'session:completed': {
       const s = event.payload as SessionState;
+      const critical = s.findings.filter((f) => f.severity === 'critical').length;
+      const high = s.findings.filter((f) => f.severity === 'high').length;
       const coverageLine = s.prdCoverage
-        ? `\n\n📋 **PRD coverage:** ${s.prdCoverage.passedCount} passed · ${s.prdCoverage.failedCount} failed · ${s.prdCoverage.gaps.length} gaps · ${s.prdCoverage.blocked.length} blocked\nOpen the session **Report** for the full coverage table.`
+        ? `\n\n📋 **PRD coverage:** ${s.prdCoverage.passedCount} passed · ${s.prdCoverage.failedCount} failed · ${s.prdCoverage.gaps.length} gaps · ${s.prdCoverage.blocked.length} blocked`
         : '';
       return msg(
         'assistant',
-        `✅ Exploration complete — **${s.findings.length} findings** recorded.` +
+        `✅ Exploration complete — **${s.findings.length} findings** recorded (${critical} critical, ${high} high).` +
           (s.config.prdPath ? `\nMode was **PRD-only**.` : '') +
-          coverageLine,
+          coverageLine +
+          `\n\nOpen the **Report** page to view the full write-up, or download Markdown / HTML.`,
         { kind: 'status' },
       );
     }
@@ -207,6 +210,29 @@ export function processLiveMessage(
     return { messages, action: 'none' };
   }
 
+  if (/\breport\b/.test(text)) {
+    if (session.status !== 'completed' && session.status !== 'failed') {
+      messages.push(
+        msg(
+          'assistant',
+          `Report isn’t ready yet — session is **${session.status}** (${session.progress.percent}%). Ask again when exploration finishes.`,
+          { kind: 'status' },
+        ),
+      );
+    } else {
+      const critical = session.findings.filter((f) => f.severity === 'critical').length;
+      const high = session.findings.filter((f) => f.severity === 'high').length;
+      messages.push(
+        msg(
+          'assistant',
+          `📋 **${session.findings.length} findings** (${critical} critical, ${high} high).\nOpen [/report/${session.id}](/report/${session.id}) for the full report, or export Markdown / HTML from that page.`,
+          { kind: 'status' },
+        ),
+      );
+    }
+    return { messages, action: 'none' };
+  }
+
   const credPatch = parseAuthFields(userText, {
     depth: session.config.depth,
     areas: session.config.areas,
@@ -292,7 +318,7 @@ export function processLiveMessage(
   messages.push(
     msg(
       'assistant',
-      `Exploring **${session.config.targetUrl}**. Try "status", "show findings", or provide login: \`email: x password: y\``,
+      `Exploring **${session.config.targetUrl}**. Try "status", "show findings", "report", or provide login: \`email: x password: y\``,
       { kind: 'status' },
     ),
   );

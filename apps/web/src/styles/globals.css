@@ -514,6 +514,23 @@ textarea {
   color: var(--text-muted);
 }
 
+.finding-preconditions {
+  font-size: 0.85rem;
+  margin-bottom: 0.5rem;
+  color: var(--text-muted);
+}
+
+.report-flow-steps {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.report-flow-steps li {
+  margin: 0.15rem 0;
+}
+
 .finding-expected-actual {
   font-size: 0.85rem;
   margin-bottom: 0.75rem;
@@ -612,6 +629,34 @@ textarea {
   font-size: 0.85rem;
   line-height: 1.7;
   overflow-x: auto;
+}
+
+.report-overview-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+  margin-bottom: 0.5rem;
+}
+
+.report-overview-table th,
+.report-overview-table td {
+  text-align: left;
+  padding: 0.55rem 0.65rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.report-overview-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  width: 28%;
+  white-space: nowrap;
+}
+
+.report-actions a.btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
 }
 
 .loading {
