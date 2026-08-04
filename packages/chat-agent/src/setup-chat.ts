@@ -65,6 +65,10 @@ export const MATRIX_ID_MAP: Record<string, string> = {
   F3: 'vertical-privilege',
   F4: 'xss-probe',
   F5: 'mass-assignment',
+  // Accessibility
+  E1: 'labels',
+  E2: 'keyboard',
+  E3: 'contrast',
   // Performance
   G1: 'spike-load',
   G2: 'large-payload',
@@ -128,6 +132,11 @@ export function matrixTestList(): string {
       { id: 'F3', label: 'Vertical privilege escalation' },
       { id: 'F4', label: 'XSS in inputs' },
       { id: 'F5', label: 'Mass assignment' },
+    ],
+    'Accessibility': [
+      { id: 'E1', label: 'Labels & ARIA' },
+      { id: 'E2', label: 'Keyboard access' },
+      { id: 'E3', label: 'Colour contrast' },
     ],
     'Performance': [
       { id: 'G1', label: 'Spike load' },
@@ -536,8 +545,10 @@ export function processSetupMessage(
 
   // Detect matrix test IDs (e.g. "A6, B2, F2" or "run all")
   const isRunAll = /\b(all tests?|run all|full matrix|every test|all flows?)\b/i.test(text);
+  let selectedMatrixThisTurn = false;
   if (isRunAll) {
     conversation.draft.selectedFlowClasses = Object.values(MATRIX_ID_MAP);
+    selectedMatrixThisTurn = true;
   } else {
     const matrixIds = extractMatrixIds(text);
     if (matrixIds.length > 0) {
@@ -545,13 +556,17 @@ export function processSetupMessage(
       conversation.draft.selectedFlowClasses = [
         ...new Set([...(conversation.draft.selectedFlowClasses ?? []), ...flowClasses]),
       ];
+      selectedMatrixThisTurn = flowClasses.length > 0;
     }
   }
 
-  // Detect and store flow instructions
+  // Detect and store flow instructions.
+  // Skip when the message is a matrix-ID selection ("run E1, E2, E3") — that
+  // already maps to selectedFlowClasses; treating it as user-directed too
+  // duplicates work and pollutes targeted runs.
   const isListRequest = /\b(list|show|what|which).{0,30}(tests?|flows?|matrix|checks?)\b/i.test(text);
   const instruction = extractFlowInstruction(text);
-  if (instruction && !isListRequest) {
+  if (instruction && !isListRequest && !selectedMatrixThisTurn) {
     conversation.draft.flowInstructions = [
       ...(conversation.draft.flowInstructions ?? []),
       instruction,

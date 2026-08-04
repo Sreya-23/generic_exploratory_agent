@@ -34,6 +34,11 @@ import {
   runMultiTabLogout,
 } from './flows/session-flows.js';
 import { runGoldenPath, runVisualRegression } from './flows/regression.js';
+import {
+  runLabelsAria,
+  runKeyboardAccess,
+  runContrast,
+} from './flows/accessibility.js';
 import { performLogin, detectLoginWall } from './auth/login.js';
 import {
   ensureAuthenticatedLanding,
@@ -429,6 +434,10 @@ const FLOW_HANDLERS: Record<
   'golden-path': runGoldenPath,
   // H3 — Visual Regression
   'visual-regression': runVisualRegression,
+  // E1–E3 — Accessibility (real handlers — do not fall back to navigation)
+  'labels': runLabelsAria,
+  'keyboard': runKeyboardAccess,
+  'contrast': runContrast,
 };
 
 export class UiExecutor implements BaseExecutor {
