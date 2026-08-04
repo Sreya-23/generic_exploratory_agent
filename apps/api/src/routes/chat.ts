@@ -12,7 +12,7 @@ import {
 } from '@qa/chat-agent';
 import { probeAuth } from '@qa/explorer-ui';
 import type { SessionCredentials, SessionEvent } from '@qa/shared';
-import { orchestrator, generateSessionReportMarkdown } from '@qa/agent-core';
+import { orchestrator, generateSessionReportMarkdown, generateSessionReport, writeSessionReport } from '@qa/agent-core';
 
 function extractUrlFromMessage(text: string): string | undefined {
   const match = text.match(/https?:\/\/[^\s<>"']+/i);
@@ -227,18 +227,50 @@ export function registerPrdAndReportRoutes(app: FastifyInstance, sessionsDir: st
       const session = orchestrator.getSession(req.params.id);
       if (!session) return reply.status(404).send({ error: 'Session not found' });
 
-      const format = req.query.format ?? 'md';
-      if (format === 'json') {
-        return {
-          session,
-          prdCoverage: session.prdCoverage ?? null,
-          reportMarkdown: generateSessionReportMarkdown(session),
-        };
+      const format = (req.query.format ?? 'json').toLowerCase();
+
+      let report = generateSessionReport(session);
+      if (session.status === 'completed' || session.status === 'failed') {
+        try {
+          report = await writeSessionReport(sessionsDir, session);
+        } catch {
+          /* keep in-memory report */
+        }
       }
 
-      const md = generateSessionReportMarkdown(session);
-      reply.header('content-type', 'text/markdown; charset=utf-8');
-      return md;
+      if (format === 'md' || format === 'markdown') {
+        // Prefer rich template report; fall back to PRD-aware markdown if needed
+        const md = report.markdown || generateSessionReportMarkdown(session);
+        return reply
+          .header('Content-Type', 'text/markdown; charset=utf-8')
+          .header(
+            'Content-Disposition',
+            `attachment; filename="qa-report-${session.id.slice(0, 8)}.md"`,
+          )
+          .send(md);
+      }
+
+      if (format === 'html') {
+        return reply
+          .header('Content-Type', 'text/html; charset=utf-8')
+          .header(
+            'Content-Disposition',
+            `inline; filename="qa-report-${session.id.slice(0, 8)}.html"`,
+          )
+          .send(report.html);
+      }
+
+      return {
+        sessionId: session.id,
+        status: session.status,
+        ...report.summary,
+        markdown: report.markdown,
+        html: report.html,
+        findings: report.summary.findings,
+        prdCoverage: session.prdCoverage ?? null,
+        reportMarkdown: generateSessionReportMarkdown(session),
+        session,
+      };
     },
   );
 }

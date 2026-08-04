@@ -3,7 +3,11 @@ export {
   saveSessionState,
   generateSessionReportMarkdown,
   chatSummaryFromCoverage,
+  writeSessionReport,
+  generateSessionReport,
+  dedupeFindings,
 } from './reporter/index.js';
+export type { SessionReport, SeverityCounts } from './reporter/index.js';
 export {
   fingerprintFinding,
   diffFindingFingerprints,

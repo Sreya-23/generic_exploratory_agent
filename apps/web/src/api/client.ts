@@ -239,4 +239,39 @@ export async function probeUrl(
   return res.json();
 }
 
+export async function getSessionReport(id: string): Promise<SessionReportPayload> {
+  const res = await fetch(`${API_BASE}/api/sessions/${id}/report`);
+  if (!res.ok) throw new Error('Report not found');
+  return res.json();
+}
+
+export function reportDownloadUrl(id: string, format: 'md' | 'html'): string {
+  return `${API_BASE}/api/sessions/${id}/report?format=${format}`;
+}
+
+export interface SessionReportPayload {
+  sessionId: string;
+  status: string;
+  total: number;
+  bySeverity: Record<'critical' | 'high' | 'medium' | 'low' | 'info', number>;
+  executiveSummary: string;
+  recommendedNextSteps: string[];
+  markdown: string;
+  html: string;
+  findings: Finding[];
+  flowsCovered?: {
+    area: string;
+    flowClass: string;
+    title: string;
+    description: string;
+    findingsCount: number;
+    steps?: string[];
+  }[];
+  findingsByArea?: {
+    area: string;
+    count: number;
+    bySeverity: Record<'critical' | 'high' | 'medium' | 'low' | 'info', number>;
+  }[];
+}
+
 export type { Finding, SessionState, SessionConfig };

@@ -431,6 +431,10 @@ packages/
                                    # state.discoveredApiEndpoints persisted after each task
                                    # ctx.discoveredApiEndpoints injected into each task's context
                                    # onPreActionNeeded: honours _user_skip flag from live chat
+                                   # writeSessionReport() on completion → report.md + report.html
+    reporter/
+      generate-report.ts           # Markdown + HTML report from findings (report-template format)
+      index.ts                     # saveSessionState + writeSessionReport
   explorer-ui/src/
     auth/
       probe.ts                     # probeAuth(): detects password, otp, oauth, magic-link, saml
@@ -517,6 +521,12 @@ Prioritize these — manual QA and brittle scripts miss them:
 ## Output
 
 Every finding MUST use the template in [report-template.md](report-template.md).
+
+When a session completes, the agent:
+1. Dedupes findings by severity + area + title + actual
+2. Writes `report.md`, `report.html`, and `report-summary.json` under `sessions/<id>/`
+3. Serves the report via `GET /api/sessions/:id/report?format=json|md|html`
+4. Shows the Report page at `/report/:id` with Markdown/HTML export
 
 Severity guide:
 - **Critical**: data loss, security breach, payment duplicate

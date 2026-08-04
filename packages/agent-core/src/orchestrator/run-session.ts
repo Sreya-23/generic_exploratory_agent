@@ -18,7 +18,7 @@ import type {
 import { credentialsComplete, effectiveAuthState, authPromptForState } from '@qa/chat-agent';
 import { buildPlan, injectJourneyTasks } from '../planner/index.js';
 import { classifySite } from '../intelligence/classify-site.js';
-import { saveSessionState, chatSummaryFromCoverage } from '../reporter/index.js';
+import { saveSessionState, chatSummaryFromCoverage, writeSessionReport } from '../reporter/index.js';
 import {
   attachFingerprints,
   diffFindingFingerprints,
@@ -718,6 +718,19 @@ export class SessionOrchestrator {
       state.progress.percent = 100;
       state.updatedAt = new Date().toISOString();
       await saveSessionState(sessionsDir, state);
+      try {
+        await writeSessionReport(sessionsDir, state);
+      } catch (err) {
+        // Report generation must not fail the session; surface in logs via emit
+        this.emit({
+          type: 'log',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          payload: {
+            message: `Report generation failed: ${(err as Error).message}`,
+          },
+        });
+      }
       this.emit({
         type: 'session:completed',
         sessionId,
