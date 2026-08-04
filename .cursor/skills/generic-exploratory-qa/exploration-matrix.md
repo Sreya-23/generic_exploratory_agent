@@ -129,9 +129,9 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 
 | ID | Flow | Flow Class | Status | What it does |
 |----|------|-----------|--------|--------------|
-| E1 | Labels & ARIA | `labels` | 📋 | Planned — no entry in `FLOW_HANDLERS`; task currently falls back to the generic `navigation` flow, producing no accessibility-specific findings |
-| E2 | Keyboard access | `keyboard` | 📋 | Planned — same fallback; not the same check as `A5 keyboard-nav`, which only covers Tab order/focus trap, not a11y semantics |
-| E3 | Colour contrast | `contrast` | 📋 | Planned — same fallback; no contrast-ratio computation implemented anywhere in the codebase |
+| E1 | Labels & ARIA | `labels` | ✅ | Audits form controls without labels/aria-label, buttons/links without accessible names, images missing `alt`, and focusable nodes inside `aria-hidden` |
+| E2 | Keyboard access | `keyboard` | ✅ | Finds interactive widgets (`role=button`, onclick, custom `.btn`) that are not focusable; flags positive `tabindex`; checks Tab can reach a primary control (distinct from A5 Tab-order/focus-trap) |
+| E3 | Colour contrast | `contrast` | ✅ | Samples visible text, computes WCAG relative-luminance contrast vs effective background, flags ratios below AA (4.5:1 normal / 3:1 large) |
 
 ## Performance
 
@@ -169,5 +169,4 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | B8 | Needs session IDs persisted from a prior run to simulate stale bookmarks |
 | D8 | Needs an API contract (OpenAPI/Swagger) to compare error shape against |
 | G4 | Needs server-level restart/cold-start hooks outside the browser |
-| E1–E3 | `accessibility` is a real area (`FLOW_CLASSES.accessibility`) but is deliberately excluded from `ALL_AREAS` in `planner/index.ts` (2026-07-15) so it's no longer scheduled by default — `labels`/`keyboard`/`contrast` have no entry in `FLOW_HANDLERS` and would otherwise silently run the generic navigation check instead, wasting task budget. Still runnable explicitly (`selectedFlowClasses`, e.g. "run E1, E2, E3"). Needs real handlers (axe-core-style label/ARIA audit, dedicated keyboard-semantics check, contrast-ratio computation) before this can be marked ✅ or re-added to defaults |
 | A14, A15, B9, D9–D11, F6–F9, I1–I4 | New cases proposed 2026-07-15 — none have a `FLOW_CLASSES` entry, `FLOW_HANDLERS` implementation, or planner scheduling yet. Highest-value first builds: F6 (security-headers, cheap — one `page.on('response')` header read), I1 (price-tamper, catches real business-logic bugs), D9 (token-expiry, reuses existing auth-matrix plumbing) |

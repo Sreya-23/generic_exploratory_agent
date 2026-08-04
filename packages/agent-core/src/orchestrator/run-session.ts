@@ -538,12 +538,15 @@ export class SessionOrchestrator {
             payload: classification,
           });
 
-          // PRD-only mode: never inject domain journeys / matrix-adjacent tasks
+          // PRD-only / targeted matrix ("run E1, E2, E3"): never inject journeys
           if (state.config.prdPath) return;
+          if (state.config.selectedFlowClasses && state.config.selectedFlowClasses.length > 0) {
+            return;
+          }
 
           // Dynamically inject journey tasks into the remaining plan
           if (state.plan) {
-            injectJourneyTasks(state.plan, classification);
+            injectJourneyTasks(state.plan, classification, state.config);
             // Update total task count
             state.progress.totalTasks = state.plan.tasks.length;
           }

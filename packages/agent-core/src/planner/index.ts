@@ -30,17 +30,16 @@ function tasksForArea(area: keyof typeof FLOW_CLASSES, startPriority: number): F
 }
 
 /**
- * All areas that are always explored by default.
- * 'accessibility' is deliberately excluded: labels/keyboard/contrast have no
- * FLOW_HANDLERS entry, so they'd silently fall back to the navigation flow
- * A1 already runs — pure wasted task budget. Still runnable explicitly via
- * `selectedFlowClasses` (e.g. "run E1, E2, E3") once real handlers exist.
+ * All areas that are always explored by default (standard/deep depth).
+ * Accessibility is included now that E1–E3 have real FLOW_HANDLERS
+ * (labels / keyboard / contrast) — not the navigation fallback.
  */
 const ALL_AREAS: (keyof typeof FLOW_CLASSES)[] = [
   'ui',
   'chaos',
   'api',
   'security',
+  'accessibility',
   'performance',
   'regression',
 ];
@@ -62,23 +61,18 @@ function areaForFlow(fc: string): ExplorationArea {
   return 'ui';
 }
 
+/** True when the user picked specific matrix IDs (e.g. "run E1, E2, E3"). */
+export function isTargetedMatrixRun(config: SessionConfig): boolean {
+  return Boolean(config.selectedFlowClasses && config.selectedFlowClasses.length > 0);
+}
+
 export function buildGenericPlan(sessionId: string, config: SessionConfig): ExplorationPlan {
   let priority = 0;
   const tasks: FlowTask[] = [];
 
-  // Recon always runs first
-  tasks.push({
-    id: 'recon-site-map',
-    area: 'ui',
-    flowClass: 'recon',
-    title: 'Site reconnaissance',
-    description: 'Map URLs, forms, links, and API calls, classify site type',
-    priority: priority++,
-  });
-
-  if (config.selectedFlowClasses && config.selectedFlowClasses.length > 0) {
-    // User explicitly chose specific matrix tests — run only those
-    for (const fc of config.selectedFlowClasses) {
+  if (isTargetedMatrixRun(config)) {
+    // Targeted run: ONLY the selected matrix tests — no recon, journeys, or extras.
+    for (const fc of config.selectedFlowClasses!) {
       tasks.push({
         id: `selected-${fc}`,
         area: areaForFlow(fc),
@@ -89,6 +83,16 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
       });
     }
   } else {
+    // Recon always runs first on a full / area-based plan
+    tasks.push({
+      id: 'recon-site-map',
+      area: 'ui',
+      flowClass: 'recon',
+      title: 'Site reconnaissance',
+      description: 'Map URLs, forms, links, and API calls, classify site type',
+      priority: priority++,
+    });
+
     // Default: run ALL matrix flows across all areas, ordered by priority
     // Smoke runs only the core UI set; standard/deep/chaos run everything
     const depthAreas: (keyof typeof FLOW_CLASSES)[] =
@@ -107,6 +111,23 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
 
   const limit = DEPTH_TASK_LIMITS[config.depth];
   const limitedTasks = tasks.slice(0, limit);
+
+  // Targeted matrix runs get a single clear phase (not buried under "report")
+  if (isTargetedMatrixRun(config)) {
+    return {
+      sessionId,
+      phases: [
+        {
+          id: 'selected',
+          name: 'Selected matrix tests',
+          description: `Running ${limitedTasks.length} explicitly selected test(s) only`,
+          taskIds: limitedTasks.map((t) => t.id),
+        },
+      ],
+      tasks: limitedTasks,
+      generatedAt: new Date().toISOString(),
+    };
+  }
 
   const phases: PlanPhase[] = GENERIC_PHASES.map((phase) => ({
     id: phase.id,
@@ -226,17 +247,11 @@ export function buildPlanFromContext(
 export function injectJourneyTasks(
   plan: ExplorationPlan,
   classification: SiteClassification,
+  /** When set, skip injection for targeted matrix runs ("run E1, E2, E3"). */
+  config?: SessionConfig,
 ): ExplorationPlan {
+  if (config && isTargetedMatrixRun(config)) return plan;
   if (classification.confidence < 0.3) return plan;
-
-  const journeyTasks: FlowTask[] = classification.inferredJourneys.map((journey, i) => ({
-    id: `journey-${i}-${randomUUID().slice(0, 6)}`,
-    area: 'ui' as const,
-    flowClass: 'journey',
-    title: journey,
-    description: `[${classification.siteType}] ${journey}`,
-    priority: -(100 - i),
-  }));
 
   // Add a single grouped journey task that runs all flows for the classified type
   const journeyPhaseTask: FlowTask = {
@@ -282,6 +297,12 @@ export function buildPlan(
 
   const plan = buildPlanFromContext(sessionId, config);
 
+  // Targeted matrix selection ("run E1, E2, E3") → selected tests only.
+  // Skip user-directed duplicates and domain journeys.
+  if (isTargetedMatrixRun(config)) {
+    return plan;
+  }
+
   // User-directed flow instructions get highest priority
   if (config.flowInstructions && config.flowInstructions.length > 0) {
     const userTasks: FlowTask[] = config.flowInstructions.map((instruction, i) => ({
@@ -303,7 +324,7 @@ export function buildPlan(
   }
 
   if (classification) {
-    injectJourneyTasks(plan, classification);
+    injectJourneyTasks(plan, classification, config);
   }
 
   return plan;

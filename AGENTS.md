@@ -81,11 +81,9 @@ ELSE (no PRD — existing behaviour):
   ↓
   Matrix tasks        UI, chaos, API, security, performance, regression (ALL_AREAS)
                       API executor uses real discovered endpoints — not guesses
-                      NOTE: `accessibility` is excluded from ALL_AREAS on purpose — its
-                      flow classes (labels/keyboard/contrast) have no entry in
-                      FLOW_HANDLERS yet and would silently fall back to the navigation
-                      flow A1 already runs. Still runnable via `selectedFlowClasses`
-                      (e.g. "run E1, E2, E3") once real handlers exist.
+ NOTE: Accessibility (E1–E3: labels / keyboard / contrast) is included in
+ ALL_AREAS with real FLOW_HANDLERS in explorer-ui `accessibility.ts`.
+ Still runnable via `selectedFlowClasses` (e.g. "run E1, E2, E3").
 ```
 
 **Skill source of truth for PRD mode:** always follow `.cursor/skills/generic-exploratory-qa/SKILL.md` → section **PRD-Driven Protocol** when `config.prdPath` is set.
@@ -184,5 +182,5 @@ Keep these accurate — coding agents read them at runtime. Status markers (✅/
 | Adding a new area to `FLOW_CLASSES` but not `ALL_AREAS` | Both must be updated in `planner/index.ts` |
 | Running full matrix when a PRD was uploaded | Use `buildPrdOnlyPlan` — PRD-only happy/negative/interruption |
 | Mapping `prd-driven` to generic `runNavigation` | Use `runPrdDrivenFlow` and record `onPrdCoverageUpdate` |
-| Adding a new area/flow class to `FLOW_CLASSES` and also to `ALL_AREAS` before it has a `FLOW_HANDLERS` entry | Build the handler first. Unhandled flow classes silently fall back to `navigation` — scheduling them by default wastes task budget re-running A1 (see `accessibility`, excluded from `ALL_AREAS` in `planner/index.ts` for exactly this reason) |
+| Adding a new area/flow class to `FLOW_CLASSES` and also to `ALL_AREAS` before it has a `FLOW_HANDLERS` entry | Build the handler first. Unhandled flow classes silently fall back to `navigation` — scheduling them by default wastes task budget re-running A1 |
 | Marking a matrix ID ✅ in `exploration-matrix.md` before the handler is registered and scheduled | Only mark ✅ once `FLOW_HANDLERS` has a real implementation AND the area is in `ALL_AREAS` (or explicitly documented as opt-in) |

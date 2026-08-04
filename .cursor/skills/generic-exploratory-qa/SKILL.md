@@ -139,15 +139,15 @@ After the URL is given and start is clicked, the agent runs ALL of these:
 - **Network & Chaos** (C1–C6): slow network, offline, flaky network, WebSocket disconnect
 - **API** (D1–D7): CRUD, auth matrix, rate limiting, idempotency
 - **Security** (F1–F5): IDOR, privilege escalation, XSS, mass assignment
+- **Accessibility** (E1–E3): labels/ARIA, keyboard access, colour contrast
 - **Performance** (G1–G3): spike load, large payload, N+1 patterns
 - **Regression** (H1–H3): golden path snapshots, visual regression, schema drift
 
-> **Accessibility (E1–E3) is not scheduled by default and not yet a real check.** The `labels`/`keyboard`/`contrast`
-> flow classes have no entry in `FLOW_HANDLERS` ([ui-executor.ts](../../../packages/explorer-ui/src/ui-executor.ts))
-> — they'd silently fall back to the generic navigation flow instead of running an accessibility-specific
-> audit. `planner/index.ts` deliberately excludes `accessibility` from `ALL_AREAS` so default runs don't
-> waste task budget on that fallback. Still runnable explicitly (`"run E1, E2, E3"`) once real handlers exist.
-> Don't report accessibility as covered until then.
+> **Accessibility (E1–E3)** runs by default on standard/deep depths. Handlers live in
+> `packages/explorer-ui/src/flows/accessibility.ts` (`labels` / `keyboard` / `contrast`) and are
+> registered in `FLOW_HANDLERS`. Say `"run E1, E2, E3"` for a targeted a11y-only run.
+> Note: **A5 `keyboard-nav`** is Tab-order/focus-trap only; **E2 `keyboard`** covers non-focusable
+> interactive widgets and keyboard reachability semantics.
 
 ### Power-user: select specific tests
 
@@ -178,7 +178,7 @@ Matrix IDs map to these flow classes:
 | Security | F1–F9 | idor-probe, horizontal-privilege, vertical-privilege, xss-probe, mass-assignment, security-headers 📋, cookie-flags 📋, clickjacking-probe 📋, open-redirect 📋 |
 | Performance | G1–G3 | spike-load, large-payload, n-plus-one |
 | Regression | H1–H3 | golden-path, visual-regression, schema-drift |
-| Accessibility | E1–E3 | labels, keyboard, contrast — 📋 **planned, no handler yet; falls back to `navigation`** |
+| Accessibility | E1–E3 | labels, keyboard, contrast — ✅ real handlers in `accessibility.ts` |
 | Business Logic | I1–I4 | price-tamper, negative-value, coupon-abuse, date-boundary-logic — 📋 **planned, proposed 2026-07-15, no `FLOW_CLASSES` entry yet** |
 
 ### What the agent accepts as credentials / inputs
@@ -383,7 +383,7 @@ resolveEndpointPaths() returns: real endpoints if available, generic guesses onl
 | Chaos | Network failure, back mid-POST, double-submit |
 | Security | IDOR, auth bypass, XSS probes |
 | Regression | Golden path vs baseline |
-| Accessibility | Labels, tab order, contrast — 📋 planned, currently falls back to navigation |
+| Accessibility | Labels, tab order semantics, contrast — ✅ E1–E3 implemented |
 | Performance | Load time, rate limits |
 | Business Logic | Price/quantity tampering, coupon abuse, date-boundary logic — 📋 planned, no handler yet |
 
@@ -420,13 +420,13 @@ packages/
                                    # ExecutorContext.discoveredApiEndpoints (injected per task)
                                    # PreActionRequest.type includes 'otp'
     constants.ts                   # FLOW_CLASSES (deduplicated), FLOW_TITLES
-                                   # ALL_AREAS includes 'accessibility' (labels, keyboard, contrast)
+                                   # ALL_AREAS includes accessibility (labels, keyboard, contrast)
   agent-core/src/
     intelligence/
       classify-site.ts             # classifySite(signals) → SiteClassification (7 site types)
-    planner/index.ts               # buildGenericPlan — ALL_AREAS excludes accessibility by default
-                                   # (no FLOW_HANDLERS yet; still selectable explicitly)
+    planner/index.ts               # buildGenericPlan — ALL_AREAS includes accessibility
                                    # areaForFlow() handles accessibility area
+                                   # (real FLOW_HANDLERS: labels / keyboard / contrast)
     orchestrator/run-session.ts    # performSessionLogin() called ONCE before tasks start
                                    # state.discoveredApiEndpoints persisted after each task
                                    # ctx.discoveredApiEndpoints injected into each task's context
