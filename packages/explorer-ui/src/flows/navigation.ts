@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
+import { findVisibleErrorText, explorationBreadth } from './helpers.js';
 
 interface NavPage {
   url: string;
@@ -13,6 +14,15 @@ interface NavPage {
 
 // ── Selectors for clickable navigation surfaces ──────────────────────────────
 // Each group targets a different UI pattern. Ordered: most-specific first.
+//
+// The href-requiring groups below assume the app uses real <a href> elements for
+// navigation. Many real-world SPA dashboards (React/Vue/Angular client-side routers)
+// instead render sidebar/nav items as <button> or plain clickable <div>/<li> with an
+// onClick handler that calls history.pushState directly — no href anywhere. Requiring
+// a[href] on every sidebar/nav selector makes those completely invisible to this crawl
+// (it'll report "0 nav items" on a page that visibly has a full working sidebar), even
+// though action-inventory's much broader "any button" selector still finds them fine.
+// Each href-based group below has a sibling entry covering the no-href case.
 const NAV_CLICK_SELECTORS = [
   // Hamburger / drawer triggers (must click to reveal hidden menu)
   '[class*="burger"]',
@@ -21,15 +31,26 @@ const NAV_CLICK_SELECTORS = [
   '[class*="nav-toggle"]',
   '[aria-label*="menu" i]',
   '[aria-label*="open navigation" i]',
-  // Sidebar nav items
+  // Sidebar nav items — semantic <aside>, then common class-name conventions
+  'aside a[href]',
+  'aside button',
+  'aside [role="button"]',
   '[class*="sidebar"] a[href]',
+  '[class*="sidebar"] button',
+  '[class*="sidebar"] [role="button"]',
   '[class*="side-nav"] a[href]',
+  '[class*="side-nav"] button',
   '[class*="side-menu"] a[href]',
+  '[class*="side-menu"] button',
   '[class*="drawer"] a[href]',
+  '[class*="drawer"] button',
   // Top-nav / header links
   'nav a[href]',
+  'nav button',
   'header a[href]',
+  'header button',
   '[role="navigation"] a[href]',
+  '[role="navigation"] button',
   // Tab bars
   '[role="tab"]',
   '[class*="tab-item"]',
@@ -40,7 +61,9 @@ const NAV_CLICK_SELECTORS = [
   '[class*="dropdown-toggle"]',
   // Generic menu items that are visible
   '[class*="menu-item"] a[href]',
+  '[class*="menu-item"] button',
   '[class*="nav-item"] a[href]',
+  '[class*="nav-item"] button',
   '[class*="nav-link"]',
 ];
 
@@ -83,6 +106,20 @@ interface NavItem {
  * Covers: links in nav/sidebar/header, tabs, and hamburger-revealed panels.
  */
 async function collectNavItems(page: Page, baseOrigin: string): Promise<NavItem[]> {
+  // Poll for nav content to render before giving up — client-rendered SPAs (Vue/React/Angular
+  // sidebars, common in real-world dashboards) often mount their nav a beat after
+  // 'domcontentloaded', so a single same-tick scan can find zero items on an otherwise
+  // link-rich page.
+  const deadline = Date.now() + 5000;
+  let items = await collectNavItemsOnce(page, baseOrigin);
+  while (items.length === 0 && Date.now() < deadline) {
+    await page.waitForTimeout(400);
+    items = await collectNavItemsOnce(page, baseOrigin);
+  }
+  return items;
+}
+
+async function collectNavItemsOnce(page: Page, baseOrigin: string): Promise<NavItem[]> {
   const items: NavItem[] = [];
   const seen = new Set<string>();
 
@@ -90,7 +127,7 @@ async function collectNavItems(page: Page, baseOrigin: string): Promise<NavItem[
   await revealHiddenNav(page);
   await page.waitForTimeout(300);
 
-  for (const sel of NAV_CLICK_SELECTORS) {
+  async function collectFrom(sel: string): Promise<void> {
     const els = await page.locator(sel).all();
     for (const el of els) {
       const visible = await el.isVisible().catch(() => false);
@@ -105,6 +142,11 @@ async function collectNavItems(page: Page, baseOrigin: string): Promise<NavItem[
       if (href === '#' || href?.startsWith('javascript:')) continue;
       if (href && !href.startsWith('/') && !href.startsWith(baseOrigin) &&
           !href.startsWith('http://') && !href.startsWith('https://')) continue;
+
+      // A bare number with no href is almost always a pagination control or a count
+      // badge, not a distinct page to crawl — clicking through "1", "2", "16", "124" wastes
+      // budget on what's really the same page's pagination, not real site coverage.
+      if (!href && /^\d+$/.test(label)) continue;
 
       // Normalise to absolute URL for deduplication
       let fullHref: string | null = null;
@@ -130,6 +172,19 @@ async function collectNavItems(page: Page, baseOrigin: string): Promise<NavItem[
       });
     }
   }
+
+  for (const sel of NAV_CLICK_SELECTORS) {
+    await collectFrom(sel);
+  }
+
+  // Fallback: any visible, same-origin <a href> on the page at all — not scoped to any
+  // container. The scoped selectors above assume nav/sidebar markup uses SOME recognizable
+  // signal (a semantic tag, or a class name containing "sidebar"/"nav-item"/etc.) — plenty
+  // of real sites (Tailwind-styled apps especially) use neither, just plain utility classes
+  // like "flex items-center gap-3 px-4 py-3" with zero semantic naming. On those, every
+  // scoped selector above matches nothing even though the page is full of real internal
+  // links. Same dedup applies, so this only adds links the scoped passes missed.
+  await collectFrom('a[href]');
 
   return items;
 }
@@ -160,10 +215,10 @@ async function auditPage(page: Page): Promise<string[]> {
     issues.push('Page has no <title>');
   }
 
-  // Look for visible error text
-  const errorText = await page.locator('[class*="error"]:visible, [role="alert"]:visible').first()
-    .textContent().catch(() => null);
-  if (errorText?.trim()) {
+  // Look for visible error text — uses the shared, size-ordered helper rather than a raw
+  // `.first()` match, which can grab a large wrapping container's full concatenated text.
+  const errorText = await findVisibleErrorText(page, 0);
+  if (errorText) {
     issues.push(`Error message on page: "${errorText.trim().slice(0, 80)}"`);
   }
 
@@ -181,20 +236,31 @@ export async function runNavigation(
   ctx.onLog(`[Navigation] Starting authenticated site traversal from: ${startUrl}`);
 
   const visitedUrls = new Set<string>([startUrl]);
+  const visitedKeys = new Set<string>(); // covers click-only items too (no href to dedup by)
   const visitedPages: NavPage[] = [];
-  const queue: Array<{ url: string | null; label: string; depth: number }> = [];
+  interface QueueItem {
+    url: string | null;
+    label: string;
+    depth: number;
+    // For items with no href (client-router buttons/divs) — where to click FROM, and
+    // which selector group to re-locate the element with once we're back on that page.
+    selector?: string;
+    discoveredOnUrl?: string;
+  }
+  const queue: QueueItem[] = [];
 
   // Collect initial nav from the landing/post-login page
   const initialItems = await collectNavItems(page, baseOrigin);
   ctx.onLog(`[Navigation] Discovered ${initialItems.length} nav items on entry page`);
 
   for (const item of initialItems) {
-    queue.push({ url: item.href, label: item.label, depth: 1 });
+    queue.push({ url: item.href, label: item.label, depth: 1, selector: item.selector, discoveredOnUrl: startUrl });
   }
 
-  // BFS — visit each discovered page, then discover its nav items
-  const MAX_PAGES = 25;
-  const MAX_DEPTH = 3;
+  // BFS — visit each discovered page, then discover its nav items. Scale by session depth —
+  // a smoke run should sample a few pages quickly, a deep run should sweep much further.
+  const MAX_PAGES = explorationBreadth(ctx, { smoke: 8, standard: 25, deep: 60, chaos: 8 });
+  const MAX_DEPTH = explorationBreadth(ctx, { smoke: 2, standard: 3, deep: 4, chaos: 2 });
 
   // ── Network API call capture ────────────────────────────────────────────────
   // Monitor all XHR/fetch requests made by the authenticated app during BFS.
@@ -223,40 +289,72 @@ export async function runNavigation(
   while (queue.length > 0 && visitedPages.length < MAX_PAGES) {
     const next = queue.shift()!;
     if (next.depth > MAX_DEPTH) continue;
-    if (!next.url || visitedUrls.has(next.url)) continue;
 
-    visitedUrls.add(next.url);
-
-    ctx.onLog(`[Navigation] Visiting [depth ${next.depth}]: "${next.label}" → ${next.url}`);
+    if (next.url) {
+      if (visitedUrls.has(next.url)) continue;
+      visitedUrls.add(next.url);
+    } else {
+      // Client-router item with no href — dedupe by label alone, not by where it was
+      // discovered. A persistent sidebar/nav item's destination doesn't depend on which
+      // page you clicked it from, so without this a persistent nav re-discovered on every
+      // page gets queued and fully re-visited once per discovery context — e.g. a 3-item
+      // sidebar on 3 pages turns into 9+ redundant visits of the same 3 destinations
+      // instead of 3, wasting exactly the kind of budget removeUnlikelyTasks/breadth
+      // scaling elsewhere is trying to protect.
+      if (!next.selector) continue;
+      if (visitedKeys.has(next.label)) continue;
+      visitedKeys.add(next.label);
+    }
 
     try {
-      const response = await page.goto(next.url, {
-        waitUntil: 'domcontentloaded',
-        timeout: 15000,
-      });
-      await page.waitForTimeout(500);
+      let httpStatus = 0;
+      if (next.url) {
+        ctx.onLog(`[Navigation] Visiting [depth ${next.depth}]: "${next.label}" → ${next.url}`);
+        const response = await page.goto(next.url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await page.waitForTimeout(500);
+        httpStatus = response?.status() ?? 0;
+      } else {
+        // No href to load directly. Most sidebars/nav bars are PERSISTENT across pages —
+        // the item is very likely still right here on whatever page we currently happen to
+        // be on, with zero navigation needed. Only fall back to reloading discoveredOnUrl
+        // (a full page load) if it genuinely isn't on the current page — reloading a
+        // client-side-only route from scratch isn't guaranteed to work at all (a plain
+        // static file server, or any SPA host without a catch-all rewrite to index.html,
+        // 404s on a direct load of a route that only ever existed via history.pushState).
+        ctx.onLog(`[Navigation] Visiting [depth ${next.depth}]: "${next.label}" (click, no href)`);
+        let target = page.locator(next.selector!).filter({ hasText: next.label }).first();
+        if ((await target.count().catch(() => 0)) === 0) {
+          await page.goto(next.discoveredOnUrl!, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+          await page.waitForTimeout(500);
+          target = page.locator(next.selector!).filter({ hasText: next.label }).first();
+        }
+        if ((await target.count().catch(() => 0)) === 0) {
+          ctx.onLog(`[Navigation] Could not re-locate "${next.label}" (tried current page and ${next.discoveredOnUrl}) — skipping`);
+          continue;
+        }
+        await target.click({ timeout: 4000 }).catch(() => {});
+        await page.waitForTimeout(800);
+      }
 
-      const httpStatus = response?.status() ?? 0;
       const pageTitle = await page.title().catch(() => '');
       const finalUrl = page.url();
+      visitedUrls.add(finalUrl);
 
       const shotName = `nav-${visitedPages.length}-${next.label.replace(/[^a-z0-9]/gi, '-').slice(0, 30)}`;
       const shotPath = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `${shotName}.png`);
       await page.screenshot({ path: shotPath, fullPage: false }).catch(() => {});
 
       const pageIssues = await auditPage(page);
+      const reachedVia = next.url ? `Navigate to: ${next.url}` : `Click "${next.label}" (from ${next.discoveredOnUrl})`;
 
-      // HTTP error check
+      // HTTP error check — only meaningful for href-based navigation
       if (httpStatus >= 400) {
         pageIssues.push(`HTTP ${httpStatus}`);
         ctx.onFinding({
           severity: httpStatus >= 500 ? 'high' : 'medium',
           area: 'UI-Navigation',
           title: `Broken link: "${next.label}" returns HTTP ${httpStatus}`,
-          steps: [
-            `Navigate to: ${next.url}`,
-            `Link reached via: "${next.label}"`,
-          ],
+          steps: [reachedVia, `Link reached via: "${next.label}"`],
           expected: 'Page loads with 2xx status',
           actual: `HTTP ${httpStatus} — ${next.url}`,
           evidence: [shotPath],
@@ -272,12 +370,13 @@ export async function runNavigation(
           severity: issue.includes('blank') || issue.includes('error message') ? 'medium' : 'low',
           area: 'UI-Navigation',
           title: `Page issue on "${next.label}": ${issue}`,
-          steps: [`Navigate to ${next.url}`, 'Inspect page content'],
+          steps: [reachedVia, 'Inspect page content'],
           expected: 'Page renders correctly with content',
           actual: issue,
           evidence: [shotPath],
           reproRate: '1/1',
           automationCandidate: true,
+          pageUrl: finalUrl,
         });
       }
 
@@ -297,8 +396,15 @@ export async function runNavigation(
       if (!hasPasswordInput && next.depth < MAX_DEPTH) {
         const childItems = await collectNavItems(page, baseOrigin);
         for (const child of childItems) {
-          if (!child.href || visitedUrls.has(child.href)) continue;
-          queue.push({ url: child.href, label: child.label, depth: next.depth + 1 });
+          if (child.href && visitedUrls.has(child.href)) continue;
+          if (!child.href && visitedKeys.has(`${finalUrl}::${child.label}`)) continue;
+          queue.push({
+            url: child.href,
+            label: child.label,
+            depth: next.depth + 1,
+            selector: child.selector,
+            discoveredOnUrl: finalUrl,
+          });
         }
       }
 

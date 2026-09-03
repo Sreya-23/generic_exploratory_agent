@@ -214,14 +214,14 @@ async function seedCart(page: Page, ctx: ExecutorContext, minItems = 1): Promise
 async function openBurgerLogout(page: Page): Promise<boolean> {
   const burger = page.locator('#react-burger-menu-btn, button:has-text("Open Menu")').first();
   if ((await burger.count()) > 0) {
-    await burger.click().catch(() => {});
+    await burger.click({ timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(300);
   }
   const logout = page
     .locator('#logout_sidebar_link, a:has-text("Logout"), button:has-text("Logout")')
     .first();
   if ((await logout.count()) > 0) {
-    await logout.click().catch(() => {});
+    await logout.click({ timeout: 2000 }).catch(() => {});
     await page.waitForLoadState('domcontentloaded').catch(() => {});
     await page.waitForTimeout(400);
     return true;
@@ -313,7 +313,7 @@ async function locateFeatureUi(
     if (items > 0) return true;
     const productLink = page.locator('a[href*="inventory"], .inventory_item_name, a[id*="item"]').first();
     if ((await productLink.count()) > 0) {
-      await productLink.click().catch(() => {});
+      await productLink.click({ timeout: 2000 }).catch(() => {});
       await page.waitForTimeout(400);
       return (await countInventoryItems(page)) > 0;
     }
@@ -338,7 +338,7 @@ async function locateFeatureUi(
       )
       .first();
     if ((await checkout.count()) > 0) {
-      await checkout.click().catch(() => {});
+      await checkout.click({ timeout: 2000 }).catch(() => {});
       await page.waitForTimeout(500);
       ctx.onLog('[PRD] Opened checkout');
       return (
@@ -767,16 +767,16 @@ async function runHappyPath(
     await seedCart(page, ctx, 1);
     await openCart(page, ctx);
     const checkout = page.locator('[data-test="checkout"], button:has-text("Checkout")').first();
-    if ((await checkout.count()) > 0) await checkout.click().catch(() => {});
+    if ((await checkout.count()) > 0) await checkout.click({ timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(400);
-    await page.locator('#first-name, [data-test="firstName"]').first().fill('QA').catch(() => {});
-    await page.locator('#last-name, [data-test="lastName"]').first().fill('Tester').catch(() => {});
-    await page.locator('#postal-code, [data-test="postalCode"]').first().fill('560001').catch(() => {});
-    await page.locator('[data-test="continue"], input[type="submit"]').first().click().catch(() => {});
+    await page.locator('#first-name, [data-test="firstName"]').first().fill('QA', { timeout: 2000 }).catch(() => {});
+    await page.locator('#last-name, [data-test="lastName"]').first().fill('Tester', { timeout: 2000 }).catch(() => {});
+    await page.locator('#postal-code, [data-test="postalCode"]').first().fill('560001', { timeout: 2000 }).catch(() => {});
+    await page.locator('[data-test="continue"], input[type="submit"]').first().click({ timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(500);
     const overview = await assertCheckoutOverviewGuards(page);
     ctx.onLog(`[PRD] ${overview}`);
-    await page.locator('[data-test="finish"], button:has-text("Finish")').first().click().catch(() => {});
+    await page.locator('[data-test="finish"], button:has-text("Finish")').first().click({ timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(500);
   }
 
@@ -842,8 +842,8 @@ async function runNegativePath(
       await page.goto(ctx.config.targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
     }
 
-    await page.locator('#user-name, input[name="user-name"], input[type="text"]').first().fill('').catch(() => {});
-    await page.locator('#password, input[type="password"]').first().fill('').catch(() => {});
+    await page.locator('#user-name, input[name="user-name"], input[type="text"]').first().fill('', { timeout: 2000 }).catch(() => {});
+    await page.locator('#password, input[type="password"]').first().fill('', { timeout: 2000 }).catch(() => {});
     await clickPrimarySubmit(page);
     const emptyError = await findVisibleErrorText(page, 800);
     if (!emptyError) {
@@ -869,7 +869,7 @@ async function runNegativePath(
       .first()
       .fill(ctx.config.credentials?.username ?? 'standard_user')
       .catch(() => {});
-    await page.locator('#password, input[type="password"]').first().fill('wrong_password_xyz').catch(() => {});
+    await page.locator('#password, input[type="password"]').first().fill('wrong_password_xyz', { timeout: 2000 }).catch(() => {});
     await clickPrimarySubmit(page);
     const wrongError = await findVisibleErrorText(page, 800);
     if (!(await isLoginWallPage(page))) {
@@ -904,8 +904,8 @@ async function runNegativePath(
       notes.push(`wrong-password: "${wrongError.slice(0, 60)}"`);
     }
 
-    await page.locator('#user-name, input[name="user-name"], input[type="text"]').first().fill('locked_out_user').catch(() => {});
-    await page.locator('#password, input[type="password"]').first().fill('secret_sauce').catch(() => {});
+    await page.locator('#user-name, input[name="user-name"], input[type="text"]').first().fill('locked_out_user', { timeout: 2000 }).catch(() => {});
+    await page.locator('#password, input[type="password"]').first().fill('secret_sauce', { timeout: 2000 }).catch(() => {});
     await clickPrimarySubmit(page);
     const lockedError = await findVisibleErrorText(page, 800);
     if (lockedError) {
@@ -1164,7 +1164,7 @@ async function runNegativePath(
   );
   const count = await inputs.count().catch(() => 0);
   for (let i = 0; i < Math.min(count, 3); i++) {
-    await inputs.nth(i).fill('<script>alert(1)</script>').catch(() => {});
+    await inputs.nth(i).fill('<script>alert(1)</script>', { timeout: 2000 }).catch(() => {});
   }
   if (count > 0) await clickPrimarySubmit(page);
   const invalidError = await findVisibleErrorText(page, 500);
@@ -1211,20 +1211,20 @@ async function runInterruptionPath(
   if (intent === 'checkout') {
     await seedCart(page, ctx, 1);
     await openCart(page, ctx);
-    await page.locator('[data-test="checkout"], button:has-text("Checkout")').first().click().catch(() => {});
+    await page.locator('[data-test="checkout"], button:has-text("Checkout")').first().click({ timeout: 2000 }).catch(() => {});
     await page.waitForTimeout(300);
-    await page.locator('#first-name, [data-test="firstName"]').first().fill('Interrupt').catch(() => {});
-    await page.locator('#last-name, [data-test="lastName"]').first().fill('Test').catch(() => {});
-    await page.locator('#postal-code, [data-test="postalCode"]').first().fill('560001').catch(() => {});
+    await page.locator('#first-name, [data-test="firstName"]').first().fill('Interrupt', { timeout: 2000 }).catch(() => {});
+    await page.locator('#last-name, [data-test="lastName"]').first().fill('Test', { timeout: 2000 }).catch(() => {});
+    await page.locator('#postal-code, [data-test="postalCode"]').first().fill('560001', { timeout: 2000 }).catch(() => {});
   } else if (intent === 'login') {
     await page.goto(ctx.config.targetUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
-    await page.locator('#user-name, input[name="user-name"]').first().fill('standard_user').catch(() => {});
+    await page.locator('#user-name, input[name="user-name"]').first().fill('standard_user', { timeout: 2000 }).catch(() => {});
   } else if (intent === 'cart' || intent === 'add-to-cart') {
     await seedCart(page, ctx, 1);
     if (intent === 'cart') await openCart(page, ctx);
   } else if (intent === 'logout') {
     const burger = page.locator('#react-burger-menu-btn').first();
-    if ((await burger.count()) > 0) await burger.click().catch(() => {});
+    if ((await burger.count()) > 0) await burger.click({ timeout: 2000 }).catch(() => {});
   } else {
     await fillSafePlaceholders(page, ctx);
   }

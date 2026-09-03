@@ -114,6 +114,71 @@ export const FLOW_CLASSES = {
     // Journey & user-directed
     'journey',
     'user-directed',
+    // Element integrity — occlusion, disabled-state mismatch, zero-size/off-screen, touch targets
+    'element-integrity',
+    'touch-target',
+    // Dead internal links
+    'dead-links',
+    // Action inventory — every button/icon-button/menu-item/tab found and what clicking it did
+    'action-inventory',
+    // Cross-browser compatibility spot-check (Firefox/WebKit vs the Chromium baseline)
+    'cross-browser',
+    // Consent & user agreement exploration (T&C, privacy, marketing, cookie, age, etc.)
+    'consent-exploration',
+    // I1/I2 — Business-logic boundary testing on amount/price/quantity-like fields
+    'business-logic-boundary',
+    // Real device emulation — phones/tablets across iOS (WebKit) and Android (Chromium)
+    // engines, distinct from viewport.ts (same engine, just resized) and cross-browser.ts
+    // (desktop-sized engine comparison only)
+    'device-matrix',
+    // AI-powered visual QA (Gemini vision) — catches rendering defects with no DOM/CSS
+    // signal at all (overlap, clipping, off-screen elements, leftover placeholder copy).
+    // Purely additive: skips gracefully if GEMINI_API_KEY isn't configured or the API
+    // call fails, never affecting any other flow.
+    'visual-review',
+    // WCAG 1.4.10 — layout must reflow without 2D scrolling at up to 400% browser zoom
+    'zoom-reflow',
+    // prefers-color-scheme: dark support and base contrast under it
+    'dark-mode',
+    // prefers-reduced-motion — animations should pause/reduce when requested
+    'reduced-motion',
+    // Keyboard focus should stay trapped inside an open modal dialog
+    'focus-trap',
+    // Custom field icons that may collide with a real browser's native autofill icon
+    'autofill-overlap',
+    // Extremely long, unbroken input values shouldn't break surrounding layout
+    'long-content',
+    // Browser back/forward-cache restore should be immediately interactive
+    'bfcache',
+    // Clicking a download control should yield a valid, non-empty file
+    'download-verify',
+    // Multiple toasts/notifications fired in quick succession shouldn't overlap
+    'toast-stacking',
+    // Hardcoded LTR layout assumptions surfaced by forcing dir="rtl"
+    'rtl-layout',
+    // Placeholder text leaking into the real submitted value, or left as dev/lorem-ipsum copy
+    'placeholder-check',
+    // <img> elements that fail to decode, and CSS background-images that 404
+    'broken-images',
+    // Text clipped/overflowing its OWN box — not just whole-page horizontal scroll
+    'element-overflow',
+    // Uncaught JS exceptions and console.error calls, accumulated across the whole session
+    'js-errors',
+    // Discovered routes (recon) vs actually-visited routes (whole session) — the explicit,
+    // checkable answer to "was everything actually explored"
+    'coverage-report',
+    // Core Web Vitals (LCP/CLS/INP) — user-perceived rendering performance, distinct from the
+    // network/server-focused checks under the performance area
+    'web-vitals',
+    // Mid-form draft loss on navigate-away-and-back, and passive same-record multi-tab
+    // edit-awareness
+    'concurrent-edit',
+    // Text-expansion layout tolerance and locale-aware date/currency formatting under a
+    // non-default browser locale — distinct from rtl-layout.ts (direction, not locale)
+    'locale-format',
+    // Service worker registration + real offline-cache behavior (genuine network cutoff, not
+    // per-request interception like chaos/flaky-network.ts)
+    'offline-pwa',
   ],
   // H1/H3 live only in regression — not duplicated in ui
   api: [
@@ -144,8 +209,10 @@ export const FLOW_CLASSES = {
     'timeout-retry',
     // C6 — WebSocket disconnect
     'websocket-disconnect',
+    // Low-end-device CPU throttling — distinct from slow-network above
+    'cpu-throttle',
   ],
-  security: ['xss-probe'],  // F4 only — F1/F2/F3/F5 already run under api area
+  security: ['xss-probe', 'security-headers'],  // F4, F6/F7/F8 — F1/F2/F3/F5 already run under api area
   accessibility: ['labels', 'keyboard', 'contrast'],
   performance: ['load-time', 'large-payload', 'spike-load', 'n-plus-one'],
   regression: ['golden-path', 'visual-regression', 'schema-drift'],
@@ -175,6 +242,35 @@ export const FLOW_TITLES: Record<string, string> = {
   'journey': 'Domain Journey',
   'user-directed': 'User-Directed Flow',
   'prd-driven': 'PRD Feature Test',
+  // Element integrity
+  'element-integrity': 'Element Integrity (occlusion, disabled-state)',
+  'touch-target': 'Touch Target Size (mobile)',
+  'dead-links': 'Dead Internal Links',
+  'action-inventory': 'Action Inventory',
+  'cross-browser': 'Cross-Browser Compatibility',
+  'consent-exploration': 'Consent & User Agreement Exploration',
+  'business-logic-boundary': 'Business Logic Boundary (amount/price/quantity) (I1/I2)',
+  'device-matrix': 'Real Device Matrix (iPhone/iPad/Pixel/Galaxy Tab)',
+  'visual-review': 'AI Visual QA Review (Gemini vision, optional)',
+  'zoom-reflow': 'Zoom & Reflow (WCAG 1.4.10)',
+  'dark-mode': 'Dark Mode (prefers-color-scheme)',
+  'reduced-motion': 'Reduced Motion (prefers-reduced-motion)',
+  'focus-trap': 'Modal Focus Trap',
+  'autofill-overlap': 'Autofill Icon Overlap',
+  'long-content': 'Long/Unbroken Content Stress Test',
+  'bfcache': 'Back/Forward Cache Restore',
+  'download-verify': 'Download Verification',
+  'toast-stacking': 'Toast/Notification Stacking',
+  'rtl-layout': 'RTL Layout',
+  'placeholder-check': 'Placeholder Text Integrity',
+  'broken-images': 'Broken Images',
+  'element-overflow': 'Element-Level Text Overflow/Clipping',
+  'js-errors': 'JavaScript Console Errors',
+  'coverage-report': 'Page/Route Coverage Report',
+  'web-vitals': 'Core Web Vitals (LCP/CLS/INP)',
+  'concurrent-edit': 'Form Autosave & Concurrent Edit',
+  'locale-format': 'Locale & Formatting',
+  'offline-pwa': 'Service Worker & Offline',
   // API
   'crud': 'CRUD Endpoints',
   'auth-matrix': 'Auth Matrix',
@@ -193,6 +289,7 @@ export const FLOW_TITLES: Record<string, string> = {
   'load-time': 'Load Time',
   'large-payload': 'Large Payload',
   // Chaos
+  'cpu-throttle': 'CPU Throttling (low-end device)',
   'slow-network': 'Slow Network (3G)',
   'offline-mid-request': 'Offline During Submit',
   'offline-recovery': 'Offline Recovery',
@@ -204,6 +301,7 @@ export const FLOW_TITLES: Record<string, string> = {
   'websocket-disconnect': 'WebSocket Disconnect (C6)',
   // Security
   'xss-probe': 'XSS Probe',
+  'security-headers': 'Security Headers, Cookie Flags & Clickjacking (F6/F7/F8)',
   // Accessibility
   'labels': 'Labels & ARIA',
   'keyboard': 'Keyboard Access',

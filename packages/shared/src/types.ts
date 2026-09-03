@@ -176,6 +176,29 @@ export interface Finding {
    */
   quarantineReason?: string;
   tags?: string[];
+  /**
+   * The page the finding was observed on, and a stable-ish identifier for the specific
+   * element involved (id, data-testid/data-test, name attribute, or a tag+text+index
+   * fallback — see elementFingerprint() in explorer-ui/flows/helpers.ts). When both are
+   * present on two findings, the report's dedup treats a match as strong evidence they're
+   * the SAME underlying defect (e.g. the same broken button hit by two different flows)
+   * even when the finding titles are worded completely differently — a more precise
+   * root-cause signal than title-text similarity alone.
+   */
+  pageUrl?: string;
+  targetSelector?: string;
+  /**
+   * 'verified' — multiple independent signals agree (e.g. a DOM measurement AND a visual
+   * check both flag the same area), or the signal is an objective, unambiguous browser fact
+   * (naturalWidth===0, a thrown JS exception, an HTTP status code).
+   * 'heuristic' — a single AI-vision read, or a single fuzzy/pattern-based signal with no
+   * corroborating check. Not necessarily wrong, but should be spot-checked before treating as
+   * confirmed. Omitted entirely for checks that predate this field — absence is not a claim
+   * either way, just unclassified.
+   */
+  confidence?: 'verified' | 'heuristic';
+  /** One sentence on why `confidence` was set this way — shown alongside the finding. */
+  confidenceReason?: string;
 }
 
 export interface FlowTask {
@@ -231,11 +254,23 @@ export interface SessionState {
   discoveredApiEndpoints?: string[];
   /** Populated when a PRD was uploaded — coverage of PRD features vs what was tested */
   prdCoverage?: PrdCoverageSummary;
+  /** Every distinct button/icon-button/menu-item found and what happened when clicked. */
+  actionInventory?: ActionInventorySummary;
+  /**
+   * Diff vs the most recent previous completed session for the same target — new / fixed /
+   * recurring findings. Populated for every session (not just PRD-driven ones) once a prior
+   * run against the same target exists.
+   */
+  findingDiff?: FindingFingerprintDiff;
   /**
    * URL reached after successful session login (e.g. /inventory.html).
    * Tasks should open this instead of the login URL so exploration runs inside the app.
    */
   postLoginUrl?: string;
+  /** Distinct routes discovered from links on the landing page (set by recon). */
+  discoveredRoutes?: string[];
+  /** Distinct routes actually navigated to during the session — the "what did we really cover" answer. */
+  visitedRoutes?: string[];
   createdAt: string;
   updatedAt: string;
   error?: string;
@@ -291,12 +326,46 @@ export interface FormInfo {
   fields: string[];
 }
 
+/** Outcome observed after clicking a discovered action-inventory candidate. */
+export type ActionInventoryResult =
+  | 'navigation'
+  | 'modal'
+  | 'dom-change'
+  | 'no-effect'
+  | 'error'
+  | 'skipped-risky'
+  | 'skipped-disabled';
+
+export interface ActionInventoryEntry {
+  label: string;
+  kind: 'button' | 'icon-button' | 'menu-item' | 'tab' | 'other';
+  pageUrl: string;
+  result: ActionInventoryResult;
+  detail?: string;
+  evidence?: string;
+}
+
+/**
+ * Structured inventory of every distinct button/icon-button/menu-item/tab discovered
+ * during exploration and what happened when each was clicked — the "explored every action,
+ * not just every link" artifact, surfaced as its own report section.
+ */
+export interface ActionInventorySummary {
+  totalFound: number;
+  totalTested: number;
+  totalSkippedRisky: number;
+  byResult: Record<string, number>;
+  entries: ActionInventoryEntry[];
+}
+
 export interface PreActionRequest {
   /** Category of the risky action */
   type: 'purchase' | 'payment' | 'send_link' | 'booking_confirm' | 'delete' | 'generic' | 'otp';
   description: string;
   /** Extra data keys the action requires (e.g. 'card', 'phone') */
   requiredExtras?: string[];
+  /** URL the action was reached on, so the resulting "skipped" finding is locatable. */
+  pageUrl?: string;
 }
 
 export interface ExecutorContext {
@@ -312,6 +381,15 @@ export interface ExecutorContext {
   discoveredApiEndpoints?: string[];
   /** Authenticated landing URL from performSessionLogin — prefer over targetUrl for exploration. */
   postLoginUrl?: string;
+  /** Accumulated across the session by action-inventory.ts; read by the reporter. */
+  actionInventory?: ActionInventorySummary;
+  /**
+   * Set by the orchestrator once several consecutive tasks have failed with the same
+   * page-load-timeout signature — a signal the target site itself is currently degraded, not
+   * that the app has a bug. Executors use this to fail faster on subsequent tasks (shorter
+   * timeout budget) instead of burning a full budget repeating the same failure.
+   */
+  envDegraded?: boolean;
   onFinding: (finding: Omit<Finding, 'id' | 'sessionId' | 'createdAt'>) => void;
   onLog: (message: string) => void;
   onClassification?: (c: SiteClassification) => void;
@@ -324,6 +402,10 @@ export interface ExecutorContext {
   onPreActionNeeded?: (req: PreActionRequest) => Record<string, string> | null;
   /** Called by PRD-driven flows to record per-feature coverage */
   onPrdCoverageUpdate?: (update: PrdFeatureCoverage) => void;
+  /** Distinct routes (origin+pathname) discovered from links on the landing page, set by recon. */
+  discoveredRoutes?: string[];
+  /** Distinct routes actually navigated to during the session, set by the coverage-report flow. */
+  visitedRoutes?: string[];
 }
 
 export interface ExecutorResult {

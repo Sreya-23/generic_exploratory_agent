@@ -1,0 +1,78 @@
+name: Exploratory QA Agent
+
+# Example CI wiring — runs the exploratory agent against a preview/staging URL and fails the
+# job if findings at or above the configured severity are found. Adjust the trigger, the
+# target URL input, and secrets to fit your actual deployment setup.
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'URL to explore (e.g. a PR preview deployment)'
+        required: true
+      depth:
+        description: 'smoke | standard | deep | chaos'
+        required: false
+        default: 'smoke'
+      fail_on:
+        description: 'Minimum severity that fails the job: critical | high | medium | low'
+        required: false
+        default: 'high'
+  # Uncomment to run automatically on every PR against a preview URL your deploy step outputs:
+  # pull_request:
+  #   types: [opened, synchronize]
+
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Build
+        run: npm run build
+
+      - name: Start API server
+        run: nohup node apps/api/dist/index.js > api.log 2>&1 &
+        env:
+          API_PORT: 3001
+          SESSIONS_DIR: ./sessions
+
+      - name: Wait for API to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:3001/api/sessions > /dev/null; then
+              echo "API is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "API did not become ready in time"; cat api.log; exit 1
+
+      - name: Run exploratory session
+        run: |
+          node scripts/ci-run.mjs "${{ github.event.inputs.target_url }}" \
+            --depth="${{ github.event.inputs.depth }}" \
+            --fail-on="${{ github.event.inputs.fail_on }}" \
+            --report-out=qa-report.md
+        env:
+          # If the target needs login, set these as repo/environment secrets and uncomment:
+          # QA_USERNAME: ${{ secrets.QA_USERNAME }}
+          # QA_PASSWORD: ${{ secrets.QA_PASSWORD }}
+          NODE_ENV: production
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-report
+          path: qa-report.md

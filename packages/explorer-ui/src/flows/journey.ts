@@ -1,13 +1,75 @@
 import { join } from 'node:path';
-import type { Page } from 'playwright';
+import type { Locator, Page } from 'playwright';
 import type { ExecutorContext, FlowTask, SiteType } from '@qa/shared';
 import { fillExtras } from './user-directed.js';
-import { findVisibleErrorText } from './helpers.js';
+import {
+  findVisibleErrorText,
+  isRiskyActionLabel,
+  explorationBreadth,
+  describeElement,
+  elementFingerprint,
+  isLoginWallPage,
+} from './helpers.js';
+import { findByIntentWithRetry } from './element-matcher.js';
 
 async function shot(page: Page, ctx: ExecutorContext, name: string): Promise<string> {
   const p = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `journey-${name}.png`);
   await page.screenshot({ path: p, fullPage: false }).catch(() => {});
   return p;
+}
+
+/**
+ * Poll for a locator to become visible, up to `timeoutMs`, instead of an instant
+ * count()+isVisible() check. `waitForLoadState('domcontentloaded')` is a no-op after an
+ * SPA client-side route change (no real navigation fires it), so a flat 400-600ms wait
+ * after clicking Create/Edit/Delete/Settings routinely checks before the resulting
+ * form/modal/button has actually rendered — producing false "action didn't work" findings.
+ */
+async function existsVisible(locator: Locator, timeoutMs = 5000): Promise<boolean> {
+  try {
+    await locator.waitFor({ state: 'visible', timeout: timeoutMs });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How many distinct entities/modules/sections a journey should explore, scaled by session
+ * depth — a smoke run wants one quick sample, a deep run should sweep across the app's real
+ * breadth (all sidebar modules, several product categories, several post types, etc.).
+ */
+function journeyBreadth(ctx: ExecutorContext): number {
+  return explorationBreadth(ctx, { smoke: 1, standard: 3, deep: 6, chaos: 1 });
+}
+
+/**
+ * Collect up to `max` distinct visible nav-item labels matching `selector` — the breadth-
+ * scaled alternative to grabbing just `.first()`. Returns labels (not Locators), since the
+ * page will navigate away and back between modules, and locators must be re-resolved by
+ * label each time rather than held across that navigation.
+ *
+ * Checks visibility per-item via `.isVisible()` rather than appending a `:visible` pseudo-
+ * class to `selector` — `selector` is typically a comma-separated list, and a trailing
+ * pseudo-class on a comma-joined string only binds to the last part (the same footgun as
+ * `:has-text` elsewhere in this codebase), silently leaving every earlier alternative
+ * unfiltered by visibility.
+ */
+async function collectNavLabels(page: Page, selector: string, max: number): Promise<string[]> {
+  const items = page.locator(selector);
+  const count = await items.count().catch(() => 0);
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < count && labels.length < max; i++) {
+    const el = items.nth(i);
+    if (!(await el.isVisible().catch(() => false))) continue;
+    const text = (await el.textContent().catch(() => ''))?.trim();
+    if (text && !seen.has(text)) {
+      seen.add(text);
+      labels.push(text);
+    }
+  }
+  return labels;
 }
 
 /**
@@ -189,22 +251,7 @@ async function gateIfSensitive(
 ): Promise<boolean> {
   const label = buttonLabel.toLowerCase();
 
-  const isExternalComm =
-    /\bsend\b/.test(label) ||
-    /\bshare\b/.test(label) ||
-    /\binvite\b/.test(label) ||
-    /\bwhatsapp\b/.test(label) ||
-    /\bsms\b/.test(label) ||
-    /\bemail\b/.test(label) ||
-    /\bnotif(y|ication)\b/.test(label) ||
-    /\bmessage\b/.test(label) ||
-    /\bforward\b/.test(label) ||
-    /\bsubmit.*order\b/.test(label) ||
-    /\bplace.*order\b/.test(label) ||
-    /\bpay\b/.test(label) ||
-    /\btransfer\b/.test(label);
-
-  if (!isExternalComm) return true; // Not sensitive, proceed
+  if (!isRiskyActionLabel(buttonLabel)) return true; // Not sensitive, proceed
 
   // Check what data is already available in extras
   const extras = ctx.config.credentials?.extras ?? {};
@@ -237,6 +284,7 @@ async function gateIfSensitive(
     type: actionType,
     description: `"${buttonLabel}" — this will send a real communication or payment`,
     requiredExtras: [requiredKey],
+    pageUrl: page.url(),
   });
 
   if (provided && provided[requiredKey]) {
@@ -347,6 +395,7 @@ async function runEcommerceJourney(page: Page, ctx: ExecutorContext): Promise<vo
         type: 'purchase',
         description: 'Complete checkout / payment',
         requiredExtras: ['card'],
+        pageUrl: page.url(),
       });
 
       if (extras && extras['card']) {
@@ -418,6 +467,7 @@ async function runBookingJourney(page: Page, ctx: ExecutorContext): Promise<void
           type: 'booking_confirm',
           description: 'Confirm booking / reservation',
           requiredExtras: [],
+          pageUrl: page.url(),
         });
 
         if (extras !== null) {
@@ -450,6 +500,21 @@ async function runBookingJourney(page: Page, ctx: ExecutorContext): Promise<void
 async function runAuthPortalJourney(page: Page, ctx: ExecutorContext): Promise<void> {
   const config = ctx.config;
   ctx.onLog('[Journey/auth-portal] Login valid → home → login invalid → error → logout');
+
+  // A saved auth-state cookie from an earlier task in this same session (see createPage() in
+  // ui-executor.ts) can already be restored by the time this task's page loads — navigating
+  // to the login URL while already authenticated commonly just redirects straight to the
+  // dashboard. The broad input[type="text"]/input[type="password"] locators below don't
+  // verify they're actually looking at a LOGIN page — they'll happily match some unrelated
+  // text+password field pair on the dashboard (a search box, a "change password" widget) and
+  // silently test something else entirely, producing a false "no error shown" finding for a
+  // login attempt that never really happened. Confirmed real: isolated re-testing of this
+  // exact locator+detection logic against the real login page found "Invalid credentials"
+  // correctly every time — the gap was never in the detection, only in what page it ran on.
+  if (!(await isLoginWallPage(page))) {
+    ctx.onLog('[Journey/auth-portal] Not currently on a login page (already authenticated?) — skipping invalid-login test');
+    return;
+  }
 
   // 1. Test invalid credentials first (non-destructive)
   const usernameInput = page.locator('input[type="text"], input[type="email"], input[name*="user" i], input[name*="email" i]').first();
@@ -625,60 +690,385 @@ async function runAuthPortalJourney(page: Page, ctx: ExecutorContext): Promise<v
 
 // ── SaaS Dashboard ────────────────────────────────────────────────────────────
 
-async function runSaasDashboardJourney(page: Page, ctx: ExecutorContext): Promise<void> {
-  ctx.onLog('[Journey/saas] List entities → create → edit → delete');
+const SAAS_ROW_SELECTOR = 'table tbody tr, [role="row"], [class*="list-item"], [class*="table-row"]';
+// ARIA grid patterns often put role="row" on the header row too (it's a row of columnheader
+// cells) — excluding rows that contain a columnheader cell is what makes ":first-child"/
+// "first()" land on a genuine data row instead of the header.
+const SAAS_DATA_ROW_SELECTOR = 'table tbody tr, [role="row"]:not(:has([role="columnheader"])):not(:has(th))';
+const SAAS_SIDEBAR_SELECTOR = 'nav a, [role="navigation"] a, [class*="sidebar"] a, [class*="side-nav"] a';
+const SAAS_EXCLUDE_LABEL_RE = /settings|profile|logout|sign ?out|dashboard|home|help/i;
 
-  await shot(page, ctx, 'saas-dashboard');
+function saasSidebarLinkByLabel(page: Page, label: string): Locator {
+  return page
+    .locator(SAAS_SIDEBAR_SELECTOR)
+    .filter({ hasText: label })
+    .filter({ hasNotText: SAAS_EXCLUDE_LABEL_RE })
+    .first();
+}
 
-  // Try to find a "Create" or "New" button
-  const createBtn = page.locator(
-    'button:has-text("New"), button:has-text("Create"), button:has-text("Add"), a:has-text("New")',
-  ).first();
+/**
+ * Create → edit → delete (gated) against whichever entity list is currently open.
+ * Shared by every module `runSaasDashboardJourney` visits — `moduleLabel` only affects
+ * logging/finding titles, so a multi-module run stays attributable to the right module
+ * instead of every finding reading identically regardless of which module it came from.
+ */
+async function runEntityModuleCrud(
+  page: Page,
+  ctx: ExecutorContext,
+  moduleLabel: string,
+  returnToListLink: Locator,
+): Promise<void> {
+  const tag = `[${moduleLabel}]`;
+  const shotName = moduleLabel.replace(/[^a-z0-9]/gi, '-').toLowerCase();
+  const rowCountBefore = await page.locator(SAAS_ROW_SELECTOR).count().catch(() => 0);
 
-  if (await createBtn.count() > 0) {
-    await createBtn.click();
+  // Create a new entity — fill safe fields only, per site-policies.md. Scored matching
+  // (not a fixed selector priority list) so a page with several "Add"/"New"-labeled
+  // elements picks the one that scores best across text+aria+icon signals together.
+  const createBtn = await findByIntentWithRetry(page, ctx, {
+    id: 'create-button',
+    candidateSelector: 'button, a[href], [role="button"]',
+    textKeywords: ['new', 'create', 'add'],
+    ariaKeywords: ['new', 'create', 'add'],
+    iconKeywords: ['plus', 'add'],
+  });
+
+  let created = false;
+  if (createBtn) {
+    // Captured BEFORE clicking — the click may navigate away or the element may go stale,
+    // and a finding that just says "Click Create/New button" gives no way to tell which of
+    // possibly several such buttons on the page was actually the one tested.
+    const createLabel = await describeElement(createBtn);
+    const createTargetUrl = page.url();
+    const createTargetSelector = await elementFingerprint(createBtn);
+    await createBtn.click().catch(() => {});
     await page.waitForLoadState('domcontentloaded').catch(() => {});
-    await page.waitForTimeout(500);
-    await shot(page, ctx, 'saas-create-form');
-    ctx.onLog('[Journey/saas] Create form / modal opened');
+    const s = await shot(page, ctx, `saas-create-form-${shotName}`);
+    ctx.onLog(`[Journey/saas] ${tag} Clicked Create/New ("${createLabel}")`);
 
-    // Check if a form appeared
-    const formAppeared = (await page.locator('form, [role="dialog"]').count()) > 0;
+    const formLocator = page.locator('form:visible, [role="dialog"]:visible').first();
+    const formAppeared = await existsVisible(formLocator, 6000);
+
     if (!formAppeared) {
       ctx.onFinding({
         severity: 'low',
         area: 'UI-Journey',
-        title: 'Create button did not open a form or modal',
-        steps: ['Navigate to dashboard', 'Click Create/New button'],
+        title: `${tag} Create button did not open a form or modal`,
+        steps: [`Open ${moduleLabel} entity list`, `Click "${createLabel}" (the Create/New button)`],
         expected: 'Form or modal for creating entity appears',
-        actual: 'No form or dialog visible',
-        evidence: [await shot(page, ctx, 'saas-create-no-form')],
+        actual: `No form or dialog visible after clicking "${createLabel}"`,
+        evidence: [s],
+        reproRate: '1/1',
+        automationCandidate: true,
+        pageUrl: createTargetUrl,
+        targetSelector: createTargetSelector ?? undefined,
+      });
+    } else {
+      const textInputs = page.locator('form input[type="text"]:visible, [role="dialog"] input[type="text"]:visible');
+      const inputCount = await textInputs.count().catch(() => 0);
+      for (let i = 0; i < Math.min(inputCount, 5); i++) {
+        await textInputs.nth(i).fill('QA Test Entry').catch(() => {});
+      }
+
+      const submitBtn = page
+        .locator('form button[type="submit"], [role="dialog"] button[type="submit"], button:has-text("Save"), button:has-text("Submit")')
+        .first();
+      if (await existsVisible(submitBtn, 3000)) {
+        await submitBtn.click().catch(() => {});
+        await page.waitForLoadState('domcontentloaded').catch(() => {});
+        await page.waitForTimeout(1500);
+        await shot(page, ctx, `saas-after-create-${shotName}`);
+
+        const errorText = await findVisibleErrorText(page, 400);
+        if (errorText) {
+          ctx.onLog(`[Journey/saas] ${tag} Create submit produced a message: "${errorText.slice(0, 80)}"`);
+        } else {
+          created = true;
+          ctx.onLog(`[Journey/saas] ${tag} Entity created (no error shown after submit)`);
+        }
+      }
+    }
+  } else {
+    ctx.onLog(`[Journey/saas] ${tag} No Create/New button found`);
+  }
+
+  // Some "Create" flows are a full page navigation away from the list rather than a modal
+  // (e.g. OrangeHRM's Admin → Add User) — return to the list before checking row count or
+  // attempting Edit/Delete below, otherwise both run against whatever page Create left us on.
+  if ((await page.locator(SAAS_ROW_SELECTOR).count().catch(() => 0)) === 0 && (await existsVisible(returnToListLink, 3000))) {
+    await returnToListLink.click().catch(() => {});
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(600);
+    ctx.onLog(`[Journey/saas] ${tag} Returned to entity list after create flow`);
+  }
+
+  if (created) {
+    const rowCountAfter = await page.locator(SAAS_ROW_SELECTOR).count().catch(() => 0);
+    if (rowCountAfter <= rowCountBefore && rowCountBefore > 0) {
+      ctx.onFinding({
+        severity: 'medium',
+        area: 'UI-Journey',
+        title: `${tag} Entity list did not grow after creating a new entity`,
+        steps: [`Open ${moduleLabel} entity list`, 'Create new entity', 'Return to entity list'],
+        expected: 'List row count increases by at least 1',
+        actual: `Row count before=${rowCountBefore}, after=${rowCountAfter}`,
+        evidence: [await shot(page, ctx, `saas-list-after-create-${shotName}`)],
         reproRate: '1/1',
         automationCandidate: true,
       });
     }
+  }
+
+  // Many real-world tables (OrangeHRM included) render row actions as icon-only buttons
+  // with no aria-label and no text — just an <i class="bi-pencil-fill">/<i class="bi-trash">
+  // inside a plain <button>. Matching only aria-label/text misses these entirely, so fall
+  // back to matching on the icon's own class name.
+  const firstDataRow = page.locator(SAAS_DATA_ROW_SELECTOR).first();
+
+  // Edit an existing entity — open the form, verify it appears, then cancel
+  // (fill safe fields only; don't actually mutate demo data by saving). Scored matching
+  // scoped to the first data row first (row actions repeat per row, so score within one row
+  // rather than across the whole page), falling back to a page-wide search.
+  const editTrigger =
+    (await findByIntentWithRetry(
+      page,
+      ctx,
+      {
+        id: 'edit-row-action',
+        candidateSelector: 'button, a[href], [role="button"]',
+        textKeywords: ['edit'],
+        ariaKeywords: ['edit'],
+        iconKeywords: ['pencil', 'edit'],
+      },
+      6000,
+      firstDataRow,
+    )) ??
+    (await findByIntentWithRetry(
+      page,
+      ctx,
+      { id: 'edit-page-wide', candidateSelector: 'button, a[href]', textKeywords: ['edit'] },
+      2000,
+    ));
+
+  if (editTrigger) {
+    // Captured BEFORE clicking, same reasoning as the Create button above — row actions
+    // are frequently icon-only with no text/aria-label, so without this the finding can
+    // only say "Edit" generically even when several icon buttons exist per row.
+    const editLabel = await describeElement(editTrigger);
+    const editTargetUrl = page.url();
+    const editTargetSelector = await elementFingerprint(editTrigger);
+    await editTrigger.click().catch(() => {});
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    const s = await shot(page, ctx, `saas-edit-form-${shotName}`);
+    ctx.onLog(`[Journey/saas] ${tag} Opened edit affordance for first row ("${editLabel}")`);
+
+    const editForm = page.locator('form:visible, [role="dialog"]:visible').first();
+    const editOpened = await existsVisible(editForm, 6000);
+    if (!editOpened) {
+      ctx.onFinding({
+        severity: 'low',
+        area: 'UI-Journey',
+        title: `${tag} Edit action did not open a form or modal`,
+        steps: [`Open ${moduleLabel} entity list`, `Click "${editLabel}" (the Edit action on the first row)`],
+        expected: 'Edit form or modal appears with existing values',
+        actual: `No form or dialog visible after clicking "${editLabel}" on the first row`,
+        evidence: [s],
+        reproRate: '1/1',
+        automationCandidate: true,
+        pageUrl: editTargetUrl,
+        targetSelector: editTargetSelector ?? undefined,
+      });
+    } else {
+      const cancelBtn = page.locator('button:has-text("Cancel"), [aria-label*="close" i]').first();
+      if ((await cancelBtn.count()) > 0) await cancelBtn.click().catch(() => {});
+    }
   } else {
-    ctx.onLog('[Journey/saas] No Create/New button found on dashboard');
+    ctx.onLog(`[Journey/saas] ${tag} No Edit affordance found on entity list rows`);
+  }
+
+  // Edit may also be a full-page navigation (not a modal) — return to the list before Delete.
+  if ((await page.locator(SAAS_ROW_SELECTOR).count().catch(() => 0)) === 0 && (await existsVisible(returnToListLink, 3000))) {
+    await returnToListLink.click().catch(() => {});
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(600);
+    ctx.onLog(`[Journey/saas] ${tag} Returned to entity list after edit flow`);
+  }
+
+  // Delete an entity and verify removal — destructive, requires consent per site-policies.md
+  const deleteTrigger =
+    (await findByIntentWithRetry(
+      page,
+      ctx,
+      {
+        id: 'delete-row-action',
+        candidateSelector: 'button, a[href], [role="button"]',
+        textKeywords: ['delete'],
+        ariaKeywords: ['delete'],
+        iconKeywords: ['trash', 'delete'],
+      },
+      6000,
+      firstDataRow,
+    )) ??
+    (await findByIntentWithRetry(
+      page,
+      ctx,
+      { id: 'delete-page-wide', candidateSelector: 'button, a[href]', textKeywords: ['delete'] },
+      2000,
+    ));
+
+  if (deleteTrigger) {
+    const proceed = await gateIfSensitive(page, ctx, `Delete entity (${moduleLabel})`);
+    if (proceed) {
+      const deleteLabel = await describeElement(deleteTrigger);
+      const deleteTargetUrl = page.url();
+      const deleteTargetSelector = await elementFingerprint(deleteTrigger);
+      const rowsBeforeDelete = await page.locator(SAAS_ROW_SELECTOR).count().catch(() => 0);
+      await deleteTrigger.click().catch(() => {});
+
+      // Common pattern: a confirmation dialog appears before the delete actually happens
+      const confirmBtn = page.locator('button:has-text("Confirm"), button:has-text("Yes"), button:has-text("Delete")').last();
+      if (await existsVisible(confirmBtn, 3000)) {
+        await confirmBtn.click().catch(() => {});
+      }
+      await page.waitForTimeout(1000);
+      const s = await shot(page, ctx, `saas-after-delete-${shotName}`);
+
+      const rowsAfterDelete = await page.locator(SAAS_ROW_SELECTOR).count().catch(() => 0);
+      ctx.onLog(`[Journey/saas] ${tag} Delete confirmed by user — rows ${rowsBeforeDelete} → ${rowsAfterDelete}`);
+
+      if (rowsAfterDelete >= rowsBeforeDelete && rowsBeforeDelete > 0) {
+        ctx.onFinding({
+          severity: 'medium',
+          area: 'UI-Journey',
+          title: `${tag} Row count did not decrease after delete action`,
+          steps: [`Open ${moduleLabel} entity list`, `Click "${deleteLabel}" (the Delete action on the first row)`, 'Confirm if prompted'],
+          expected: 'Row count decreases by at least 1 after delete',
+          actual: `Rows before=${rowsBeforeDelete}, after=${rowsAfterDelete} (deleted via "${deleteLabel}")`,
+          evidence: [s],
+          reproRate: '1/1',
+          automationCandidate: true,
+          pageUrl: deleteTargetUrl,
+          targetSelector: deleteTargetSelector ?? undefined,
+        });
+      }
+    }
+  } else {
+    ctx.onLog(`[Journey/saas] ${tag} No Delete affordance found on entity list rows`);
+  }
+}
+
+async function runSaasDashboardJourney(page: Page, ctx: ExecutorContext): Promise<void> {
+  const __t0 = Date.now();
+  await shot(page, ctx, 'saas-dashboard');
+  const landingUrl = page.url();
+  const breadth = journeyBreadth(ctx);
+
+  // Discover which sidebar modules to explore, scaled by session depth — a smoke run
+  // samples one, a deep run sweeps across several instead of only ever touching whichever
+  // module happens to be first in DOM order (which is all this journey did before).
+  const rawLabels = await collectNavLabels(page, SAAS_SIDEBAR_SELECTOR, breadth + 5);
+  const moduleLabels = rawLabels.filter((l) => !SAAS_EXCLUDE_LABEL_RE.test(l)).slice(0, breadth);
+
+  ctx.onLog(
+    `[Journey/saas] Sidebar → entity list → create → edit → delete (gated) → settings ` +
+      `(depth=${ctx.config.depth}, exploring ${moduleLabels.length} module${moduleLabels.length === 1 ? '' : 's'})`,
+  );
+
+  if (moduleLabels.length === 0) {
+    // Low confidence this is even a CRUD entity page at all — no sidebar means we never
+    // confirmed a "list of things with Create/Edit/Delete" pattern exists here, we're
+    // just guessing on whatever page happens to be current. Probing create AND edit AND
+    // delete AND settings each at their normal (multi-second, broad-candidate-rescoring)
+    // retry budget on a wrong guess is exactly what produced repeated ~60-90s task
+    // timeouts on real content-rich dashboards (OrangeHRM, a fintech app) that simply
+    // don't have this pattern on their landing page. A quick, short-timeout Create-button
+    // probe is enough signal: if that alone doesn't turn up anything, bail out entirely
+    // instead of paying the same cost three more times for edit/delete/settings.
+    ctx.onLog('[Journey/saas] No sidebar navigation found — quick-checking current page before committing');
+    const quickCreateProbe = await findByIntentWithRetry(
+      page,
+      ctx,
+      {
+        id: 'create-button-quick-probe',
+        candidateSelector: 'button, a[href], [role="button"]',
+        textKeywords: ['new', 'create', 'add'],
+        ariaKeywords: ['new', 'create', 'add'],
+        iconKeywords: ['plus', 'add'],
+      },
+      2000,
+    );
+    if (!quickCreateProbe) {
+      ctx.onLog('[Journey/saas] No Create/New affordance on the current page either — this doesn\'t look like a CRUD entity page, skipping rather than guessing further');
+    } else {
+      await runEntityModuleCrud(page, ctx, 'current page', page.locator('body').first());
+    }
+  } else {
+    for (let i = 0; i < moduleLabels.length; i++) {
+      const label = moduleLabels[i];
+      const navLink = saasSidebarLinkByLabel(page, label);
+
+      if (!(await existsVisible(navLink, 6000))) {
+        ctx.onLog(`[Journey/saas] "${label}" nav link no longer available — skipping`);
+        continue;
+      }
+      await navLink.click().catch(() => {});
+      await page.waitForLoadState('domcontentloaded').catch(() => {});
+      await page.waitForTimeout(500);
+      await shot(page, ctx, `saas-entity-list-${label.replace(/[^a-z0-9]/gi, '-').toLowerCase()}`);
+      ctx.onLog(`[Journey/saas] Navigated to "${label}" via sidebar (${i + 1}/${moduleLabels.length})`);
+
+      await runEntityModuleCrud(page, ctx, label, navLink);
+
+      // Return to the landing page before the next module so sidebar-label lookups stay
+      // reliable regardless of where Create/Edit/Delete left us for this module.
+      if (i < moduleLabels.length - 1) {
+        await page.goto(landingUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+        await page.waitForTimeout(500);
+      }
+    }
+  }
+
+  // Check settings / profile management — account-level, so only once overall, not once
+  // per module. Many apps expose this only via a header user-avatar/name dropdown trigger
+  // (no "Settings"/"Profile" text on the trigger itself, just the current user's name/
+  // avatar) rather than a literally-labeled link.
+  const settingsLink = page
+    .locator(
+      'a:has-text("Settings"), a:has-text("Profile"), [aria-label*="settings" i], nav a[href*="settings"], ' +
+        '[class*="userdropdown" i], [class*="user-dropdown" i], [class*="usermenu" i], ' +
+        '[class*="user-menu" i], [class*="account-menu" i], [class*="avatar" i]',
+    )
+    .first();
+
+  if (await existsVisible(settingsLink, 6000)) {
+    await settingsLink.click().catch(() => {});
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(600);
+    await shot(page, ctx, 'saas-settings');
+    const hasSettingsForm = (await page.locator('form, input, select').count()) > 0;
+    ctx.onLog(`[Journey/saas] Opened settings/profile — form fields present: ${hasSettingsForm}`);
+  } else {
+    ctx.onLog('[Journey/saas] No Settings/Profile link found');
   }
 }
 
 // ── Blog/CMS ──────────────────────────────────────────────────────────────────
 
 async function runBlogJourney(page: Page, ctx: ExecutorContext): Promise<void> {
-  ctx.onLog('[Journey/blog] Browse articles → open post → search');
+  ctx.onLog('[Journey/blog] Browse listing → open article → search → category/tag → pagination');
 
+  // 1 & 2. Browse listing, open a single article, verify content renders
   const articleLink = page.locator(
     'article a, .post a, .entry a, a[href*="/post"], a[href*="/article"], a[href*="/blog/"]',
   ).first();
 
-  if (await articleLink.count() > 0) {
+  if ((await articleLink.count()) > 0) {
     const href = await articleLink.getAttribute('href');
     await articleLink.click();
     await page.waitForLoadState('domcontentloaded');
     await shot(page, ctx, 'blog-article');
     ctx.onLog(`[Journey/blog] Opened article: ${href}`);
 
-    // Check if article content is rendered
     const hasContent = (await page.locator('article, .post-content, .entry-content, main').count()) > 0;
     if (!hasContent) {
       ctx.onFinding({
@@ -693,16 +1083,91 @@ async function runBlogJourney(page: Page, ctx: ExecutorContext): Promise<void> {
         automationCandidate: false,
       });
     }
+
+    await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(300);
+  } else {
+    ctx.onLog('[Journey/blog] No article link found on listing page');
   }
 
-  // Search test
+  // 3. Search
   const searchInput = page.locator('input[type="search"], input[name="q"], input[placeholder*="search" i]').first();
-  if (await searchInput.count() > 0) {
+  if ((await searchInput.count()) > 0) {
     await searchInput.fill('test');
     await page.keyboard.press('Enter');
     await page.waitForLoadState('domcontentloaded').catch(() => {});
     await shot(page, ctx, 'blog-search-results');
     ctx.onLog('[Journey/blog] Search tested');
+  } else {
+    ctx.onLog('[Journey/blog] No search input found');
+  }
+
+  // 4. Browse by category or tag
+  const categoryLink = page
+    .locator(
+      'a[href*="category"], a[href*="/tag"], a[href*="topics/"], ' +
+        'a[class*="category"], a[class*="tag"], [class*="category"] a, [class*="tag"] a',
+    )
+    .first();
+
+  if ((await categoryLink.count()) > 0 && (await categoryLink.isVisible().catch(() => false))) {
+    const label = (await categoryLink.textContent().catch(() => ''))?.trim() || 'category';
+    await categoryLink.click().catch(() => {});
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(400);
+    const s = await shot(page, ctx, 'blog-category');
+    ctx.onLog(`[Journey/blog] Opened category/tag: "${label}"`);
+
+    const hasFilteredList = (await page.locator('article, .post, .entry').count()) > 0;
+    if (!hasFilteredList) {
+      ctx.onFinding({
+        severity: 'low',
+        area: 'UI-Journey',
+        title: `Category/tag page "${label}" shows no articles`,
+        steps: [`Click category/tag link "${label}"`, 'Observe filtered listing'],
+        expected: 'Category/tag page lists at least one article, or shows an explicit empty state',
+        actual: 'No article/post/entry elements found on category page',
+        evidence: [s],
+        reproRate: '1/1',
+        automationCandidate: false,
+      });
+    }
+  } else {
+    ctx.onLog('[Journey/blog] No category/tag link found');
+  }
+
+  // 5. Check pagination of article list
+  const nextPageLink = page
+    .locator(
+      'a:has-text("Next"), a[aria-label*="next" i], [class*="pagination"] a:has-text("2"), ' +
+        'button:has-text("Next"), a[rel="next"]',
+    )
+    .first();
+
+  if ((await nextPageLink.count()) > 0 && (await nextPageLink.isVisible().catch(() => false))) {
+    const urlBefore = page.url();
+    await nextPageLink.click().catch(() => {});
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(400);
+    const s = await shot(page, ctx, 'blog-pagination');
+
+    if (page.url() === urlBefore) {
+      ctx.onFinding({
+        severity: 'low',
+        area: 'UI-Journey',
+        title: 'Pagination "Next" control did not navigate',
+        steps: ['Open article listing', 'Click pagination Next control'],
+        expected: 'URL or content changes to show the next page of articles',
+        actual: `URL unchanged after click: ${page.url()}`,
+        evidence: [s],
+        reproRate: '1/1',
+        automationCandidate: true,
+      });
+    } else {
+      ctx.onLog(`[Journey/blog] Pagination Next → ${page.url()}`);
+    }
+  } else {
+    ctx.onLog('[Journey/blog] No pagination control found');
   }
 }
 
@@ -752,6 +1217,7 @@ async function runFintechJourney(page: Page, ctx: ExecutorContext): Promise<void
       type: 'payment',
       description: 'Initiate fund transfer or payment',
       requiredExtras: ['phone'],
+      pageUrl: page.url(),
     });
 
     if (extras !== null) {
@@ -780,35 +1246,146 @@ async function runFintechJourney(page: Page, ctx: ExecutorContext): Promise<void
 // ── Social ────────────────────────────────────────────────────────────────────
 
 async function runSocialJourney(page: Page, ctx: ExecutorContext): Promise<void> {
-  ctx.onLog('[Journey/social] Browse feed → open profile → interact');
+  ctx.onLog('[Journey/social] Feed → profile → interact → gated create-post → notifications');
 
   await shot(page, ctx, 'social-feed');
 
-  // Open a profile or post
+  // 1. Open a profile
   const profileLink = page.locator(
-    'a[href*="/user"], a[href*="/profile"], a[href*="/@"], [class*="avatar"] a',
+    'a[href*="user"], a[href*="profile"], a[href*="/@"], a[class*="avatar"], [class*="avatar"] a',
   ).first();
 
-  if (await profileLink.count() > 0) {
+  if ((await profileLink.count()) > 0) {
     await profileLink.click();
     await page.waitForLoadState('domcontentloaded').catch(() => {});
     await shot(page, ctx, 'social-profile');
     ctx.onLog('[Journey/social] Opened profile page');
+    await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(300);
+  } else {
+    ctx.onLog('[Journey/social] No profile link found');
   }
 
-  // Like/Follow — low-risk, proceed directly
+  // 2. Like/Follow — low-risk per site-policies.md, proceed directly
   const interactBtn = page.locator(
     'button:has-text("Follow"), button[aria-label*="like" i], button:has-text("Like")',
   ).first();
 
-  if (await interactBtn.count() > 0) {
+  if ((await interactBtn.count()) > 0) {
     await interactBtn.click();
     await page.waitForTimeout(500);
     await shot(page, ctx, 'social-after-interact');
     ctx.onLog('[Journey/social] Like/Follow clicked');
+  } else {
+    ctx.onLog('[Journey/social] No Like/Follow control found');
   }
 
-  // Send / Share / Message — HIGH-RISK, always gate
+  // 3. Create a new post — open compose, type safe text, gate the actual publish/post click
+  const composeTrigger = page
+    .locator(
+      'button:has-text("Post"), button:has-text("New post"), button[aria-label*="compose" i], ' +
+        'textarea[placeholder*="what" i], [role="textbox"][aria-label*="post" i]',
+    )
+    .first();
+
+  if ((await composeTrigger.count()) > 0 && (await composeTrigger.isVisible().catch(() => false))) {
+    await composeTrigger.click().catch(() => {});
+    await page.waitForTimeout(400);
+    await shot(page, ctx, 'social-compose-open');
+
+    const composeBox = page.locator('textarea:visible, [role="textbox"]:visible, [contenteditable="true"]:visible').first();
+    let composeOpened = false;
+    if ((await composeBox.count()) > 0) {
+      await composeBox.fill('QA exploratory test post').catch(async () => {
+        await composeBox.click().catch(() => {});
+        await page.keyboard.type('QA exploratory test post').catch(() => {});
+      });
+      composeOpened = true;
+      ctx.onLog('[Journey/social] Filled compose box with safe test text');
+    }
+
+    if (!composeOpened) {
+      ctx.onFinding({
+        severity: 'low',
+        area: 'UI-Journey',
+        title: 'Compose trigger did not open a usable post-entry field',
+        steps: ['Click compose/new-post control', 'Look for a text entry field'],
+        expected: 'A textarea or editable field appears for composing a post',
+        actual: 'No textarea/textbox/contenteditable field found after clicking compose',
+        evidence: [await shot(page, ctx, 'social-compose-no-field')],
+        reproRate: '1/1',
+        automationCandidate: true,
+      });
+    } else {
+      // Some platforms label the open-compose trigger AND the real publish action the same
+      // ("Post" is common on X/Twitter for both). Prefer the more specific labels first;
+      // only fall back to "Post" while explicitly excluding the trigger element itself, so
+      // we don't silently re-click the trigger and think we published when nothing happened.
+      let publishBtn = page.locator('button:has-text("Publish"), button:has-text("Tweet"), button:has-text("Share")').first();
+      if ((await publishBtn.count()) === 0) {
+        const triggerHandle = await composeTrigger.elementHandle().catch(() => null);
+        const postCandidates = await page.locator('button:has-text("Post")').all();
+        for (const candidate of postCandidates) {
+          const handle = await candidate.elementHandle().catch(() => null);
+          const isTrigger =
+            handle && triggerHandle
+              ? await page.evaluate(([a, b]) => a === b, [handle, triggerHandle]).catch(() => false)
+              : false;
+          if (!isTrigger) {
+            publishBtn = candidate;
+            break;
+          }
+        }
+      }
+      const publishLabel = (await publishBtn.textContent().catch(() => ''))?.trim() || 'Post';
+      const proceed = (await publishBtn.count()) > 0 && (await gateIfSensitive(page, ctx, publishLabel));
+
+      if (proceed) {
+        await publishBtn.click().catch(() => {});
+        await page.waitForTimeout(600);
+        await shot(page, ctx, 'social-after-post');
+        ctx.onLog(`[Journey/social] "${publishLabel}" clicked after user confirmation`);
+      } else {
+        ctx.onLog('[Journey/social] Post composed but not published — no user confirmation (or no publish button found)');
+      }
+    }
+  } else {
+    ctx.onLog('[Journey/social] No compose/new-post control found');
+  }
+
+  // 4. Check notification flow
+  const notifTrigger = page
+    .locator('[aria-label*="notification" i], a[href*="notification"], button[aria-label*="notification" i]')
+    .first();
+
+  if ((await notifTrigger.count()) > 0 && (await notifTrigger.isVisible().catch(() => false))) {
+    await notifTrigger.click().catch(() => {});
+    await page.waitForTimeout(400);
+    const s = await shot(page, ctx, 'social-notifications');
+
+    const panelOpened =
+      (await page.locator('[role="dialog"], [class*="notification"], [class*="dropdown"]').count()) > 0;
+    ctx.onLog(`[Journey/social] Notification trigger clicked — panel/page detected: ${panelOpened}`);
+
+    if (!panelOpened) {
+      ctx.onFinding({
+        severity: 'low',
+        area: 'UI-Journey',
+        title: 'Notification control did not reveal a notification panel or page',
+        steps: ['Click the notification bell/link'],
+        expected: 'A notification panel, dropdown, or dedicated page appears',
+        actual: 'No dialog/notification/dropdown container detected after click',
+        evidence: [s],
+        reproRate: '1/1',
+        automationCandidate: true,
+      });
+    }
+  } else {
+    ctx.onLog('[Journey/social] No notification control found');
+  }
+
+  // 5. Send / Share / Message / Invite — high-risk, always gate (post/publish already
+  // handled above via its own gate, so this covers remaining external-comm actions)
   const sendButtons = await page.locator(
     'button:has-text("Send"), button:has-text("Share"), button:has-text("Message"), ' +
     'button:has-text("Invite"), button:has-text("Forward")',

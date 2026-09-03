@@ -13,6 +13,7 @@ import {
 import { FindingCard } from '../components/session/FindingCard';
 import { SessionProgress } from '../components/session/SessionProgress';
 import { ChatPanel } from '../components/chat/ChatPanel';
+import { SETUP_CONV_KEY } from './ChatSetupPage';
 
 function applyEvent(
   event: { type: string; payload: unknown },
@@ -202,20 +203,58 @@ export function LiveSessionPage() {
           <h1>Live Exploration</h1>
           <p className="target-url">{session.config.targetUrl}</p>
           <p className="connection-status">
-            {awaitingAuth
-              ? '🔐 Waiting for login credentials in chat'
-              : wsStatus === 'connected'
-                ? '🟢 Live'
-                : wsStatus === 'error' || wsStatus === 'closed'
-                  ? '🟡 Polling'
-                  : '⏳ Connecting...'}
+            {/* The session's own lifecycle status is authoritative and checked first — the
+                WebSocket can easily still read "connected" for a few seconds after the
+                exploration itself has finished, which previously kept showing "🟢 Live" right
+                next to a "COMPLETED" badge elsewhere on the same page. */}
+            {session.status === 'completed'
+              ? '✅ Completed'
+              : session.status === 'failed'
+                ? '❌ Failed'
+                : session.status === 'cancelled'
+                  ? '⏹️ Cancelled'
+                  : session.status === 'paused'
+                    ? '⏸️ Paused'
+                    : awaitingAuth
+                      ? '🔐 Waiting for login credentials in chat'
+                      : wsStatus === 'connected'
+                        ? '🟢 Live'
+                        : wsStatus === 'error' || wsStatus === 'closed'
+                          ? '🟡 Polling'
+                          : '⏳ Connecting...'}
           </p>
+          {session.authState === 'required' && (
+            <p className="auth-status-warning">
+              ⚠️ Login failed — tasks are running unauthenticated; findings below may reflect the
+              login page rather than the real app
+            </p>
+          )}
+          {session.authState === 'awaiting_otp' && (
+            <p className="auth-status-warning">⏸️ Login paused — waiting for OTP, reply in chat to continue</p>
+          )}
+          {session.authState === 'ready' &&
+            session.config.credentials &&
+            session.config.credentials.type !== 'none' && (
+              <p className="auth-status-success">
+                ✅ Login completed — exploring as an authenticated user
+                {session.postLoginUrl ? ` (${session.postLoginUrl})` : ''}
+              </p>
+            )}
         </div>
         <div className="live-actions">
           {(session.status === 'completed' || session.status === 'failed') && (
-            <Link to={`/report/${session.id}`} className="btn btn-primary">
-              View Report
-            </Link>
+            <>
+              <Link to={`/report/${session.id}`} className="btn btn-primary">
+                View Report
+              </Link>
+              <Link
+                to="/chat"
+                className="btn btn-secondary"
+                onClick={() => sessionStorage.removeItem(SETUP_CONV_KEY)}
+              >
+                + New Exploration
+              </Link>
+            </>
           )}
           {isActive && (
             <button className="btn btn-secondary" onClick={handlePause}>

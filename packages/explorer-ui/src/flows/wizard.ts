@@ -110,8 +110,14 @@ export async function runWizard(
     const s5 = shot('after-back');
     await page.screenshot({ path: s5 });
 
-    // Check if data entered in previous step is still there
-    const inputValue = await page.locator('input[type="text"]').first().inputValue().catch(() => null);
+    // Check if data entered in previous step is still there. .count() first avoids the same
+    // actionability-wait hang as elsewhere in this codebase when this step's page happens to
+    // have no plain type="text" input at all (e.g. email/number/select-only steps).
+    const textInput = page.locator('input[type="text"]').first();
+    const inputValue =
+      (await textInput.count().catch(() => 0)) > 0
+        ? await textInput.inputValue().catch(() => null)
+        : null;
     ctx.onLog(`[Wizard] After Back — first input value: "${inputValue}"`);
 
     if (inputValue === null || inputValue === '') {

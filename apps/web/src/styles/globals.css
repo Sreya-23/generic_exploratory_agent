@@ -49,10 +49,14 @@ a:hover {
 .app-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 2rem;
   padding: 1rem 2rem;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
+}
+
+.new-session-btn {
+  margin-left: auto;
 }
 
 .logo {
@@ -384,6 +388,20 @@ textarea {
   margin-top: 0.25rem;
 }
 
+.auth-status-warning {
+  color: var(--high);
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-top: 0.4rem;
+}
+
+.auth-status-success {
+  color: var(--success);
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-top: 0.4rem;
+}
+
 .live-actions {
   display: flex;
   gap: 0.75rem;
@@ -431,6 +449,18 @@ textarea {
   gap: 1.5rem;
 }
 
+.regression-diff-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+}
+
+@media (max-width: 700px) {
+  .regression-diff-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 900px) {
   .live-grid {
     grid-template-columns: 1fr;
@@ -443,6 +473,12 @@ textarea {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 1.25rem;
+  /* Same fix as .chat-section: a grid item defaults to min-width:auto, so one finding
+     containing a long unbroken string (a query-string URL, a long selector list) can force
+     this whole column — and with it the live-page grid's column split — wider than the
+     viewport, turning the page into a single horizontally-scrolling column instead of the
+     intended two-column layout. */
+  min-width: 0;
 }
 
 .findings-panel h2,
@@ -465,6 +501,17 @@ textarea {
   border-left-width: 4px;
   border-radius: 8px;
   padding: 1rem;
+  min-width: 0;
+}
+
+.finding-card h3,
+.finding-card p,
+.finding-card li {
+  /* Findings routinely contain long unbroken strings — a full query-string URL, a
+     concatenated list of selectors — that would otherwise overflow the card's own width
+     even after the grid-level min-width:0 fix stops it from overflowing the whole page. */
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 
 .finding-critical {
@@ -582,6 +629,62 @@ textarea {
 .report-actions {
   display: flex;
   gap: 0.75rem;
+}
+
+.health-score-card {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.health-score-grade {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  font-size: 2rem;
+  font-weight: 800;
+  flex-shrink: 0;
+}
+
+.health-score-grade.grade-A,
+.health-score-grade.grade-B {
+  background: rgba(34, 197, 94, 0.18);
+  color: var(--success);
+}
+.health-score-grade.grade-C {
+  background: rgba(234, 179, 8, 0.18);
+  color: var(--medium);
+}
+.health-score-grade.grade-D {
+  background: rgba(249, 115, 22, 0.18);
+  color: var(--high);
+}
+.health-score-grade.grade-F {
+  background: rgba(239, 68, 68, 0.18);
+  color: var(--critical);
+}
+
+.health-score-body h2 {
+  font-size: 1.1rem;
+  margin-bottom: 0.25rem;
+}
+
+.health-score-number {
+  color: var(--text-muted);
+  font-weight: 600;
+  margin-right: 0.5rem;
+}
+
+.health-score-summary {
+  color: var(--text-muted);
 }
 
 .severity-summary {
@@ -718,6 +821,7 @@ textarea {
 .chat-panel {
   display: flex;
   flex-direction: column;
+  min-width: 0;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -745,6 +849,7 @@ textarea {
 
 .chat-messages {
   flex: 1;
+  min-width: 0;
   overflow-y: auto;
   padding: 1.25rem;
   display: flex;
@@ -754,6 +859,14 @@ textarea {
 
 .chat-bubble {
   max-width: 85%;
+  min-width: 0;
+  /* A long finding's "actual" text (a comma-separated list of quoted values, in practice)
+     has no natural break points a flex/grid layout will use on its own — without this, the
+     bubble (and every ancestor flex/grid container up to the page itself) grows to fit that
+     one long line's intrinsic width instead of wrapping it, stretching the whole UI
+     horizontally rather than just this one message. */
+  overflow-wrap: break-word;
+  word-break: break-word;
   padding: 0.75rem 1rem;
   border-radius: 12px;
   font-size: 0.9rem;
@@ -783,6 +896,94 @@ textarea {
   padding: 0.1rem 0.35rem;
   border-radius: 4px;
   font-size: 0.85em;
+}
+
+.findings-chat-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+.findings-chat-panel h2 {
+  font-size: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.findings-chat-history {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-height: 360px;
+  overflow-y: auto;
+  margin-bottom: 0.75rem;
+}
+
+.findings-chat-question {
+  align-self: flex-end;
+  max-width: 85%;
+  padding: 0.6rem 0.9rem;
+  border-radius: 12px;
+  border-bottom-right-radius: 4px;
+  background: var(--primary);
+  color: white;
+  font-size: 0.9rem;
+}
+
+.findings-chat-answer {
+  align-self: flex-start;
+  max-width: 90%;
+  padding: 0.75rem 1rem;
+  border-radius: 12px;
+  border-bottom-left-radius: 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.findings-chat-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.chip-btn {
+  padding: 0.35rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.chip-btn:hover:not(:disabled) {
+  border-color: var(--primary);
+  color: var(--primary-hover);
+}
+
+.chip-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.findings-chat-input-row {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.findings-chat-input-row input {
+  flex: 1;
+  padding: 0.6rem 0.9rem;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font);
 }
 
 .chat-time {
@@ -838,6 +1039,11 @@ textarea {
 
 .chat-section {
   min-height: 500px;
+  /* A CSS Grid track sized with `fr` still defaults to shrinking no further than its
+     content's intrinsic width — the same issue min-width:0 fixes on .chat-messages/
+     .chat-bubble below, one level up at the grid-item itself, so the .live-grid-chat
+     column split holds even when a message contains one very long line. */
+  min-width: 0;
 }
 
 @media (max-width: 900px) {

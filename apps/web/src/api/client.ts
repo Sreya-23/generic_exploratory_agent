@@ -1,6 +1,7 @@
 import type {
   ExplorationArea,
   Finding,
+  HealthScore,
   SessionConfig,
   SessionCredentials,
   SessionDepth,
@@ -85,23 +86,6 @@ export async function uploadPrd(sessionId: string, file: File): Promise<void> {
     const err = await res.json().catch(() => ({}));
     throw new Error((err as { error?: string }).error ?? 'Failed to upload PRD');
   }
-}
-
-export async function uploadSetupPrd(
-  conversationId: string,
-  file: File,
-): Promise<import('@qa/shared').SetupChatResponse> {
-  const form = new FormData();
-  form.append('file', file);
-  const res = await fetch(
-    `${API_BASE}/api/chat/setup/upload-prd?conversationId=${encodeURIComponent(conversationId)}`,
-    { method: 'POST', body: form },
-  );
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error((err as { error?: string }).error ?? 'Failed to upload PRD');
-  }
-  return res.json();
 }
 
 export async function fetchSessionReport(
@@ -249,11 +233,23 @@ export function reportDownloadUrl(id: string, format: 'md' | 'html'): string {
   return `${API_BASE}/api/sessions/${id}/report?format=${format}`;
 }
 
+export async function askAboutFindings(sessionId: string, question: string): Promise<string> {
+  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/ask`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+  });
+  if (!res.ok) throw new Error('Failed to get an answer');
+  const data = (await res.json()) as { answer: string };
+  return data.answer;
+}
+
 export interface SessionReportPayload {
   sessionId: string;
   status: string;
   total: number;
   bySeverity: Record<'critical' | 'high' | 'medium' | 'low' | 'info', number>;
+  healthScore: HealthScore;
   executiveSummary: string;
   recommendedNextSteps: string[];
   markdown: string;

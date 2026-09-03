@@ -116,9 +116,16 @@ export async function runFormValidation(
     const fieldName = (await input.getAttribute('name')) ?? '';
     const fieldPlaceholder = (await input.getAttribute('placeholder')) ?? '';
     const fieldId = (await input.getAttribute('id')) ?? '';
-    const fieldLabel = fieldId
-      ? ((await page.locator(`label[for="${fieldId}"]`).first().textContent().catch(() => '')) ?? '')
-      : '';
+    // .textContent() auto-waits for the locator to resolve to an attached element — if no
+    // <label for="..."> exists at all (very common; many real forms label via placeholder/
+    // aria-label only), .first() on that zero-match locator would otherwise block for
+    // Playwright's full default actionability timeout before the .catch() ever fires,
+    // for every single field checked. .count() first is a plain, non-waiting query.
+    const labelLocator = fieldId ? page.locator(`label[for="${fieldId}"]`).first() : null;
+    const fieldLabel =
+      labelLocator && (await labelLocator.count().catch(() => 0)) > 0
+        ? ((await labelLocator.textContent().catch(() => '')) ?? '')
+        : '';
     const risk = classifyInputRisk(fieldName, fieldPlaceholder, fieldLabel, inputType);
 
     if (risk === 'high-risk') {

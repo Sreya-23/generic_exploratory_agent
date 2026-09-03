@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { PrdCoverageSummary, SessionState } from '@qa/shared';
+import { computeHealthScore, type PrdCoverageSummary, type SessionState } from '@qa/shared';
 import { generateSessionReport, type SessionReport } from './generate-report.js';
 
 export { generateSessionReport, dedupeFindings } from './generate-report.js';
@@ -38,6 +38,7 @@ export async function saveSessionState(
 
 /** Full session report (Markdown) including optional PRD coverage */
 export function generateSessionReportMarkdown(state: SessionState): string {
+  const health = computeHealthScore(state.findings);
   const lines: string[] = [
     `# Exploration Report`,
     ``,
@@ -46,6 +47,10 @@ export function generateSessionReportMarkdown(state: SessionState): string {
     `**Status:** ${state.status}`,
     `**Findings:** ${state.findings.length}`,
     `**Completed:** ${state.updatedAt}`,
+    ``,
+    `## Health Score: ${health.grade} (${health.score}/100)`,
+    ``,
+    health.summary,
     ``,
   ];
 

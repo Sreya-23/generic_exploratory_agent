@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import { mkdir, rm, readdir } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,12 +15,27 @@ import { registerChatRoutes, bridgeSessionEventToChat, registerPrdAndReportRoute
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '../../..');
-const SESSIONS_DIR = process.env.SESSIONS_DIR ?? join(ROOT, 'sessions');
+// `import 'dotenv/config'` resolves .env relative to process.cwd() — but npm sets cwd to
+// THIS WORKSPACE's own directory (apps/api/) when running a per-workspace script, not the
+// repo root where the actual .env file lives. That silently no-ops (dotenv doesn't throw on
+// a missing file), so every env var meant to come from the root .env — GEMINI_API_KEY
+// included — was never actually loaded, no matter what the file said. Pointing dotenv at
+// an explicit, cwd-independent path fixes this for good.
+dotenv.config({ path: join(ROOT, '.env') });
+// resolve() (not a bare join/fallback) so a relative value from .env — e.g. the
+// "./sessions" in .env.example, meant relative to the repo root — still resolves to an
+// absolute path. @fastify/static requires an absolute root, and this only "worked" before
+// by accident: dotenv wasn't actually loading .env at all (see comment above), so this
+// always silently fell through to the already-absolute default instead.
+const SESSIONS_DIR = resolve(ROOT, process.env.SESSIONS_DIR ?? 'sessions');
 const PORT = Number(process.env.API_PORT ?? 3001);
 
 await mkdir(SESSIONS_DIR, { recursive: true });
 
-// Clear stale session folders on startup so old results don't bleed into new runs
+// Deletes every session folder on disk. Only called from two places: the opt-in startup
+// sweep below (gated — see its caller) and the explicit DELETE /api/sessions route, where
+// wiping files is exactly what the user asked for and should always happen regardless of the
+// startup gate.
 async function clearSessionsDir(): Promise<void> {
   try {
     const entries = await readdir(SESSIONS_DIR);
@@ -33,7 +48,11 @@ async function clearSessionsDir(): Promise<void> {
     /* ignore if dir is empty or missing */
   }
 }
-await clearSessionsDir();
+// Opt-in only — see clearSessionsDir's doc comment for why this used to run unconditionally
+// and silently destroyed real session data on every dev-server restart.
+if (process.env.CLEAR_SESSIONS_ON_START === '1') {
+  await clearSessionsDir();
+}
 
 const app = Fastify({ logger: true });
 
@@ -86,7 +105,7 @@ app.delete('/api/sessions', async () => {
 });
 
 app.get<{ Params: { id: string } }>('/api/sessions/:id', async (req, reply) => {
-  const session = orchestrator.getSession(req.params.id);
+  const session = await orchestrator.getSessionOrRehydrate(req.params.id, SESSIONS_DIR);
   if (!session) return reply.status(404).send({ error: 'Session not found' });
   return session;
 });
