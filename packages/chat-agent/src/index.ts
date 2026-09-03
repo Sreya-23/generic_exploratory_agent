@@ -27,3 +27,5 @@ export {
   LiveChatStore,
   liveChatStore,
 } from './live-chat.js';
+
+export { answerFindingsQuestion, type FindingsQaContext } from './findings-chat.js';

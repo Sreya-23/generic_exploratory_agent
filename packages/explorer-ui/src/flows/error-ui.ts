@@ -26,21 +26,32 @@ export async function runErrorUi(
     return;
   }
 
-  // Clear all text inputs and submit
+  // Fill with plausible-but-wrong values, not empty ones — an EMPTY submission tests a
+  // different thing (required-field validation, which many apps handle separately or not at
+  // all) than genuinely WRONG credentials, which is what "invalid credentials" actually means.
+  // Confirmed real gap: this previously cleared fields to blank and still reported findings
+  // titled "invalid login credentials," which don't match what was actually submitted — a
+  // real login page can correctly show nothing for an empty submit (e.g. relying on native
+  // required-field validation) while still correctly showing "Invalid credentials" for a
+  // filled-but-wrong attempt, and the old wording made the former look like the latter.
   const inputs = form.locator('input:not([type="hidden"]):not([type="submit"]):not([type="checkbox"])');
   const count = await inputs.count();
   for (let i = 0; i < count; i++) {
-    await inputs.nth(i).fill('').catch(() => {});
+    const input = inputs.nth(i);
+    const type = await input.getAttribute('type').catch(() => null);
+    const value = type === 'password' ? 'WrongPassword_QA123!' : 'invalid_test_user@example.com';
+    await input.fill(value).catch(() => {});
   }
 
   await submitBtn.click().catch(() => {});
 
-  const s1 = shot('after-empty-submit');
+  // Filled credentials mean a real server round-trip now (not just client-side validation on
+  // empty fields), so this needs more headroom than the old 800ms gave it. Screenshot AFTER
+  // the wait, not before, so the evidence actually shows the outcome rather than the
+  // pre-response page state.
+  const errorText = await findVisibleErrorText(page, 1500);
+  const s1 = shot('after-invalid-submit');
   await page.screenshot({ path: s1 });
-
-  // Use the shared helper which waits 800ms and searches ordered, specific-first selectors
-  // to avoid empty placeholder containers (e.g. Sauce Demo's always-present error div).
-  const errorText = await findVisibleErrorText(page, 800);
 
   if (!errorText) {
     // Final check: native :invalid pseudo-class (browser built-in validation)
@@ -53,9 +64,13 @@ export async function runErrorUi(
         severity: 'medium',
         area: 'UI-ErrorUI',
         title: 'No visible error message after invalid form submission',
-        steps: ['Clear all form fields', 'Click Submit', 'Wait 800ms'],
+        steps: [
+          'Fill all form fields with plausible-but-invalid values (wrong password, bogus email)',
+          'Click Submit',
+          'Wait 1500ms for a server round-trip',
+        ],
         expected: 'Clear, descriptive error message shown',
-        actual: 'No error message with text visible after 800ms (empty containers excluded)',
+        actual: 'No error message with text visible after 1500ms (empty containers excluded)',
         evidence: [s1],
         reproRate: '1/1',
         automationCandidate: true,

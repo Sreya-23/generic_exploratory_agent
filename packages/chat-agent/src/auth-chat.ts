@@ -13,7 +13,15 @@ export function effectiveAuthState(draft: SetupDraft): AuthState {
 export function credentialsComplete(draft: SetupDraft): boolean {
   const creds = draft.credentials;
   if (!draft.authProbe?.requiresAuth && !draft.needsLogin) return true;
-  if (creds.type === 'none' && !draft.authProbe?.requiresAuth) return true;
+  // An explicit "skip login, explore anonymously" choice must always be honored — this is
+  // exactly the right call for a site like an e-commerce catalog where almost everything is
+  // browsable without an account. Previously this only counted as "complete" when the probe
+  // ALSO agreed no auth was needed, which meant the user's explicit choice got silently
+  // overridden and the whole session blocked on a credentials prompt whenever the probe
+  // detected (or misdetected) requiresAuth — precisely the case this option exists for.
+  // Whatever's actually gated will simply surface per-flow (isLoginWallPage()) rather than
+  // stopping exploration before it starts.
+  if (creds.type === 'none') return true;
   if (creds.type === 'api-key' && creds.apiKey) return true;
   if (creds.type === 'bearer' && creds.bearerToken) return true;
   if (creds.type !== 'login' && creds.type !== 'api-key' && creds.type !== 'bearer') return false;
@@ -23,16 +31,21 @@ export function credentialsComplete(draft: SetupDraft): boolean {
 
   const method = creds.authMethod ?? draft.authProbe?.suggestedMethod ?? 'password';
   if (method === 'password') return !!(creds.username && creds.password);
-  if (method === 'otp') return !!(creds.username && creds.otp);
-  if (method === 'password-otp') return !!(creds.username && creds.password && creds.otp);
+  // OTP methods: the code itself is NEVER known up front — it only exists after we've
+  // visited the site and triggered a real send. Treating "complete" as "have everything
+  // needed to attempt login" (not "already have the OTP") is what lets the app actually
+  // reach the site and trigger that send, instead of asking the user for a code before
+  // any real OTP has ever been sent.
+  if (method === 'otp') return !!creds.username;
+  if (method === 'password-otp') return !!(creds.username && creds.password);
   return !!(creds.username && (creds.password || creds.otp));
 }
 
 export function nextAuthState(draft: SetupDraft): AuthState {
   if (!draft.targetUrl) return 'unknown';
-  if (draft.credentials.type === 'none' && !draft.authProbe?.requiresAuth && !draft.needsLogin) {
-    return 'ready';
-  }
+  // Same fix as credentialsComplete() above: an explicit "none" choice is always 'ready',
+  // regardless of what the probe thinks — never re-litigated based on requiresAuth/needsLogin.
+  if (draft.credentials.type === 'none') return 'ready';
   if (!draft.authProbe && !draft.needsLogin) return 'ready';
 
   const requires = draft.authProbe?.requiresAuth || draft.needsLogin;
@@ -105,7 +118,12 @@ export function applyAuthProbe(draft: SetupDraft, probe: AuthProbeResult): Setup
 
 /** Strip accidental wrapping quotes from a credential value. */
 export function cleanCredentialValue(value: string): string {
-  return value.trim().replace(/^['"`]+|['"`]+$/g, '').trim();
+  // Users commonly separate multiple fields on one line with a comma (e.g.
+  // "username: 8111916365, otp: 123456") — the value-capturing regexes above stop at
+  // whitespace, not punctuation, so a trailing comma/semicolon sticks to the captured
+  // value unless stripped here. Left in, it becomes part of the actual phone number/
+  // username submitted to the real site.
+  return value.trim().replace(/^['"`]+|['"`]+$/g, '').replace(/[,;]+$/, '').trim();
 }
 
 /**
@@ -209,57 +227,57 @@ export function parseAuthFields(
   }
 
   const userLabelMatch = trimmed.match(
-    /^(?:e-?mail|users?names?|user(?:name)?|login|account)\s*[:=]\s*(.+)$/i,
+    /^(?:e-?mail|users?names?|user(?:name)?|login|account)\s*[:=-]\s*(.+)$/i,
   );
   if (userLabelMatch) {
     patch.username = cleanCredentialValue(userLabelMatch[1]);
     patch.type = 'login';
   }
 
-  const passLabelMatch = trimmed.match(/^(?:pass(?:words?)?|pwd)\s*[:=]\s*(.+)$/i);
+  const passLabelMatch = trimmed.match(/^(?:pass(?:words?)?|pwd)\s*[:=-]\s*(.+)$/i);
   if (passLabelMatch) {
     patch.password = cleanCredentialValue(passLabelMatch[1]);
     patch.type = 'login';
   }
 
-  const otpLabelMatch = trimmed.match(/^(?:otp|code|verification)\s*[:=]\s*(.+)$/i);
+  const otpLabelMatch = trimmed.match(/^(?:otp|code|verification)\s*[:=-]\s*(.+)$/i);
   if (otpLabelMatch) {
     patch.otp = cleanCredentialValue(otpLabelMatch[1]);
     patch.type = 'login';
   }
 
-  const emailMatch = trimmed.match(/(?:email|users?names?|user(?:name)?)\s*[:=]\s*(\S+)/i);
+  const emailMatch = trimmed.match(/(?:email|users?names?|user(?:name)?)\s*[:=-]\s*(\S+)/i);
   if (emailMatch) {
     patch.username = cleanCredentialValue(emailMatch[1]);
     patch.type = 'login';
   }
 
-  const passMatch = trimmed.match(/(?:pass(?:word)?)\s*[:=]\s*(\S+)/i);
+  const passMatch = trimmed.match(/(?:pass(?:word)?)\s*[:=-]\s*(\S+)/i);
   if (passMatch) {
     patch.password = cleanCredentialValue(passMatch[1]);
     patch.type = 'login';
   }
 
-  const otpMatch = trimmed.match(/(?:otp|code)\s*[:=]\s*(\S+)/i);
+  const otpMatch = trimmed.match(/(?:otp|code)\s*[:=-]\s*(\S+)/i);
   if (otpMatch) {
     patch.otp = cleanCredentialValue(otpMatch[1]);
     patch.type = 'login';
   }
 
-  const apiMatch = trimmed.match(/(?:api[- ]?key)\s*[:=]\s*(\S+)/i);
+  const apiMatch = trimmed.match(/(?:api[- ]?key)\s*[:=-]\s*(\S+)/i);
   if (apiMatch) {
     patch.type = 'api-key';
     patch.apiKey = apiMatch[1];
   }
 
-  const bearerMatch = trimmed.match(/(?:bearer)\s*[:=]\s*(\S+)/i);
+  const bearerMatch = trimmed.match(/(?:bearer)\s*[:=-]\s*(\S+)/i);
   if (bearerMatch) {
     patch.type = 'bearer';
     patch.bearerToken = bearerMatch[1];
   }
 
   // OAuth / SSO — user pastes cookies from DevTools
-  const cookiesMatch = trimmed.match(/^cookies?\s*[:=]\s*(.+)$/i);
+  const cookiesMatch = trimmed.match(/^cookies?\s*[:=-]\s*(.+)$/i);
   if (cookiesMatch) {
     patch.type = 'bearer'; // reuse bearer flow, injected as cookies
     patch.cookieString = cookiesMatch[1].trim();
@@ -267,7 +285,7 @@ export function parseAuthFields(
   }
 
   // Magic-link — user pastes the URL from their email
-  const magicLinkMatch = trimmed.match(/^magic-?link\s*[:=]\s*(https?:\/\/\S+)/i);
+  const magicLinkMatch = trimmed.match(/^magic-?link\s*[:=-]\s*(https?:\/\/\S+)/i);
   if (magicLinkMatch) {
     patch.type = 'login';
     patch.magicLinkUrl = magicLinkMatch[1].trim();
@@ -275,7 +293,7 @@ export function parseAuthFields(
   }
 
   // Phone number — for OTP-based login
-  const phoneMatch = trimmed.match(/^phone\s*[:=]\s*([+\d\s()-]{7,20})/i);
+  const phoneMatch = trimmed.match(/^phone\s*[:=-]\s*([+\d\s()-]{7,20})/i);
   if (phoneMatch) {
     patch.type = 'login';
     patch.username = phoneMatch[1].trim();
@@ -283,7 +301,7 @@ export function parseAuthFields(
   }
 
   const combo = trimmed.match(
-    /(?:user(?:name)?|email)\s*[:=]\s*(\S+)\s+(?:pass(?:word)?)\s*[:=]\s*(\S+)(?:\s+(?:otp|code)\s*[:=]\s*(\S+))?/i,
+    /(?:user(?:name)?|email)\s*[:=-]\s*(\S+)\s+(?:pass(?:word)?)\s*[:=-]\s*(\S+)(?:\s+(?:otp|code)\s*[:=-]\s*(\S+))?/i,
   );
   if (combo) {
     patch.type = 'login';
@@ -336,7 +354,7 @@ export function parseAuthFields(
     !/^(start|public|password|otp|api)$/i.test(trimmed)
   ) {
     patch.username = cleanCredentialValue(
-      trimmed.replace(/^(?:email|users?names?|user(?:name)?)\s*[:=]\s*/i, ''),
+      trimmed.replace(/^(?:email|users?names?|user(?:name)?)\s*[:=-]\s*/i, ''),
     );
     patch.type = 'login';
   }

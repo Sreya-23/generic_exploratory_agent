@@ -9,6 +9,7 @@ import {
   liveChatStore,
   processLiveMessage,
   sessionEventToChatMessage,
+  answerFindingsQuestion,
 } from '@qa/chat-agent';
 import { probeAuth } from '@qa/explorer-ui';
 import type { SessionCredentials, SessionEvent } from '@qa/shared';
@@ -224,7 +225,7 @@ export function registerPrdAndReportRoutes(app: FastifyInstance, sessionsDir: st
   app.get<{ Params: { id: string }; Querystring: { format?: string } }>(
     '/api/sessions/:id/report',
     async (req, reply) => {
-      const session = orchestrator.getSession(req.params.id);
+      const session = await orchestrator.getSessionOrRehydrate(req.params.id, sessionsDir);
       if (!session) return reply.status(404).send({ error: 'Session not found' });
 
       const format = (req.query.format ?? 'json').toLowerCase();
@@ -271,6 +272,23 @@ export function registerPrdAndReportRoutes(app: FastifyInstance, sessionsDir: st
         reportMarkdown: generateSessionReportMarkdown(session),
         session,
       };
+    },
+  );
+
+  app.post<{ Params: { id: string }; Body: { question: string } }>(
+    '/api/sessions/:id/ask',
+    async (req, reply) => {
+      const session = await orchestrator.getSessionOrRehydrate(req.params.id, sessionsDir);
+      if (!session) return reply.status(404).send({ error: 'Session not found' });
+      const question = req.body?.question?.trim();
+      if (!question) return reply.status(400).send({ error: 'question is required' });
+
+      const answer = answerFindingsQuestion(question, {
+        findings: session.findings,
+        targetUrl: session.config.targetUrl,
+        prdCoverage: session.prdCoverage,
+      });
+      return { answer };
     },
   );
 }

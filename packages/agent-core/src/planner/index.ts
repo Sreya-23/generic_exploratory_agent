@@ -7,6 +7,7 @@ import type {
   SessionConfig,
   SessionDepth,
   SiteClassification,
+  SiteIntelligenceSignals,
 } from '@qa/shared';
 import { FLOW_CLASSES, FLOW_TITLES, GENERIC_PHASES } from '@qa/shared';
 
@@ -31,10 +32,8 @@ function tasksForArea(area: keyof typeof FLOW_CLASSES, startPriority: number): F
 
 /**
  * All areas that are always explored by default.
- * 'accessibility' is deliberately excluded: labels/keyboard/contrast have no
- * FLOW_HANDLERS entry, so they'd silently fall back to the navigation flow
- * A1 already runs — pure wasted task budget. Still runnable explicitly via
- * `selectedFlowClasses` (e.g. "run E1, E2, E3") once real handlers exist.
+ * 'accessibility' (labels, keyboard focus visibility, colour contrast) now has real
+ * FLOW_HANDLERS entries (see accessibility.ts) and is included by default.
  */
 const ALL_AREAS: (keyof typeof FLOW_CLASSES)[] = [
   'ui',
@@ -43,6 +42,7 @@ const ALL_AREAS: (keyof typeof FLOW_CLASSES)[] = [
   'security',
   'performance',
   'regression',
+  'accessibility',
 ];
 
 /** Area lookup for a given flow class */
@@ -116,7 +116,7 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
       .filter((t) => {
         if (phase.id === 'recon') return t.flowClass === 'recon';
         if (phase.id === 'smoke')
-          return ['navigation', 'crud', 'journey', 'user-directed'].includes(t.flowClass);
+          return ['navigation', 'crud', 'journey', 'user-directed', 'action-inventory', 'consent-exploration', 'visual-review'].includes(t.flowClass);
         if (phase.id === 'boundary')
           return [
             'form-validation',
@@ -128,6 +128,17 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
             'file-upload',
             'autofill',
             'viewport',
+            'business-logic-boundary',
+            'zoom-reflow',
+            'dark-mode',
+            'reduced-motion',
+            'autofill-overlap',
+            'long-content',
+            'rtl-layout',
+            'placeholder-check',
+            'broken-images',
+            'element-overflow',
+            'locale-format',
           ].includes(t.flowClass);
         if (phase.id === 'interruption')
           return [
@@ -139,6 +150,9 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
             'session-timeout',
             'multi-tab-logout',
             'wizard',
+            'focus-trap',
+            'bfcache',
+            'concurrent-edit',
           ].includes(t.flowClass);
         if (phase.id === 'auth')
           return [
@@ -158,6 +172,8 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
             'flaky-network',
             'timeout-retry',
             'websocket-disconnect',
+            'cpu-throttle',
+            'offline-pwa',
           ].includes(t.flowClass);
         if (phase.id === 'report')
           return [
@@ -169,11 +185,19 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
             'large-payload',
             'n-plus-one',
             'xss-probe',
+            'security-headers',
             'rate-limit',
             'idempotency',
             'labels',
             'keyboard',
             'contrast',
+            'cross-browser',
+            'device-matrix',
+            'download-verify',
+            'toast-stacking',
+            'js-errors',
+            'coverage-report',
+            'web-vitals',
           ].includes(t.flowClass);
         return false;
       })
@@ -221,6 +245,51 @@ export function buildPlanFromContext(
   }
 
   return base;
+}
+
+/**
+ * Called once real recon signals are in, for tasks that are already queued but haven't
+ * run yet — the depth-tier limit (DEPTH_TASK_LIMITS) already truncated the FULL matrix down
+ * to a fixed budget before recon ever ran, purely by hardcoded array order, so at
+ * smoke/standard depth over half the matrix can get cut for reasons that have nothing to do
+ * with the actual site. This can't fix which tasks already made that cut, but it CAN stop
+ * spending remaining budget on the ones we now have real evidence are pointless (e.g.
+ * testing file-upload edge cases on a page with no file input) — freeing that time for
+ * whatever's left, and directly avoiding the "clearly not applicable" output that made past
+ * runs look generic. Recon only samples the landing page, so this is evidence, not proof —
+ * a real file input could still live on some other page — hence removing only the two flows
+ * where recon's signal is unambiguous, not guessing broadly.
+ */
+export function removeUnlikelyTasks(plan: ExplorationPlan, signals: SiteIntelligenceSignals): void {
+  const hasFileInput = signals.inputTypes.includes('file');
+  const looksPaginated =
+    signals.urlPaths.some((p) => /page=|\/page\//i.test(p)) ||
+    signals.buttonTexts.some((t) => /\b(next|previous|prev)\b/i.test(t)) ||
+    signals.linkTexts.some((t) => /^\d+$/.test(t.trim()));
+  const hasAutofillProneInput =
+    signals.inputTypes.includes('email') || signals.inputTypes.includes('password');
+  const looksDownloadable =
+    signals.buttonTexts.some((t) => /\b(download|export)\b/i.test(t)) ||
+    signals.linkTexts.some((t) => /\b(download|export)\b/i.test(t));
+
+  const toRemove = new Set(
+    plan.tasks
+      .filter(
+        (t) =>
+          (t.flowClass === 'file-upload' && !hasFileInput) ||
+          (t.flowClass === 'pagination-ui' && !looksPaginated) ||
+          (t.flowClass === 'autofill-overlap' && !hasAutofillProneInput) ||
+          (t.flowClass === 'download-verify' && !looksDownloadable),
+      )
+      .map((t) => t.id),
+  );
+  if (toRemove.size === 0) return;
+
+  plan.tasks = plan.tasks.filter((t) => !toRemove.has(t.id));
+  for (const phase of plan.phases) {
+    phase.taskIds = phase.taskIds.filter((id) => !toRemove.has(id));
+  }
+  plan.phases = plan.phases.filter((p) => p.taskIds.length > 0);
 }
 
 export function injectJourneyTasks(

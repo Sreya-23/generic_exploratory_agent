@@ -63,6 +63,24 @@ export async function runRecon(
   ctx: ExecutorContext,
   _task: FlowTask,
 ): Promise<void> {
+  const apiCalls: string[] = [];
+  page.on('request', (req) => {
+    const url = req.url();
+    if (
+      req.resourceType() === 'xhr' ||
+      req.resourceType() === 'fetch' ||
+      url.includes('/api/')
+    ) {
+      apiCalls.push(`${req.method()} ${url}`);
+    }
+  });
+
+  // Wait for the app to fully settle (networkidle) BEFORE reading links/forms/title —
+  // client-rendered SPAs routinely have zero real nav links in the DOM at
+  // domcontentloaded time, so counting immediately produces a false "no links found"
+  // finding on a page that hasn't finished rendering yet, not a real bug.
+  await page.reload({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
+
   const title = await page.title();
 
   const links = await page.$$eval('a[href]', (els) =>
@@ -82,20 +100,6 @@ export async function runRecon(
     })),
   );
 
-  const apiCalls: string[] = [];
-  page.on('request', (req) => {
-    const url = req.url();
-    if (
-      req.resourceType() === 'xhr' ||
-      req.resourceType() === 'fetch' ||
-      url.includes('/api/')
-    ) {
-      apiCalls.push(`${req.method()} ${url}`);
-    }
-  });
-
-  await page.reload({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
-
   const hasLoginWall =
     (await page.locator('input[type="password"]').count()) > 0 &&
     ctx.config.credentials?.type === 'none';
@@ -106,6 +110,38 @@ export async function runRecon(
   ctx.onLog(
     `[Recon] "${title}" — ${links.length} links, ${forms.length} forms, ${apiCalls.length} API calls`,
   );
+
+  // Distinct routes (origin+pathname) discovered from landing-page links — the "what SHOULD
+  // get covered" half of the coverage-report flow's comparison. Query strings/fragments are
+  // stripped since they don't represent a genuinely different page for coverage purposes.
+  // Same-origin only — an external link (a partner site, app store badge, docs site) isn't a
+  // route of the app under test, and flagging it "not visited" would be a false gap, not real
+  // missing coverage.
+  const targetOrigin = (() => {
+    try {
+      return new URL(ctx.config.targetUrl).origin;
+    } catch {
+      return null;
+    }
+  })();
+  const discoveredRoutes = [
+    ...new Set(
+      links
+        .map((href) => {
+          try {
+            const u = new URL(href);
+            if (targetOrigin && u.origin !== targetOrigin) return null;
+            return u.origin + u.pathname;
+          } catch {
+            return null;
+          }
+        })
+        .filter((r): r is string => r !== null),
+    ),
+  ];
+  if (discoveredRoutes.length > 0) {
+    ctx.discoveredRoutes = discoveredRoutes;
+  }
 
   // Share discovered API endpoints with the context so the API executor uses
   // real endpoints instead of guessing generic paths like /api/users, /api/admin

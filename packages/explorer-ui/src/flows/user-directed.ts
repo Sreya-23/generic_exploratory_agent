@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
+import { findVisibleErrorText } from './helpers.js';
 
 async function shot(page: Page, ctx: ExecutorContext, label: string): Promise<string> {
   const p = join(
@@ -181,6 +182,7 @@ export async function runUserDirectedFlow(
       type: isPayment ? 'purchase' : isSendLink ? 'send_link' : 'generic',
       description: `User-directed: "${instruction.slice(0, 80)}"`,
       requiredExtras: isPayment ? ['card'] : isSendLink ? ['phone'] : [],
+      pageUrl: page.url(),
     });
 
     if (extras === null) {
@@ -204,14 +206,12 @@ export async function runUserDirectedFlow(
   const s2 = await shot(page, ctx, `after-${parsed.keywords[0] ?? 'done'}`);
   ctx.onLog(`[UserDirected] Completed: "${instruction}" — now at ${page.url()}`);
 
-  // Check for error states after the interaction
-  const errorEl = await page
-    .locator('[class*="error"], [role="alert"], [class*="invalid"]')
-    .first()
-    .textContent()
-    .catch(() => null);
+  // Check for error states after the interaction. Uses the shared, visibility-checked
+  // helper (not a raw `[class*="error"]` selector) — a naive .first() match can grab a
+  // large wrapping container and report its entire concatenated text as "the error".
+  const errorText = await findVisibleErrorText(page, 400);
 
-  if (errorEl) {
+  if (errorText) {
     ctx.onFinding({
       severity: 'medium',
       area: 'UI-UserDirected',
@@ -222,7 +222,7 @@ export async function runUserDirectedFlow(
         'Observe error message',
       ],
       expected: 'Flow completes without error',
-      actual: `Error shown: "${errorEl.trim().slice(0, 120)}"`,
+      actual: `Error shown: "${errorText.trim().slice(0, 120)}"`,
       evidence: [s1, s2],
       reproRate: '1/1',
       automationCandidate: true,

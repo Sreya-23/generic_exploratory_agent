@@ -11,7 +11,8 @@
     "dev": "concurrently \"npm run dev -w @qa/chat-agent\" \"npm run dev -w @qa/api\" \"npm run dev -w @qa/web\"",
     "dev:api": "npm run dev -w @qa/api",
     "dev:web": "npm run dev -w @qa/web",
-    "setup": "bash scripts/setup.sh"
+    "setup": "bash scripts/setup.sh",
+    "ci:run": "node scripts/ci-run.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

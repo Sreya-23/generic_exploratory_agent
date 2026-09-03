@@ -2,6 +2,14 @@ import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
 
+// Analytics/telemetry beacons fire once per click BY DESIGN — that's their whole job, not
+// evidence of a missing debounce on the actual business action. Confirmed via a real report:
+// clicking a generic button counted as "not debounced" purely because it also fired several
+// unagi.amazon.in / unagi-eu.amazon.com metrics POSTs alongside the real request, which would
+// happen on every single click regardless of any debounce logic on the button itself.
+const ANALYTICS_BEACON_PATTERN =
+  /unagi|analytics|telemetry|\/metrics\/|beacon|\/collect\b|\/pixel\b|google-analytics|googletagmanager|doubleclick\.net|segment\.(io|com)|mixpanel|amplitude|\/csm\/|\.eel\.katal\./i;
+
 // Buttons that trigger state mutations — highest risk for duplicate actions.
 // Ordered: transactional first (highest impact), then general actions.
 const ACTION_BUTTON_SELECTORS = [
@@ -63,7 +71,10 @@ async function readCartCount(page: Page): Promise<number | null> {
  */
 async function rapidClickN(page: Page, selector: string, n: number): Promise<void> {
   for (let i = 0; i < n; i++) {
-    await page.locator(selector).first().click({ force: true }).catch(() => {});
+    // Bounded timeout matters especially here — this runs in a tight N-iteration loop, so
+    // an unguarded default timeout would pay its full cost on EVERY iteration if selector
+    // doesn't match anything, not just once.
+    await page.locator(selector).first().click({ force: true, timeout: 2000 }).catch(() => {});
     // Tiny gap — realistic "fast human" clicking (50–80ms between clicks)
     await page.waitForTimeout(60);
   }
@@ -104,7 +115,7 @@ export async function runDoubleClick(
     let requestCount = 0;
     const requestUrls: string[] = [];
     const reqListener = (req: import('playwright').Request) => {
-      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method())) {
+      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method()) && !ANALYTICS_BEACON_PATTERN.test(req.url())) {
         requestCount++;
         requestUrls.push(`${req.method()} ${req.url()}`);
       }

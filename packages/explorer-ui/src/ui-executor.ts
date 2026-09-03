@@ -34,7 +34,46 @@ import {
   runMultiTabLogout,
 } from './flows/session-flows.js';
 import { runGoldenPath, runVisualRegression } from './flows/regression.js';
-import { performLogin, detectLoginWall } from './auth/login.js';
+import { runLabelsCheck, runKeyboardCheck, runContrastCheck } from './flows/accessibility.js';
+import { runElementIntegrity, runTouchTargetCheck } from './flows/element-integrity.js';
+import { runDeadLinksCheck } from './flows/dead-links.js';
+import { runActionInventory } from './flows/action-inventory.js';
+import { runCrossBrowserCheck } from './flows/cross-browser.js';
+import { runConsentExploration } from './flows/consent-exploration.js';
+import { runSecurityHeadersCheck } from './flows/security-headers.js';
+import { runBusinessLogicBoundary } from './flows/business-logic-boundary.js';
+import { runDeviceMatrixCheck } from './flows/device-matrix.js';
+import { runVisualReview } from './flows/visual-review.js';
+import { runZoomReflow } from './flows/zoom-reflow.js';
+import { runDarkModeCheck } from './flows/dark-mode.js';
+import { runReducedMotionCheck } from './flows/reduced-motion.js';
+import { runWebVitalsCheck } from './flows/web-vitals.js';
+import { runConcurrentEditCheck } from './flows/concurrent-edit.js';
+import { runLocaleFormatCheck } from './flows/locale-format.js';
+import { runOfflinePwaCheck } from './flows/offline-pwa.js';
+import { runFocusTrapCheck } from './flows/focus-trap.js';
+import { runAutofillOverlapCheck } from './flows/autofill-overlap.js';
+import { runLongContentStress } from './flows/long-content.js';
+import { runBfcacheCheck } from './flows/bfcache.js';
+import { runDownloadVerification } from './flows/download-verify.js';
+import { runToastStackingCheck } from './flows/toast-stacking.js';
+import { runRtlLayoutCheck } from './flows/rtl-layout.js';
+import { runPlaceholderCheck } from './flows/placeholder-check.js';
+import { runBrokenImagesCheck } from './flows/broken-images.js';
+import { runElementOverflowCheck } from './flows/element-overflow.js';
+import { runJsErrorsReport } from './flows/js-errors-report.js';
+import { attachErrorTracking } from './flows/js-error-tracker.js';
+import { attachVisitTracking } from './flows/page-visit-tracker.js';
+import { runCoverageReport } from './flows/coverage-report.js';
+import { performLogin, detectLoginWall, checkConsentCheckboxes } from './auth/login.js';
+import {
+  fillOtpInput,
+  isLoginWallPage,
+  findVisibleErrorText,
+  savedSessionStatePath,
+  restoreSessionStorage,
+  waitForRealContent,
+} from './flows/helpers.js';
 import {
   ensureAuthenticatedLanding,
   finalizePostLoginLanding,
@@ -48,6 +87,86 @@ async function getBrowser(): Promise<Browser> {
     sharedBrowser = await chromium.launch({ headless: true });
   }
   return sharedBrowser;
+}
+
+/**
+ * OTP logins pause mid-attempt to wait for the user's real code, which is only known
+ * AFTER we've already visited the site and triggered a genuine send. Closing the browser
+ * at that pause point (as if every retry could just start fresh) would force the next
+ * call to trigger a SECOND real send — racing whichever code the user actually read off
+ * their phone, and very likely invalidating it. Keeping the in-progress context/page here
+ * lets a later call that finally has the code finish this exact attempt instead of
+ * restarting it. Note: an attempt that's never resumed (user never replies) leaks one
+ * browser context until process restart — acceptable for a QA tool's session lifetime,
+ * not something to build a reaper for here.
+ */
+const pendingOtpLogins = new Map<string, { context: BrowserContext; page: Page }>();
+
+async function completeOtpLogin(
+  ctx: ExecutorContext,
+  context: BrowserContext,
+  page: Page,
+  sessionDir: string,
+  otp: string,
+): Promise<boolean> {
+  const filledOtp = await fillOtpInput(page, otp);
+  if (!filledOtp) {
+    // Diagnose rather than just fail silently: the OTP field can go missing for real
+    // reasons (challenge expired, page redirected) — a screenshot + visible-input dump
+    // makes that provable on the next run instead of re-guessing from a bare log line.
+    const visibleInputs = await page
+      .locator('input:visible')
+      .evaluateAll((els) =>
+        els.map((el) => ({
+          type: el.getAttribute('type'),
+          name: el.getAttribute('name'),
+          maxlength: el.getAttribute('maxlength'),
+        })),
+      )
+      .catch(() => []);
+    await page
+      .screenshot({ path: join(sessionDir, 'otp-fill-failure.png'), fullPage: true })
+      .catch(() => {});
+    ctx.onLog(
+      `[Auth/OTP] OTP field not found — login failed. Page: ${page.url()}. ` +
+        `Visible inputs: ${JSON.stringify(visibleInputs)}`,
+    );
+    await context.close();
+    return false;
+  }
+
+  await clickSubmitOnPage(page);
+
+  // A correct OTP still needs a real network round-trip (server verification, session write)
+  // plus a client-side redirect before the login wall actually clears — a single fixed 2s
+  // wait then a ONE-SHOT check could catch that transition mid-flight and wrongly report a
+  // genuinely correct code as "rejected." Poll instead, so a slower-but-successful login
+  // isn't misdiagnosed as a failure.
+  const deadline = Date.now() + 8000;
+  let stillOnLoginWall = await isLoginWallPage(page);
+  while (stillOnLoginWall && Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    stillOnLoginWall = await isLoginWallPage(page);
+  }
+
+  if (stillOnLoginWall) {
+    const errorText = await findVisibleErrorText(page, 500);
+    ctx.onLog(
+      errorText
+        ? `[Auth/OTP] Rejected: ${errorText.slice(0, 120)}`
+        : '[Auth/OTP] OTP submitted but still on the login step — the code was likely rejected',
+    );
+    await context.close();
+    return false;
+  }
+
+  ctx.onLog('[Auth/OTP] OTP submitted');
+  await saveSessionState(context, sessionDir, page);
+  const postLoginUrl = await finalizePostLoginLanding(page, sessionDir, ctx.config.targetUrl, (m) => ctx.onLog(m));
+  ctx.postLoginUrl = postLoginUrl;
+  ctx.onLog(`[Auth] Session saved. Post-login URL: ${postLoginUrl}`);
+  await context.close();
+  return true;
 }
 
 /**
@@ -69,36 +188,6 @@ async function saveSessionState(context: BrowserContext, sessionDir: string, pag
       join(sessionDir, 'auth-meta.json'),
       JSON.stringify({ postLoginUrl, savedAt: new Date().toISOString() }, null, 2),
     );
-  }
-}
-
-/**
- * Returns the path to a saved session state, or null if none exists.
- */
-function savedSessionStatePath(ctx: ExecutorContext): string | null {
-  const stateFile = join(ctx.sessionsDir, ctx.sessionId, 'auth-state.json');
-  return existsSync(stateFile) ? stateFile : null;
-}
-
-async function restoreSessionStorage(context: BrowserContext, sessionDir: string, targetUrl: string): Promise<void> {
-  const ssFile = join(sessionDir, 'session-storage.json');
-  if (!existsSync(ssFile)) return;
-  try {
-    const raw = readFileSync(ssFile, 'utf-8');
-    const entries = Object.entries(JSON.parse(raw) as Record<string, string>);
-    if (entries.length === 0) return;
-    const { hostname } = new URL(targetUrl);
-    await context.addInitScript(
-      ({ hostname: host, entries: pairs }) => {
-        if (window.location.hostname !== host) return;
-        for (const [key, value] of pairs) {
-          window.sessionStorage.setItem(key, value);
-        }
-      },
-      { hostname, entries },
-    );
-  } catch {
-    /* ignore corrupt session storage */
   }
 }
 
@@ -131,6 +220,8 @@ async function createPage(ctx: ExecutorContext, restoreAuth = true): Promise<Pag
   }
 
   const page = await context.newPage();
+  attachErrorTracking(page, ctx);
+  attachVisitTracking(page, ctx.sessionId);
   return page;
 }
 
@@ -153,9 +244,27 @@ export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean
     return true;
   }
 
+  // A prior call already triggered a real OTP send and is sitting on the OTP entry
+  // screen waiting for the code — finish that SAME attempt rather than starting a new
+  // browser/navigation (which would trigger a second, different send).
+  const pending = pendingOtpLogins.get(ctx.sessionId);
+  if (pending) {
+    if (!creds.otp) return false; // still nothing to submit — leave the paused attempt as-is
+    pendingOtpLogins.delete(ctx.sessionId);
+    try {
+      return await completeOtpLogin(ctx, pending.context, pending.page, sessionDir, creds.otp);
+    } catch (err) {
+      ctx.onLog(`[Auth/OTP] Login error: ${(err as Error).message}`);
+      await pending.context.close().catch(() => {});
+      return false;
+    }
+  }
+
   const browser = await getBrowser();
   const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 } });
   const page = await context.newPage();
+  attachErrorTracking(page, ctx);
+  attachVisitTracking(page, ctx.sessionId);
 
   try {
     ctx.onLog(`[Auth] Navigating to ${ctx.config.targetUrl}`);
@@ -249,64 +358,68 @@ export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean
 
     const isOtpFlow = method === 'otp' || method === 'password-otp';
 
-    if (isOtpFlow && !creds.otp) {
-      // Phase 1 — fill identifier (phone/email) and trigger OTP send
-      ctx.onLog('[Auth/OTP] Phase 1: filling identifier to trigger OTP');
-      const filled = await fillFirstMatchOnPage(page, [
-        'input[type="tel"]',
-        'input[name*="phone" i]',
-        'input[name*="mobile" i]',
-        'input[placeholder*="phone" i]',
-        'input[placeholder*="mobile" i]',
-        'input[type="email"]',
-        'input[name*="email" i]',
-        'input[name*="user" i]',
-        'input[type="text"]',
-      ], creds.username ?? '');
+    // Reaching this point means there was NO pendingOtpLogins entry for this session (that
+    // case is handled earlier and returns before we ever get here) — so this is genuinely
+    // the first attempt, and no real OTP has been sent yet in it. Any `creds.otp` already
+    // present here cannot be a real code (it was typed before the site had a chance to send
+    // one, e.g. pre-filled during initial chat setup alongside the username) — using it
+    // would just reproduce the original bug of submitting a guessed/stale value. Always
+    // trigger the real send and pause; only a later call via pendingOtpLogins (after the
+    // user replies to the actual "OTP sent" prompt) may supply a code that gets used.
+    if (isOtpFlow) {
+      // Phase 1 — get past whatever the site needs BEFORE it will send a real OTP.
+      // Pure OTP: just an identifier (phone/email). Password-then-OTP (2FA): username
+      // AND password both have to be submitted first — filling only an identifier here
+      // would never reach the point where the site actually sends the second-factor code.
+      if (method === 'password-otp' && creds.username && creds.password) {
+        ctx.onLog('[Auth/OTP] Phase 1: filling username + password to trigger 2FA OTP');
+        await fillFirstMatchOnPage(page, [
+          'input[type="email"]', 'input[name*="email" i]', 'input[name*="user" i]', 'input[type="text"]',
+        ], creds.username);
+        const filledPass = await fillFirstMatchOnPage(page, [
+          'input[type="password"]', 'input[name*="pass" i]',
+        ], creds.password);
+        if (!filledPass) {
+          ctx.onLog('[Auth/OTP] Password field not found — skipping login');
+          await context.close();
+          return false;
+        }
+      } else {
+        ctx.onLog('[Auth/OTP] Phase 1: filling identifier to trigger OTP');
+        const filled = await fillFirstMatchOnPage(page, [
+          'input[type="tel"]',
+          'input[name*="phone" i]',
+          'input[name*="mobile" i]',
+          'input[placeholder*="phone" i]',
+          'input[placeholder*="mobile" i]',
+          'input[type="email"]',
+          'input[name*="email" i]',
+          'input[name*="user" i]',
+          'input[type="text"]',
+        ], creds.username ?? '');
 
-      if (!filled) {
-        ctx.onLog('[Auth/OTP] Could not find phone/email input — skipping login');
-        await context.close();
-        return false;
+        if (!filled) {
+          ctx.onLog('[Auth/OTP] Could not find phone/email input — skipping login');
+          await context.close();
+          return false;
+        }
       }
 
       await clickSubmitOnPage(page);
       await page.waitForTimeout(2000); // Give site time to send OTP and show OTP field
 
-      // Phase 2 — pause and collect OTP from user via live chat
-      const extras = ctx.onPreActionNeeded?.({
+      // The real code can only be known once the user reads it off their phone, which
+      // can't happen synchronously inside this call. Notify (for the chat prompt), keep
+      // the browser open on the OTP screen, and let a later call — once the code is
+      // available — pick this exact attempt back up via pendingOtpLogins.
+      ctx.onPreActionNeeded?.({
         type: 'otp',
         description: 'OTP sent to your phone. Enter the code to continue.',
         requiredExtras: ['otp'],
       });
-
-      const otp = extras?.['otp'];
-      if (!otp) {
-        ctx.onLog('[Auth/OTP] OTP not provided — login paused. Enter your OTP in the chat.');
-        await context.close();
-        return false;
-      }
-
-      // Fill OTP
-      const filledOtp = await fillFirstMatchOnPage(page, [
-        'input[autocomplete="one-time-code"]',
-        'input[name*="otp" i]',
-        'input[id*="otp" i]',
-        'input[name*="code" i]',
-        'input[placeholder*="otp" i]',
-        'input[placeholder*="code" i]',
-        'input[type="text"]',
-      ], otp);
-
-      if (!filledOtp) {
-        ctx.onLog('[Auth/OTP] OTP field not found after waiting — login failed');
-        await context.close();
-        return false;
-      }
-
-      await clickSubmitOnPage(page);
-      await page.waitForTimeout(2000);
-      ctx.onLog('[Auth/OTP] OTP submitted');
+      pendingOtpLogins.set(ctx.sessionId, { context, page });
+      ctx.onLog('[Auth/OTP] OTP requested — login paused. Enter your OTP in the chat.');
+      return false;
     } else {
       // Standard password login
       const result = await performLogin(page, creds);
@@ -336,7 +449,24 @@ export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean
   }
 }
 
-async function fillFirstMatchOnPage(page: Page, selectors: string[], value: string): Promise<boolean> {
+/**
+ * Waits (bounded, once) for ANY candidate selector to become visible before giving up —
+ * a slow-loading SPA (real-world logins are frequently Angular/React apps that take a
+ * moment to hydrate) can otherwise cause a same-instant `.count()` check to miss a field
+ * that would have appeared a second later, silently failing the whole login attempt.
+ */
+async function fillFirstMatchOnPage(
+  page: Page,
+  selectors: string[],
+  value: string,
+  timeoutMs = 8000,
+): Promise<boolean> {
+  try {
+    await page.locator(selectors.join(', ')).first().waitFor({ state: 'visible', timeout: timeoutMs });
+  } catch {
+    return false; // none of the candidates appeared in time — genuinely not on this page
+  }
+
   for (const sel of selectors) {
     const loc = page.locator(sel).first();
     if ((await loc.count()) > 0 && await loc.isVisible().catch(() => false)) {
@@ -348,6 +478,7 @@ async function fillFirstMatchOnPage(page: Page, selectors: string[], value: stri
 }
 
 async function clickSubmitOnPage(page: Page): Promise<void> {
+  await checkConsentCheckboxes(page);
   const submit = page.locator(
     'button[type="submit"], input[type="submit"], ' +
     'button:has-text("Continue"), button:has-text("Send OTP"), button:has-text("Get OTP"), ' +
@@ -429,6 +560,41 @@ const FLOW_HANDLERS: Record<
   'golden-path': runGoldenPath,
   // H3 — Visual Regression
   'visual-regression': runVisualRegression,
+  // E1/E2/E3 — Accessibility
+  'labels': runLabelsCheck,
+  'keyboard': runKeyboardCheck,
+  'contrast': runContrastCheck,
+  // Element integrity
+  'element-integrity': runElementIntegrity,
+  'touch-target': runTouchTargetCheck,
+  // Dead internal links
+  'dead-links': runDeadLinksCheck,
+  'action-inventory': runActionInventory,
+  'cross-browser': runCrossBrowserCheck,
+  'consent-exploration': runConsentExploration,
+  'security-headers': runSecurityHeadersCheck,
+  'business-logic-boundary': runBusinessLogicBoundary,
+  'device-matrix': runDeviceMatrixCheck,
+  'visual-review': runVisualReview,
+  'zoom-reflow': runZoomReflow,
+  'dark-mode': runDarkModeCheck,
+  'reduced-motion': runReducedMotionCheck,
+  'web-vitals': runWebVitalsCheck,
+  'concurrent-edit': runConcurrentEditCheck,
+  'locale-format': runLocaleFormatCheck,
+  'offline-pwa': runOfflinePwaCheck,
+  'focus-trap': runFocusTrapCheck,
+  'autofill-overlap': runAutofillOverlapCheck,
+  'long-content': runLongContentStress,
+  'bfcache': runBfcacheCheck,
+  'download-verify': runDownloadVerification,
+  'toast-stacking': runToastStackingCheck,
+  'rtl-layout': runRtlLayoutCheck,
+  'placeholder-check': runPlaceholderCheck,
+  'broken-images': runBrokenImagesCheck,
+  'element-overflow': runElementOverflowCheck,
+  'js-errors': runJsErrorsReport,
+  'coverage-report': runCoverageReport,
 };
 
 export class UiExecutor implements BaseExecutor {
@@ -437,6 +603,20 @@ export class UiExecutor implements BaseExecutor {
 
   async execute(task: FlowTask, ctx: ExecutorContext): Promise<ExecutorResult> {
     let findingsCount = 0;
+    // Snapshot the references BEFORE the spread — used after the flow runs to tell "this
+    // task's flow genuinely set a new value" apart from "wrappedCtx just inherited whatever
+    // ctx already had." Without that distinction, copying these fields back after EVERY task
+    // (not just the one that owns each field) re-triggers the orchestrator's merge-into-state
+    // logic every task for the rest of the session — for array fields like actionInventory
+    // that merge by concatenation, that reappends the same entries on every subsequent task,
+    // unboundedly growing session state until it can no longer be JSON-serialized.
+    const before = {
+      discoveredApiEndpoints: ctx.discoveredApiEndpoints,
+      postLoginUrl: ctx.postLoginUrl,
+      actionInventory: ctx.actionInventory,
+      discoveredRoutes: ctx.discoveredRoutes,
+      visitedRoutes: ctx.visitedRoutes,
+    };
     const wrappedCtx: ExecutorContext = {
       ...ctx,
       onFinding: (f) => {
@@ -448,7 +628,9 @@ export class UiExecutor implements BaseExecutor {
     ctx.onLog(`[UI] Starting: ${task.title}`);
 
     let page: Page | null = null;
-    const TASK_TIMEOUT_MS = 90_000;
+    // Fail faster once the orchestrator has flagged the target as currently degraded — no
+    // point spending a full 90s repeating a failure several other tasks just hit in a row.
+    const TASK_TIMEOUT_MS = ctx.envDegraded ? 30_000 : 90_000;
     const heartbeat = setInterval(() => {
       ctx.onLog(`[UI] Still working on: ${task.title.slice(0, 80)}…`);
     }, 10_000);
@@ -456,10 +638,17 @@ export class UiExecutor implements BaseExecutor {
     try {
       page = await createPage(wrappedCtx);
       const startUrl = resolveExplorationStartUrl(ctx);
-      await page.goto(startUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 30000,
-      });
+      try {
+        await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      } catch (gotoErr) {
+        // A single timeout is often a transient blip (target briefly slow/overloaded), not a
+        // permanent failure — retry once before burning this task's whole budget on what may
+        // just be bad luck this instant. Observed repeatedly against real demo sites this way.
+        ctx.onLog(
+          `[UI] Initial page load timed out, retrying once: ${(gotoErr as Error).message.slice(0, 100)}`,
+        );
+        await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      }
 
       // Cookies restored but landed on login form (e.g. Sauce Demo `/`) → jump to app
       const landed = await ensureAuthenticatedLanding(page, wrappedCtx);
@@ -467,6 +656,22 @@ export class UiExecutor implements BaseExecutor {
         await loginIfNeeded(page, wrappedCtx);
         await ensureAuthenticatedLanding(page, wrappedCtx);
       }
+
+      // Tick any visible consent/terms checkbox as routine hygiene before handing off to the
+      // flow handler — not just when explicitly logging in. Many forms (this one included)
+      // disable their primary action until "I agree to Terms & Conditions" is checked; when
+      // no login credentials are configured at all, performSessionLogin never runs and never
+      // gets a chance to do this, leaving every generic check (Action Inventory, etc.)
+      // confused by a button that looks broken but is actually just gated on an unticked box.
+      await checkConsentCheckboxes(page).catch(() => {});
+
+      // Give the page a chance to genuinely finish rendering before handing off to the flow —
+      // confirmed real gap: a dashboard's static sidebar/logo text can clear a "there's some
+      // text" threshold well before any actual button/link/input has mounted, leaving flows
+      // like Action Inventory to scan a page that LOOKS loaded but has zero interactive
+      // elements yet. Every flow gets this for free now instead of each having to remember to
+      // call waitForRealContent itself (many already do, redundantly but harmlessly).
+      await waitForRealContent(page);
 
       const handler = FLOW_HANDLERS[task.flowClass];
       const run = async () => {
@@ -491,6 +696,28 @@ export class UiExecutor implements BaseExecutor {
         }),
       ]);
 
+      // wrappedCtx is a SEPARATE object from ctx (built via `{...ctx, onFinding}` above) — a
+      // flow setting wrappedCtx.discoveredApiEndpoints/postLoginUrl/actionInventory/etc. only
+      // ever mutates that throwaway copy. Copy each field back onto the original ctx only if
+      // THIS task's flow actually reassigned it (reference changed from the `before` snapshot)
+      // — otherwise every task after the one that first set a field would re-copy the same
+      // inherited value and re-trigger the orchestrator's merge-into-state logic needlessly.
+      if (wrappedCtx.discoveredApiEndpoints !== before.discoveredApiEndpoints) {
+        ctx.discoveredApiEndpoints = wrappedCtx.discoveredApiEndpoints;
+      }
+      if (wrappedCtx.postLoginUrl !== before.postLoginUrl) {
+        ctx.postLoginUrl = wrappedCtx.postLoginUrl;
+      }
+      if (wrappedCtx.actionInventory !== before.actionInventory) {
+        ctx.actionInventory = wrappedCtx.actionInventory;
+      }
+      if (wrappedCtx.discoveredRoutes !== before.discoveredRoutes) {
+        ctx.discoveredRoutes = wrappedCtx.discoveredRoutes;
+      }
+      if (wrappedCtx.visitedRoutes !== before.visitedRoutes) {
+        ctx.visitedRoutes = wrappedCtx.visitedRoutes;
+      }
+
       return { taskId: task.id, success: true, findingsCount };
     } catch (err) {
       const msg = (err as Error).message;
@@ -498,13 +725,26 @@ export class UiExecutor implements BaseExecutor {
       if (page) {
         try {
           const shot = await screenshot(page, ctx, `error-${task.id}`);
+          // task.flowClass (e.g. "journey") is an internal code identifier, not something a
+          // reader can act on — "Execute journey" means nothing to anyone outside this
+          // codebase. Explain what the agent was actually doing, and translate the common
+          // "page took too long to load" case into plain language rather than a raw
+          // Playwright stack-trace-style message.
+          const isGotoTimeout = /page\.goto:.*Timeout/i.test(msg);
           ctx.onFinding({
             severity: 'medium',
             area: 'UI-Error',
             title: `Task error: ${task.title}`,
-            steps: [`Navigate to ${ctx.config.targetUrl}`, `Execute ${task.flowClass}`],
+            steps: [
+              `The agent was running its "${task.title}" check against ${ctx.config.targetUrl}`,
+              'This check did not complete — see "Actual" below for what went wrong',
+            ],
             expected: 'Task completes without error',
-            actual: msg,
+            actual: isGotoTimeout
+              ? `The page took longer than 30 seconds to load and the check gave up — likely the ` +
+                `target site was slow or briefly unavailable, not necessarily a defect in the ` +
+                `app itself. Raw error: ${msg}`
+              : msg,
             evidence: [shot],
             reproRate: '1/1',
             automationCandidate: true,

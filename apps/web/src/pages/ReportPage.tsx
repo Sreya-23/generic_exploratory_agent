@@ -9,6 +9,8 @@ import {
   type SessionState,
 } from '../api/client';
 import { FindingCard } from '../components/session/FindingCard';
+import { FindingsChatPanel } from '../components/chat/FindingsChatPanel';
+import { SETUP_CONV_KEY } from './ChatSetupPage';
 
 const SEVERITIES: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
 
@@ -106,6 +108,24 @@ export function ReportPage() {
           <a className="btn btn-primary" href={htmlUrl} target="_blank" rel="noreferrer">
             Open report / Save PDF
           </a>
+          <Link
+            to="/chat"
+            className="btn btn-primary"
+            onClick={() => sessionStorage.removeItem(SETUP_CONV_KEY)}
+          >
+            + New Exploration
+          </Link>
+        </div>
+      </div>
+
+      <div className="health-score-card">
+        <div className={`health-score-grade grade-${report.healthScore.grade}`}>
+          {report.healthScore.grade}
+        </div>
+        <div className="health-score-body">
+          <h2>Site Health Score</h2>
+          <span className="health-score-number">{report.healthScore.score}/100</span>
+          <span className="health-score-summary">{report.healthScore.summary}</span>
         </div>
       </div>
 
@@ -119,6 +139,8 @@ export function ReportPage() {
           </span>
         ))}
       </section>
+
+      <FindingsChatPanel sessionId={session.id} />
 
       <div className="report-actions" style={{ marginBottom: '1.25rem' }}>
         <button
@@ -182,9 +204,15 @@ export function ReportPage() {
                   <td>
                     {session.authProbe?.requiresAuth === false
                       ? 'No login required'
-                      : session.authProbe?.suggestedMethod ??
-                        session.config.credentials?.type ??
-                        'not probed'}
+                      : `${session.authProbe?.suggestedMethod ?? session.config.credentials?.type ?? 'unknown method'} — ${
+                          session.authState === 'ready'
+                            ? '✅ Authenticated'
+                            : session.authState === 'awaiting_otp'
+                              ? '⏸️ Waiting for OTP'
+                              : session.authState === 'required'
+                                ? '⚠️ Login failed — findings may reflect the login page'
+                                : 'status unknown'
+                        }`}
                   </td>
                 </tr>
               </tbody>
@@ -239,6 +267,90 @@ export function ReportPage() {
               ))
             )}
           </section>
+
+          {session.actionInventory && session.actionInventory.totalFound > 0 && (
+            <section style={{ marginBottom: '1.5rem' }}>
+              <h2>Action Inventory</h2>
+              <p className="session-meta">
+                Found <strong>{session.actionInventory.totalFound}</strong> distinct action
+                element(s) (buttons, icon-buttons, menu items, tabs) — tested{' '}
+                <strong>{session.actionInventory.totalTested}</strong>, skipped{' '}
+                <strong>{session.actionInventory.totalSkippedRisky}</strong> as risky
+                (delete/pay/send-style actions).
+              </p>
+              <table className="report-overview-table">
+                <thead>
+                  <tr>
+                    <th>Outcome</th>
+                    <th>Count</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {Object.entries(session.actionInventory.byResult).map(([result, count]) => (
+                    <tr key={result}>
+                      <td>{result}</td>
+                      <td>{count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          )}
+
+          {session.findingDiff && (
+            <section style={{ marginBottom: '1.5rem' }}>
+              <h2>Regression vs Previous Run</h2>
+              <p className="session-meta">
+                Compared against the previous completed run against this target
+                {session.findingDiff.previousSessionId
+                  ? ` (session ${session.findingDiff.previousSessionId.slice(0, 8)})`
+                  : ''}
+                .
+              </p>
+              <div className="regression-diff-grid">
+                <div>
+                  <h3 style={{ fontSize: '1rem' }}>
+                    New ({session.findingDiff.newFindings.length})
+                  </h3>
+                  {session.findingDiff.newFindings.length === 0 ? (
+                    <p className="empty-state">None</p>
+                  ) : (
+                    <ul>
+                      {session.findingDiff.newFindings.slice(0, 20).map((t, i) => (
+                        <li key={i}>{t}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                <div>
+                  <h3 style={{ fontSize: '1rem' }}>
+                    Fixed ({session.findingDiff.fixedFindings.length})
+                  </h3>
+                  {session.findingDiff.fixedFindings.length === 0 ? (
+                    <p className="empty-state">None</p>
+                  ) : (
+                    <ul>
+                      {session.findingDiff.fixedFindings.slice(0, 20).map((t, i) => (
+                        <li key={i}>{t}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+              {session.findingDiff.recurringFindings.length > 0 && (
+                <>
+                  <h3 style={{ fontSize: '1rem' }}>
+                    Recurring ({session.findingDiff.recurringFindings.length})
+                  </h3>
+                  <ul>
+                    {session.findingDiff.recurringFindings.slice(0, 20).map((t, i) => (
+                      <li key={i}>{t}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </section>
+          )}
 
           {findingsByArea.length > 0 && (
             <section style={{ marginBottom: '1.5rem' }}>

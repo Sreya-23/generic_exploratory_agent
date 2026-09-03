@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { copyFile, access } from 'node:fs/promises';
+import { copyFile, access, readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import type {
   BaseExecutor,
@@ -16,7 +16,7 @@ import type {
   SiteIntelligenceSignals,
 } from '@qa/shared';
 import { credentialsComplete, effectiveAuthState, authPromptForState } from '@qa/chat-agent';
-import { buildPlan, injectJourneyTasks } from '../planner/index.js';
+import { buildPlan, injectJourneyTasks, removeUnlikelyTasks } from '../planner/index.js';
 import { classifySite } from '../intelligence/classify-site.js';
 import { saveSessionState, chatSummaryFromCoverage, writeSessionReport } from '../reporter/index.js';
 import {
@@ -31,6 +31,45 @@ import { ApiExecutor } from '@qa/explorer-api';
 import { ChaosExecutor } from '@qa/chaos-engine';
 
 export type EventCallback = (event: SessionEvent) => void;
+
+/**
+ * Every session event previously only went to whatever's actually listening (the
+ * websocket bridge to the frontend) — nothing printed to the terminal running `npm run
+ * dev`, so debugging a failed run meant either reading session.json after the fact or
+ * relying on the chat UI to have rendered the right thing. This makes the live run visible
+ * directly in the dev server's terminal as it happens.
+ */
+function logSessionEventToConsole(event: SessionEvent): void {
+  const p = (event.payload ?? {}) as Record<string, unknown>;
+  const tag = `[${event.timestamp.slice(11, 19)}] [${event.sessionId.slice(0, 8)}] ${event.type}`;
+
+  switch (event.type) {
+    case 'log':
+      console.log(`${tag} — ${p.message ?? ''}`);
+      break;
+    case 'session:finding': {
+      const f = p as { severity?: string; area?: string; title?: string };
+      console.log(`${tag} — [${f.severity ?? '?'}] (${f.area ?? '?'}) ${f.title ?? ''}`);
+      break;
+    }
+    case 'auth:required':
+      console.log(`${tag} — ${p.message ?? ''}`);
+      break;
+    case 'pre_action:required':
+      console.log(`${tag} — ${p.prompt ?? JSON.stringify(p.request ?? {})}`);
+      break;
+    case 'session:failed':
+      console.log(`${tag} — ${p.error ?? ''}`);
+      break;
+    case 'session:started':
+    case 'session:paused':
+    case 'session:completed':
+      console.log(`${tag} — ${JSON.stringify(p)}`);
+      break;
+    default:
+      console.log(`${tag}`);
+  }
+}
 
 const executors: BaseExecutor[] = [new UiExecutor(), new ApiExecutor(), new ChaosExecutor()];
 
@@ -76,6 +115,28 @@ export class SessionOrchestrator {
     return this.states.get(id);
   }
 
+  /**
+   * Read-only rehydration for viewing a completed session (report, findings) after the
+   * in-memory Map has lost it — which happens on every single API server restart, since
+   * session state was never persisted to anything but this Map. A finished session's
+   * state.json on disk is otherwise fully intact and sufficient to redisplay its report;
+   * only actions that require a *live* run (start/pause/websocket) still correctly 404 here,
+   * since a rehydrated session has no abort controller or in-progress task to control.
+   */
+  async getSessionOrRehydrate(id: string, sessionsDir: string): Promise<SessionState | undefined> {
+    const live = this.states.get(id);
+    if (live) return live;
+    try {
+      const raw = await readFile(join(sessionsDir, id, 'state.json'), 'utf-8');
+      const state = JSON.parse(raw) as SessionState;
+      this.states.set(id, state);
+      this.sessionsDirs.set(id, sessionsDir);
+      return state;
+    } catch {
+      return undefined;
+    }
+  }
+
   listSessions(): SessionState[] {
     return Array.from(this.states.values()).sort(
       (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
@@ -102,6 +163,7 @@ export class SessionOrchestrator {
   }
 
   private emit(event: SessionEvent): void {
+    logSessionEventToConsole(event);
     const listeners = this.listeners.get(event.sessionId);
     listeners?.forEach((cb) => cb(event));
   }
@@ -288,6 +350,7 @@ export class SessionOrchestrator {
     // ── Pre-session login (once, shared across all tasks) ─────────────────────
     // Builds an ExecutorContext just for login so the OTP pre-action gate works.
     if (state.config.credentials && state.config.credentials.type !== 'none') {
+      let awaitingOtp = false;
       const loginCtx: ExecutorContext = {
         sessionId,
         config: state.config,
@@ -297,9 +360,13 @@ export class SessionOrchestrator {
           this.emit({ type: 'log', sessionId, timestamp: new Date().toISOString(), payload: { message } });
         },
         onPreActionNeeded: (req: PreActionRequest): Record<string, string> | null => {
-          const extras = state.config.credentials?.extras ?? {};
-          const otp = extras['otp'];
+          // The chat layer (live-chat.ts's parseAuthFields) writes a supplied OTP to the
+          // top-level `credentials.otp` field — the same field credentialsComplete/
+          // performLogin already use — NOT to `credentials.extras`, which is a separate
+          // generic bag used by unrelated pre-action requests (payments, recipients, etc.).
+          const otp = state.config.credentials?.otp;
           if (req.type === 'otp' && !otp) {
+            awaitingOtp = true;
             this.emit({
               type: 'pre_action:required',
               sessionId,
@@ -318,11 +385,31 @@ export class SessionOrchestrator {
         },
       };
       const loginOk = await performSessionLogin(loginCtx);
+      if (!loginOk && awaitingOtp) {
+        // Genuinely paused, not failed — a real OTP send was just triggered and we're
+        // waiting on the user to supply the code. Unlike the hard-failure case below,
+        // there is nothing useful to explore yet, so tasks must NOT start running against
+        // an unauthenticated page: previously this fell through to runTasks() unconditionally
+        // regardless of loginOk, which is exactly why "tasks running unauthenticated" kept
+        // showing even right after a fresh OTP request — the exploration had already started
+        // before the pause was ever given a chance to be resolved.
+        state.authState = 'awaiting_otp';
+        state.status = 'awaiting_auth';
+        state.updatedAt = new Date().toISOString();
+        await saveSessionState(sessionsDir, state);
+        loginCtx.onLog('[Auth] Pre-session login paused — waiting for OTP');
+        return state;
+      }
       if (!loginOk) {
-        loginCtx.onLog('[Auth] Pre-session login failed or waiting for OTP — tasks will attempt re-login individually');
+        // authState was optimistically set to 'ready' above — correct it now that the
+        // actual login outcome is known, so the UI reflects reality instead of a stale guess.
+        state.authState = 'required';
+        loginCtx.onLog('[Auth] Pre-session login failed — tasks will attempt re-login individually');
       } else if (loginCtx.postLoginUrl) {
         state.postLoginUrl = loginCtx.postLoginUrl;
-        loginCtx.onLog(`[Auth] Exploration will start from authenticated URL: ${state.postLoginUrl}`);
+        loginCtx.onLog(
+          `[Auth] Login completed successfully — exploration will start from ${state.postLoginUrl}`,
+        );
       } else {
         // Recover post-login URL from disk if set during saveSessionState
         try {
@@ -336,6 +423,7 @@ export class SessionOrchestrator {
         } catch {
           /* ignore */
         }
+        loginCtx.onLog('[Auth] Login completed successfully');
       }
     }
     // ─────────────────────────────────────────────────────────────────────────
@@ -376,12 +464,31 @@ export class SessionOrchestrator {
     signal: AbortSignal,
   ): Promise<void> {
     const state = this.states.get(sessionId)!;
-    const tasks = state.plan?.tasks ?? [];
     /** When PRD auth smoke fails, remaining PRD feature tasks are skipped */
     let prdAuthSmokeFailed = false;
+    // Failure isolation: several consecutive tasks failing with the same page-load-timeout
+    // signature means the TARGET is currently degraded, not that each is an independent app
+    // bug. Track consecutive occurrences so they can be clustered into one note instead of
+    // reported as N unrelated "Task error" findings, and so later tasks fail faster.
+    let consecutiveTimeoutFailures = 0;
+    let envDegradedNoted = false;
+    const TIMEOUT_SIGNATURE = /Timeout \d+ms exceeded/i;
+    const ENV_DEGRADED_THRESHOLD = 3;
 
-    for (const task of tasks) {
+    // NOT a `for (const task of tasks)` over a fixed snapshot — injectJourneyTasks() and
+    // removeUnlikelyTasks() both mutate the plan mid-run by REASSIGNING state.plan.tasks to
+    // a new array (not mutating the existing one in place), which a snapshot taken before
+    // they run would never see. That previously meant removeUnlikelyTasks's "skip this
+    // task" had no actual effect on execution — only on the displayed totalTasks — so
+    // completedTasks could exceed the (wrongly shrunk) totalTasks. Re-reading
+    // state.plan.tasks fresh each iteration and tracking progress by task id (not array
+    // position) makes both dynamic addition and removal actually take effect.
+    const executedTaskIds = new Set<string>();
+    while (true) {
       if (signal.aborted) break;
+      const task = (state.plan?.tasks ?? []).find((t) => !executedTaskIds.has(t.id));
+      if (!task) break;
+      executedTaskIds.add(task.id);
 
       state.progress.currentTask = task.title;
       state.progress.currentPhase = state.plan?.phases.find((p) =>
@@ -448,10 +555,19 @@ export class SessionOrchestrator {
         classification: state.classification,
         discoveredApiEndpoints: state.discoveredApiEndpoints,
         postLoginUrl: state.postLoginUrl,
+        actionInventory: state.actionInventory,
+        discoveredRoutes: state.discoveredRoutes,
+        envDegraded: consecutiveTimeoutFailures >= ENV_DEGRADED_THRESHOLD,
         onFinding: (partial) => {
           const withFp = {
             ...partial,
             fingerprint: partial.fingerprint ?? fingerprintFinding(partial),
+            // Auto-tagged rather than left to each flow to remember — the reporter's
+            // near-duplicate merge relies on this to tell "the same defect independently
+            // found by two different flows" (should merge) apart from "one flow enumerating
+            // several genuinely distinct instances" (e.g. one finding per device/zoom-level/
+            // DOM-element from a single task) which must never collapse into each other.
+            taskId: partial.taskId ?? task.id,
           };
           const finding: Finding = {
             ...withFp,
@@ -509,7 +625,11 @@ export class SessionOrchestrator {
               severity: 'info',
               area: 'UI-Journey',
               title: `Skipped: ${req.description}`,
-              steps: [`${req.type} action reached`, 'Required data not provided'],
+              steps: [
+                req.pageUrl ? `Open ${req.pageUrl}` : `Navigate to the page where this action is reached`,
+                `Trigger: ${req.description}`,
+                `Missing data: ${missing.join(', ')} — reply in the live chat with e.g. \`${missing[0]}: <value>\` to let this run for real`,
+              ],
               expected: `Data provided for: ${missing.join(', ')}`,
               actual: `Action skipped — provide missing data in live chat to test this flow`,
               evidence: [],
@@ -541,9 +661,12 @@ export class SessionOrchestrator {
           // PRD-only mode: never inject domain journeys / matrix-adjacent tasks
           if (state.config.prdPath) return;
 
-          // Dynamically inject journey tasks into the remaining plan
+          // Dynamically inject journey tasks into the remaining plan, and drop
+          // already-queued generic-matrix tasks recon gives clear evidence are moot
+          // (e.g. file-upload edge cases with no file input anywhere on the landing page)
           if (state.plan) {
             injectJourneyTasks(state.plan, classification);
+            if (signals) removeUnlikelyTasks(state.plan, signals);
             // Update total task count
             state.progress.totalTasks = state.plan.tasks.length;
           }
@@ -551,22 +674,113 @@ export class SessionOrchestrator {
       };
 
       const executor = getExecutor(task);
+      const findingsCountBeforeTask = state.findings.length;
+      // ctx is built FROM state's own fields above (e.g. `actionInventory: state.actionInventory`
+      // at construction) — so ctx.actionInventory is already truthy on every task after the one
+      // that first set it, REGARDLESS of whether this task's flow touched it at all. Checking
+      // `if (ctx.actionInventory)` alone re-runs the merge below on every subsequent task, and
+      // since ctx.actionInventory === state.actionInventory when nothing changed, the entries
+      // concat becomes `[...X, ...X]` — doubling the array every single task (confirmed: reached
+      // 2,097,152 = 2^21 entries from one real candidate, a ~450MB session state that could no
+      // longer be JSON-serialized). Snapshotting these references before execute() and only
+      // merging when they actually changed fixes this at the root.
+      const before = {
+        discoveredApiEndpoints: ctx.discoveredApiEndpoints,
+        postLoginUrl: ctx.postLoginUrl,
+        discoveredRoutes: ctx.discoveredRoutes,
+        visitedRoutes: ctx.visitedRoutes,
+        actionInventory: ctx.actionInventory,
+      };
       if (executor) {
         try {
           await executor.execute(task, ctx);
           // Persist any newly discovered API endpoints back to session state
           // so subsequent tasks (API executor) can use them
-          if (ctx.discoveredApiEndpoints && ctx.discoveredApiEndpoints.length > 0) {
+          if (ctx.discoveredApiEndpoints && ctx.discoveredApiEndpoints !== before.discoveredApiEndpoints) {
             const existing = new Set(state.discoveredApiEndpoints ?? []);
             for (const e of ctx.discoveredApiEndpoints) existing.add(e);
             state.discoveredApiEndpoints = [...existing];
           }
-          if (ctx.postLoginUrl) {
+          if (ctx.postLoginUrl && ctx.postLoginUrl !== before.postLoginUrl) {
             state.postLoginUrl = ctx.postLoginUrl;
+          }
+          if (ctx.discoveredRoutes && ctx.discoveredRoutes !== before.discoveredRoutes) {
+            const existing = new Set(state.discoveredRoutes ?? []);
+            for (const r of ctx.discoveredRoutes) existing.add(r);
+            state.discoveredRoutes = [...existing];
+          }
+          if (ctx.visitedRoutes && ctx.visitedRoutes !== before.visitedRoutes) {
+            state.visitedRoutes = ctx.visitedRoutes;
+          }
+          if (ctx.actionInventory && ctx.actionInventory !== before.actionInventory) {
+            const mergedEntries = [
+              ...(state.actionInventory?.entries ?? []),
+              ...ctx.actionInventory.entries,
+            ];
+            const byResult: Record<string, number> = {};
+            for (const e of mergedEntries) byResult[e.result] = (byResult[e.result] ?? 0) + 1;
+            state.actionInventory = {
+              totalFound: (state.actionInventory?.totalFound ?? 0) + ctx.actionInventory.totalFound,
+              totalTested: (state.actionInventory?.totalTested ?? 0) + ctx.actionInventory.totalTested,
+              totalSkippedRisky:
+                (state.actionInventory?.totalSkippedRisky ?? 0) + ctx.actionInventory.totalSkippedRisky,
+              byResult,
+              entries: mergedEntries,
+            };
           }
         } catch (err) {
           ctx.onLog(`Task failed: ${(err as Error).message}`);
         }
+      }
+
+      // Failure isolation: did this task fail with the same page-load-timeout signature as
+      // the target being down/slow, rather than a real app defect?
+      const newFindingsThisTask = state.findings.slice(findingsCountBeforeTask);
+      const hadTimeoutFailure = newFindingsThisTask.some(
+        (f) => f.area === 'UI-Error' && TIMEOUT_SIGNATURE.test(f.actual),
+      );
+      consecutiveTimeoutFailures = hadTimeoutFailure ? consecutiveTimeoutFailures + 1 : 0;
+
+      if (consecutiveTimeoutFailures >= ENV_DEGRADED_THRESHOLD && !envDegradedNoted) {
+        envDegradedNoted = true;
+        // Retroactively quarantine the individual "Task error" findings that make up this
+        // streak — they're symptoms of one environmental issue, not N separate app defects —
+        // and replace them with a single clear note. computeHealthScore already skips
+        // quarantined findings, so this also stops one bad stretch from tanking the score.
+        let quarantinedCount = 0;
+        for (let i = state.findings.length - 1; i >= 0 && quarantinedCount < consecutiveTimeoutFailures; i--) {
+          const f = state.findings[i];
+          if (f.area === 'UI-Error' && TIMEOUT_SIGNATURE.test(f.actual) && !f.quarantineReason) {
+            f.severity = 'info';
+            f.quarantineReason =
+              'Part of a streak of consecutive page-load timeouts — likely the target site was ' +
+              'slow or briefly unavailable during this window, not an application defect';
+            f.tags = [...new Set([...(f.tags ?? []), 'env-degraded'])];
+            quarantinedCount++;
+          }
+        }
+        ctx.onFinding({
+          severity: 'medium',
+          area: 'UI-Environment',
+          title: `Target site appears to have been unavailable or slow for ${consecutiveTimeoutFailures} consecutive checks`,
+          steps: [
+            `Re-run this session against ${state.config.targetUrl} when the target is confirmed reachable`,
+            'Compare whether the same checks still fail',
+          ],
+          expected: 'The target application responds within normal load times',
+          actual:
+            `${consecutiveTimeoutFailures} consecutive tasks failed with a page-load timeout. ` +
+            'The individual findings from this streak have been downgraded to info and marked ' +
+            'as environment-related — treat them as inconclusive, not confirmed defects, until ' +
+            're-run against a healthy target.',
+          evidence: [],
+          reproRate: 'N/A',
+          automationCandidate: false,
+        });
+        ctx.onLog(
+          `[Env] Target appears degraded after ${consecutiveTimeoutFailures} consecutive timeouts — ` +
+            'remaining tasks will use a shorter timeout budget',
+        );
       }
 
       // Detect PRD auth smoke failure → skip remaining PRD feature tasks
@@ -712,6 +926,29 @@ export class SessionOrchestrator {
         });
       } else {
         state.findings = attachFingerprints(state.findings);
+        const prevGeneric = await loadPreviousSessionFindings(
+          sessionsDir,
+          state.config.targetUrl,
+          sessionId,
+        );
+        if (prevGeneric) {
+          state.findingDiff = diffFindingFingerprints(
+            state.findings,
+            prevGeneric.findings,
+            prevGeneric.sessionId,
+          );
+          this.emit({
+            type: 'log',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            payload: {
+              message:
+                `[Regression] Finding diff vs previous session (${prevGeneric.sessionId.slice(0, 8)}): ` +
+                `+${state.findingDiff.newFindings.length} new, -${state.findingDiff.fixedFindings.length} fixed, ` +
+                `${state.findingDiff.recurringFindings.length} recurring`,
+            },
+          });
+        }
       }
 
       state.status = 'completed';

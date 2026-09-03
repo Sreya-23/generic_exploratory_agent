@@ -373,7 +373,7 @@ function buildAssistantReply(
       `Got it — **${draft.targetUrl}**\n\n` +
       `Does this site need any credentials to log in?\n\n` +
       `- **Login**: \`username: admin\` / \`password: secret\`\n` +
-      `- **OTP**: \`otp: 123456\`\n` +
+      `- **OTP login**: \`username: <phone or email>\` — I'll trigger the real code myself and ask you for it once the site actually sends it (don't type a code now, it wouldn't be real yet)\n` +
       `- **API key**: \`api-key: sk-abc123\`\n` +
       `- **Extra inputs** (phone, card, account ID): \`phone: +91 9876543210\`\n` +
       `- Reply **"no"** if the site is publicly accessible\n\n` +
@@ -395,10 +395,22 @@ function buildAssistantReply(
     return `✅ Username saved.\n\n${authPromptForState(draft)}`;
   }
   if (justCaptured?.password && authState === 'awaiting_otp') {
-    return `✅ Password saved.\n\n${authPromptForState(draft)}`;
+    // Don't invite an OTP here — no real code has been sent yet (that only happens once
+    // exploration actually starts and visits the site). Asking for one now just invites
+    // the same stale/guessed-code bug this flow used to have.
+    return (
+      `✅ Password saved.\n\n` +
+      `I'll trigger the real OTP send once we start, and ask you for the code in chat then.\n\n` +
+      `Say **"start"** when ready.`
+    );
   }
-  if (justCaptured?.otp && authState === 'ready') {
-    return `✅ OTP saved.\n\n${summarizeDraft(draft)}\n\nSay **"start"** when ready.`;
+  if (justCaptured?.otp && credentialsComplete(draft)) {
+    return (
+      `Noted — but heads up: I can't use an OTP given now, since the real code only exists ` +
+      `after I've actually triggered a send (which happens once exploration starts). ` +
+      `I'll ask you for it again in chat right after that happens.\n\n` +
+      `Say **"start"** when ready.`
+    );
   }
 
   if (!credentialsComplete(draft) && authState !== 'ready') {
@@ -491,9 +503,17 @@ export function processSetupMessage(
     conversation.draft.credentialsAsked = true;
   }
 
-  // Handle explicit "no credentials" reply
-  if (isNoCredentials(text) && !conversation.draft.needsLogin) {
+  // Handle explicit "no credentials" reply — this must work even when needsLogin is already
+  // true (the probe detected/guessed the site requires auth), not just when it's false.
+  // Confirmed real gap: the old `&& !conversation.draft.needsLogin` guard disabled this
+  // EXACTLY when it mattered — needsLogin only becomes true once the probe has already
+  // decided auth is required and started asking for credentials, which is precisely the
+  // moment a user needs to say "skip login, explore anonymously" to override that guess
+  // (e.g. an e-commerce catalog where almost everything is browsable without an account,
+  // even if some page the probe happened to check was gated). The explicit "no" always wins.
+  if (isNoCredentials(text)) {
     conversation.draft.credentials = { type: 'none', authMethod: 'none' };
+    conversation.draft.needsLogin = false;
     conversation.draft.authState = 'ready';
   }
 
@@ -622,9 +642,12 @@ export function applyProbeToConversation(
   conversation.draft.authState = nextAuthState(conversation.draft);
 
   const probeMsg = authPromptFromProbe(probe);
-  const followUp = authPromptForState(conversation.draft);
+  // authPromptFromProbe already spells out exactly what to provide for the detected method
+  // (e.g. "phone: ..." for OTP, "username: ... / password: ..." for password) — appending
+  // authPromptForState's generic "please provide your username" on top of that just repeats
+  // the same ask in different words, reading as two separate questions stacked together.
   const content = probe.requiresAuth
-    ? `${probeMsg}\n\n${followUp}`
+    ? probeMsg
     : `${probeMsg}\n\nTell me what to test, or any extra inputs the site needs (phone, card number, etc.), or say **"start"** for a quick smoke run.`;
 
   const last = conversation.messages.at(-1);

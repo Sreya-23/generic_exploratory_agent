@@ -134,20 +134,20 @@ If the user doesn't respond, the action is **skipped** and a finding is logged:
 ### What runs automatically (no user input needed)
 
 After the URL is given and start is clicked, the agent runs ALL of these:
-- **UI & Interaction** (A1–A13): navigation, forms, viewport, autofill, file upload, pagination, wizard
+- **UI & Interaction** (A1–A13): navigation, forms, viewport, autofill, file upload, pagination, wizard, real device matrix (iPhone/iPad/Pixel/Galaxy Tab), AI visual QA review (optional — needs `GEMINI_API_KEY` in `.env`, silently skipped otherwise)
 - **Navigation & Session** (B1–B7): back/forward, deep links, session timeout, multi-tab logout
 - **Network & Chaos** (C1–C6): slow network, offline, flaky network, WebSocket disconnect
 - **API** (D1–D7): CRUD, auth matrix, rate limiting, idempotency
+- **Accessibility** (E1–E3): labels/alt text, keyboard focus visibility, colour contrast (WCAG AA)
 - **Security** (F1–F5): IDOR, privilege escalation, XSS, mass assignment
 - **Performance** (G1–G3): spike load, large payload, N+1 patterns
 - **Regression** (H1–H3): golden path snapshots, visual regression, schema drift
 
-> **Accessibility (E1–E3) is not scheduled by default and not yet a real check.** The `labels`/`keyboard`/`contrast`
-> flow classes have no entry in `FLOW_HANDLERS` ([ui-executor.ts](../../../packages/explorer-ui/src/ui-executor.ts))
-> — they'd silently fall back to the generic navigation flow instead of running an accessibility-specific
-> audit. `planner/index.ts` deliberately excludes `accessibility` from `ALL_AREAS` so default runs don't
-> waste task budget on that fallback. Still runnable explicitly (`"run E1, E2, E3"`) once real handlers exist.
-> Don't report accessibility as covered until then.
+> **Element integrity & dead links** (not in the A–H matrix numbering, run under `ui`): occlusion
+> (an interactive element blocked by an overlapping element), disabled-state visual/actual mismatch,
+> zero-size/off-screen tabbable elements, mobile touch-target size, and same-origin dead-link (4xx/5xx)
+> checks. See [element-integrity.ts](../../../packages/explorer-ui/src/flows/element-integrity.ts) and
+> [dead-links.ts](../../../packages/explorer-ui/src/flows/dead-links.ts).
 
 ### Power-user: select specific tests
 
@@ -171,15 +171,15 @@ Matrix IDs map to these flow classes:
 
 | Section | IDs | Flow classes |
 |---------|-----|-------------|
-| UI & Interaction | A1–A15 | navigation, form-validation, input-boundary, double-click, keyboard-nav, viewport, modal-lifecycle, empty-states, error-ui, autofill, file-upload, pagination-ui, wizard, file-upload-security 📋, i18n-rtl 📋 |
+| UI & Interaction | A1–A15 | navigation, form-validation, input-boundary, double-click, keyboard-nav, viewport, modal-lifecycle, empty-states, error-ui, autofill, file-upload, pagination-ui, wizard, `device-matrix` (real iPhone/iPad/Pixel/Galaxy Tab emulation — not just resized viewport), file-upload-security 📋, i18n-rtl 📋 |
 | Navigation & Session | B1–B9 | back-during-post, forward-after-back, refresh-during-request, deep-link, session-timeout, multi-tab-logout, concurrent-write 📋 |
 | Network & Chaos | C1–C6 | slow-network, offline-mid-request, offline-recovery, flaky-network, timeout-retry, websocket-disconnect |
 | API | D1–D11 | crud, auth-matrix, idempotency, pagination, rate-limit, token-expiry 📋, csrf-probe 📋, graphql-probe 📋 |
-| Security | F1–F9 | idor-probe, horizontal-privilege, vertical-privilege, xss-probe, mass-assignment, security-headers 📋, cookie-flags 📋, clickjacking-probe 📋, open-redirect 📋 |
+| Security | F1–F9 | idor-probe, horizontal-privilege, vertical-privilege, xss-probe, mass-assignment, security-headers (also covers cookie-flags + clickjacking-probe — one flow, one response's headers + cookie jar), open-redirect 📋 |
 | Performance | G1–G3 | spike-load, large-payload, n-plus-one |
 | Regression | H1–H3 | golden-path, visual-regression, schema-drift |
 | Accessibility | E1–E3 | labels, keyboard, contrast — 📋 **planned, no handler yet; falls back to `navigation`** |
-| Business Logic | I1–I4 | price-tamper, negative-value, coupon-abuse, date-boundary-logic — 📋 **planned, proposed 2026-07-15, no `FLOW_CLASSES` entry yet** |
+| Business Logic | I1–I4 | `business-logic-boundary` covers price-tamper/negative-value (I1/I2): discovers amount/price/quantity-like fields, fills negative/zero/oversized/decimal-precision values, checks for inline validation feedback WITHOUT ever clicking submit (avoids risking a real mutation on a live system). coupon-abuse, date-boundary-logic — 📋 still planned, no handler yet |
 
 ### What the agent accepts as credentials / inputs
 
@@ -335,13 +335,29 @@ After login, regardless of site type, the agent physically explores the entire U
 
 ```
 1. Click all reveal triggers (hamburger ≡, dropdowns, accordion toggles)
-2. Collect all nav items from: nav, header, sidebar, tabs, [role="navigation"]
-3. Visit each page (BFS, up to 25 pages, 3 levels deep)
+2. Collect all nav items from: aside, nav, header, sidebar, tabs, [role="navigation"]
+   — both real <a href> links AND href-less <button>/[role="button"] items, since many
+   React/Vue/Angular SPA sidebars route via a client-side router with no href at all
+   (only [class*="sidebar"|"side-nav"|...] a[href] would find literally nothing on
+   those sites — action-inventory's generic "any button" selector still would, which is
+   the tell: if it finds far more clickables than navigation.ts finds nav items, this is
+   almost certainly why)
+3. Visit each page — href items via page.goto(url); href-less items by locating +
+   clicking the same element (current page first, since persistent sidebars are on
+   every page already; falls back to reloading the page it was discovered on only if
+   not found on the current one) and letting the SPA's own router navigate.
+   BFS, up to 25 pages, 3 levels deep (scales with session depth)
 4. On each page:
    - Screenshot
    - Audit: broken images, blank content, JS console errors
+     (href-less visits skip the HTTP-status check — no response object for a
+     client-side route change — everything else still applies)
    - Capture all XHR/fetch network calls (same-origin only)
-5. Discover new nav items on that page and add to queue
+5. Discover new nav items on that page and add to queue.
+   Href-less items dedupe by LABEL alone, not by page — a persistent nav item's
+   destination doesn't depend on which page you clicked it from, so without this a
+   3-item sidebar re-discovered on 3 pages turns into 9+ redundant re-visits of the
+   same 3 destinations instead of 3.
 6. Report all JS console errors collected across the full traversal
 7. Write all captured real endpoints to ctx.discoveredApiEndpoints
 ```
@@ -385,9 +401,29 @@ resolveEndpointPaths() returns: real endpoints if available, generic guesses onl
 | Regression | Golden path vs baseline |
 | Accessibility | Labels, tab order, contrast — 📋 planned, currently falls back to navigation |
 | Performance | Load time, rate limits |
-| Business Logic | Price/quantity tampering, coupon abuse, date-boundary logic — 📋 planned, no handler yet |
+| Business Logic | Price/quantity tampering, negative-value (`business-logic-boundary.ts`) — implemented; coupon abuse, date-boundary logic — 📋 still planned |
 
 Full catalog: [exploration-matrix.md](exploration-matrix.md)
+
+## Efficiency — The Actionability-Wait Trap (write new flows with this in mind)
+
+Playwright's `.getAttribute()`, `.textContent()`, `.inputValue()`, `.click()`, and `.fill()`
+all **auto-wait** for their locator to resolve to an attached element before running — if a
+sub-locator (`el.locator('i, svg').first()`, `page.locator('label[for="x"]').first()`, etc.)
+matches ZERO elements, the call doesn't fail fast: it blocks for Playwright's full default
+actionability timeout (tens of seconds) before the surrounding `.catch()` ever fires. Found
+and fixed in 5+ places this session (`element-matcher.ts`'s scoring, `describeElement()`,
+`forms.ts`'s label lookup, `wizard.ts`'s back-button check, ~22 unguarded `.fill()`/`.click()`
+calls in `prd-driven.ts`) — this was the actual root cause behind every "Domain Journey
+timeout after 90s" finding seen across two completely different real sites, not a slow site
+or a single bad flow. Verified fix: one specific hang went from 39.5s to 8.8s.
+
+**When writing a new flow**, any locator that might legitimately not exist on the page:
+- For a read (`getAttribute`/`textContent`/`inputValue`): check `.count() > 0` first (a
+  plain, non-waiting DOM query) before calling the auto-waiting accessor.
+- For an action (`click`/`fill`/`check`) that's expected to sometimes have nothing to act
+  on: always pass an explicit `{ timeout: 2000 }`-ish value — never leave it to Playwright's
+  default, even under a `.catch(() => {})`, since the TIME cost happens before the catch.
 
 ## Detection Logic — False Positive Prevention
 
@@ -408,6 +444,13 @@ Key rules baked into the flows to prevent noise:
 | HIGH-RISK form fields | Fields matching recipient/whatsapp/SMS/message-to patterns — never filled with any data |
 | Sensitive form fields | email, phone, card, bank, PAN — no random data; only empty-submit validation |
 | `targetUrl` includes login path | API executor always extracts `new URL(targetUrl).origin` — strips `/login`, `/signin` etc. |
+| Cross-browser check on a login-gated site | Firefox/WebKit contexts load the SAME saved `auth-state.json` (+ sessionStorage) as the Chromium baseline before navigating — without this they always land on the login page while Chromium (already authenticated) reaches the real app, producing a "title differs: Login vs Dashboard" finding that's really just missing auth-sharing, not a real cross-browser bug |
+| Viewport nav check on a wide/desktop layout | Also recognizes an already-expanded, persistent sidebar (`aside`/`[class*="sidebar"]` etc. with 2+ links/buttons) as valid navigation — not just a semantic `<nav>` tag, hamburger trigger, or small header icon. A full sidebar shown directly (no hamburger needed at tablet/desktop widths) was previously reported as "no navigation found" |
+| Href-less sidebar/nav items (client-side router, no `<a href>`) | `navigation.ts`'s BFS also collects and clicks `button`/`[role="button"]` nav items, not just `a[href]` — re-locating on the current page first (persistent sidebars are on every page) before falling back to reloading the discovery page. Previously these were invisible to the crawl entirely ("Discovered 0 nav items" on a page with a real, working sidebar) |
+| Generic matrix task with no matching surface on the landing page | `removeUnlikelyTasks` (planner) drops already-queued tasks recon gives clear negative evidence for (e.g. `file-upload` with zero `input[type=file]` seen) — frees a limited-depth task budget for checks more likely to find something, rather than spending a slot proving a non-existent feature doesn't work |
+| Device/visual checks vs. a legitimate app-download gate, cookie banner, maintenance page, or empty state | `non-bug-patterns.ts` — a growing, named library of regexes for known-legitimate UI patterns. `device-matrix.ts` checks rendered text against it before flagging "content differs"; `visual-review.ts`'s Gemini prompt explicitly lists these categories as non-defects. Real incident: a real fintech site's phone-sized "please download our app" interstitial was misread as both "rendering/content differs on Pixel 7" (DeviceMatrix) and "empty white dashboard" (AI vision) before this fix |
+| AI-vision screenshot taken mid-load (skeleton/loading state) | `waitForStableContent()` in `visual-review.ts` samples a cheap content-shape signal (text length + interactive-element count) twice, 1.2s apart, before screenshotting — if it's still changing, waits longer (bounded) rather than reviewing a page still mid-transition. Cheaper than a second Gemini call to self-verify |
+| Confidence of findings from single-signal/AI-vision checks vs. multi-signal/objective ones | `Finding.confidence` (`'verified'` \| `'heuristic'`) + `confidenceReason` — surfaced as a badge in the HTML report and a line in markdown. `'verified'`: an unambiguous browser-native fact (`naturalWidth===0`, a thrown JS exception, an HTTP status) or multiple independent signals agreeing. `'heuristic'`: a single AI-vision read or single fuzzy pattern match — not necessarily wrong, but flagged for a human spot-check before being treated as confirmed |
 
 ## File Structure
 
@@ -427,6 +470,11 @@ packages/
     planner/index.ts               # buildGenericPlan — ALL_AREAS excludes accessibility by default
                                    # (no FLOW_HANDLERS yet; still selectable explicitly)
                                    # areaForFlow() handles accessibility area
+                                   # removeUnlikelyTasks(): drops already-queued tasks recon
+                                   #   gives clear negative evidence for (file-upload with no
+                                   #   file input, pagination-ui with no pagination signal) —
+                                   #   wired into the same onClassification callback that
+                                   #   injects domain journeys, in run-session.ts
     orchestrator/run-session.ts    # performSessionLogin() called ONCE before tasks start
                                    # state.discoveredApiEndpoints persisted after each task
                                    # ctx.discoveredApiEndpoints injected into each task's context
@@ -434,6 +482,8 @@ packages/
                                    # writeSessionReport() on completion → report.md + report.html
     reporter/
       generate-report.ts           # Markdown + HTML report from findings (report-template format)
+                                   # dedupeFindings(): exact-match, then near-duplicate merge
+                                   #   (pageUrl+targetSelector match, else title token-overlap)
       index.ts                     # saveSessionState + writeSessionReport
   explorer-ui/src/
     auth/
@@ -453,10 +503,51 @@ packages/
                                    # Captures XHR/fetch calls → ctx.discoveredApiEndpoints
                                    # Skips no-link finding on login walls
       navigation.ts                # BFS authenticated site traversal (25 pages, 3 levels deep)
+                                   # Collects both a[href] AND href-less button/[role=button]
+                                   #   nav items (client-side router SPAs) — clicks the latter
+                                   #   directly instead of page.goto(), current-page-first
                                    # page.on('request') captures ALL real API calls during BFS
                                    # Writes captured endpoints → ctx.discoveredApiEndpoints
                                    # Clicks hamburger/sidebar/tabs, audits each page
                                    # JS console error collection across all pages
+      cross-browser.ts             # Firefox/WebKit contexts load the same saved auth-state.json
+                                   #   + sessionStorage as Chromium before navigating
+      device-matrix.ts             # Real device emulation — real user-agent + hasTouch, not
+                                   #   just a resized viewport on the same desktop engine.
+                                   #   Catalog (depth-scaled 1→4→8): iPhone 13, iPad (gen 7),
+                                   #   Pixel 7, Galaxy Tab S4 (standard, iOS+Android phone+
+                                   #   tablet core) + iPhone SE (smallest common screen),
+                                   #   iPhone 13 / iPad (gen 7) landscape, Galaxy Z Fold 6
+                                   #   (foldable — distinct near-square aspect ratio) (deep).
+                                   #   Flags content/render divergence vs desktop baseline,
+                                   #   AND hover-only-reachable UI (dropdowns/tooltips shown
+                                   #   only via CSS :hover) — genuinely unreachable with no
+                                   #   mouse, which plain viewport resizing can't catch since
+                                   #   desktop Chromium still supports synthetic hover
+      visual-review.ts              # OPTIONAL, Gemini-vision-powered — catches rendering
+                                   #   defects with NO DOM/CSS signal at all: overlapping
+                                   #   text, off-screen/clipped elements, leftover "Lorem
+                                   #   ipsum"/unresolved {{template}} copy, broken icon
+                                   #   fonts, FOUC-style unstyled content. Screenshots
+                                   #   already-captured pages, sends to Gemini's vision API
+                                   #   with a 13-category checklist prompt, one JSON finding
+                                   #   per issue found. Skipped entirely — logged, not
+                                   #   thrown — if GEMINI_API_KEY (.env) is unset or the API
+                                   #   call fails for any reason (bad key, rate limit,
+                                   #   timeout, malformed response). Purely additive: every
+                                   #   other flow runs unconditionally either way.
+                                   #   Quota protection (checked BEFORE any API call, so a
+                                   #   skip here costs nothing): only runs at standard/deep
+                                   #   depth (never smoke/chaos); a daily call cap, default
+                                   #   15/day across all sessions (GEMINI_VISUAL_REVIEW_
+                                   #   DAILY_LIMIT); and a per-site-origin cooldown, default
+                                   #   6h (GEMINI_VISUAL_REVIEW_COOLDOWN_HOURS) — re-testing
+                                   #   the same site minutes apart won't burn a second call
+                                   #   on UI that hasn't visually changed. Usage tracked in
+                                   #   sessions/.gemini-visual-review-usage.json (shared
+                                   #   across all sessions, not per-session).
+      elementFingerprint()         # helpers.ts — stable-ish id/data-testid/name/tag+text+index
+                                   #   fingerprint for a Locator, used for finding dedup
       journey.ts                   # 7 site-type journeys + generic fallback
                                    # findSemanticButton(): 4-strategy discovery (testid→aria→text→class)
                                    # Multi-language button text (EN/FR/DE/ES/IT)
@@ -469,10 +560,23 @@ packages/
       user-directed.ts             # plain-language instructions; pre-action gate
       keyboard.ts                  # clicks body before Tab (headless focus fix)
       double-click.ts              # 5-click rapid flood; cart badge + button disabled check
-      viewport.ts                  # mobile/tablet/desktop; hamburger-aware; skips login walls
+      viewport.ts                  # 9 sizes, depth-scaled (3→5→9): mobile/tablet/desktop
+                                   #   (smoke) + small-mobile 320px, large-desktop 1920px
+                                   #   (standard) + Bootstrap-style breakpoint edges 576/992/
+                                   #   1200px, ultra-wide 2560px (deep) — breakpoint EDGES
+                                   #   specifically, since a media-query off-by-one only
+                                   #   shows up right at the threshold, not at round numbers
+                                   #   like 375/768/1280 that sit comfortably inside a range.
+                                   #   hamburger-aware; skips login walls; also recognizes an
+                                   #   already-expanded persistent sidebar as valid nav (not
+                                   #   just <nav>/hamburger/small header icon)
       session-flows.ts             # B5: collects real paths from authenticated session before clearing
                                    # B6: two-phase cookie test
       regression.ts                # H1/H3 — golden path snapshots, visual regression
+      security-headers.ts          # F6/F7/F8 — CSP/HSTS/X-Content-Type-Options/Referrer-Policy,
+                                   #   cookie httpOnly/secure/SameSite flags, clickjacking exposure
+      business-logic-boundary.ts   # I1/I2 — amount/price/quantity field boundary testing
+                                   #   (negative/zero/oversized/decimal-precision), never submits
   chaos-engine/src/
     chaos-executor.ts              # C4 flaky-network, C5 timeout-retry, C6 websocket-disconnect
   explorer-api/src/
@@ -523,7 +627,12 @@ Prioritize these — manual QA and brittle scripts miss them:
 Every finding MUST use the template in [report-template.md](report-template.md).
 
 When a session completes, the agent:
-1. Dedupes findings by severity + area + title + actual
+1. Dedupes findings in two passes: exact-match (severity+area+title+actual), then
+   near-duplicate merging — same page + same target element (`pageUrl`+`targetSelector`,
+   when a flow attaches them) merges regardless of wording/area/severity (keeping the
+   higher severity), otherwise falling back to title token-overlap ≥60% within the same
+   severity+area. This is what stops the same broken element, hit by two different flows
+   with differently-worded findings, from being reported as two separate bugs.
 2. Writes `report.md`, `report.html`, and `report-summary.json` under `sessions/<id>/`
 3. Serves the report via `GET /api/sessions/:id/report?format=json|md|html`
 4. Shows the Report page at `/report/:id` with Markdown/HTML export
@@ -550,3 +659,47 @@ When Playwright MCP is available, use it for UI exploration:
 - `browser_navigate`, `browser_snapshot`, `browser_click`
 - `browser_navigate_back` during in-flight actions
 - `browser_network_requests` for API discovery
+
+## Changelog — false positives and bugs found and fixed
+
+Kept so the credibility story is traceable, not just asserted. Every `Finding` now carries
+an optional `confidence: 'verified' | 'heuristic'` + `confidenceReason` — deterministic,
+objective signals (a thrown JS exception, `naturalWidth===0`, an HTTP status) get `verified`;
+a single AI-vision read or a single fuzzy pattern match gets `heuristic` and should be
+spot-checked. See [non-bug-patterns.ts](../../../packages/explorer-ui/src/flows/non-bug-patterns.ts)
+for the growing library referenced below.
+
+- **App-download-gate misread as "empty/broken page"** — `device-matrix.ts`'s content-diff
+  check and the Gemini visual-review prompt both flagged a real, sparse-but-intentional
+  "please download our mobile app" interstitial as a rendering defect. Fixed by detecting the
+  pattern (`non-bug-patterns.ts`) and instructing the Gemini prompt to recognize it, plus three
+  more common patterns (cookie-consent banners, maintenance pages, generic empty states).
+- **AI-vision findings caught mid-load** — a screenshot taken while the page was still
+  hydrating could produce a "content failed to render" finding that would have resolved
+  itself moments later. Fixed with `waitForStableContent()` in `visual-review.ts`: samples a
+  coarse content-shape signal twice, 1.2s apart, and only screenshots once it stops changing
+  (bounded wait, no extra API cost).
+- **`ctx` field propagation was silently broken** — `UiExecutor.execute()` builds a
+  `wrappedCtx` copy (`{...ctx, onFinding}`) per task; flows setting
+  `wrappedCtx.discoveredApiEndpoints`/`postLoginUrl`/`actionInventory` were mutating that
+  throwaway copy only. The orchestrator's post-task checks read the original `ctx`, which
+  was never touched — real discovered API endpoints, the post-login URL, and action-inventory
+  aggregation were no-ops. Fixed by copying fields back in `ui-executor.ts`, gated on
+  reference-inequality (not just truthiness) against a snapshot taken before the flow ran.
+- **Exponential `actionInventory` growth once the above was fixed** — the orchestrator builds
+  each task's `ctx` FROM `state.actionInventory`, so `ctx.actionInventory` is truthy on every
+  task after the first one that set it, regardless of whether that task's flow touched it. The
+  merge block's `if (ctx.actionInventory)` guard alone re-ran on every subsequent task, and
+  since `ctx.actionInventory === state.actionInventory` when unchanged, the entries concat
+  became `[...X, ...X]` — doubling the array every task. Reached 2,097,152 entries (2^21) from
+  one real candidate, a ~450MB session state that could no longer be JSON-serialized and
+  crashed the session. Fixed in `run-session.ts` by snapshotting the pre-execute reference and
+  only merging when it actually changed.
+- **External links counted as "uncovered routes"** — the Coverage Report's `discoveredRoutes`
+  (from `recon.ts`) included any link found on the landing page, including ones to a different
+  domain entirely (e.g. a partner site or docs link). Fixed with a same-origin filter, so
+  coverage only measures the app under test, not the sites it happens to link to.
+- **`long-content.ts` never found the fields it was meant to stress-test** — its selector only
+  matched `type="text"`/`type="search"`/untyped inputs and `<textarea>`, missing `type="tel"`,
+  `type="number"`, `type="email"`, `type="password"`, and `type="url"` — common real-world
+  types (e.g. a phone-number field) it silently never touched. Widened to cover all of them.

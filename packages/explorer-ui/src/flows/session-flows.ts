@@ -2,6 +2,7 @@
 import { join } from 'node:path';
 import { chromium, type Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
+import { restoreAuthenticatedState, isLoginWallPage } from './helpers.js';
 
 // B2 — Forward after Back: stale form resubmit
 export async function runForwardAfterBack(
@@ -268,11 +269,25 @@ export async function runSessionTimeout(
   const shot = (n: string) =>
     join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `session-timeout-${n}.png`);
 
-  // If already on login page and credentials are available, attempt login first.
-  // B6 must start from an authenticated state — clearing cookies on an unauthenticated
-  // page tests nothing meaningful.
-  const alreadyOnLogin = (await page.locator('input[type="password"]').count()) > 0;
-  if (alreadyOnLogin) {
+  // This whole check is meaningless on a site with no authentication system at all — there is
+  // no "session" for cookies to hold in the first place. Confirmed real gap: the only signal
+  // used below was "is a password field NOT visible right now," which is equally true for a
+  // genuinely logged-in page AND for a site (e.g. a static docs page) that never had a login
+  // system to begin with — the latter fell through assuming "must already be authenticated"
+  // and then reported clearing cookies "kept the user logged in," which is a category error,
+  // not a security finding. Requiring real credentials to be configured before proceeding
+  // closes that gap at the source.
+  if (!ctx.config.credentials || ctx.config.credentials.type === 'none') {
+    ctx.onLog('[B6] No authentication configured for this target — skipping (nothing to test cookie-bound session against)');
+    return;
+  }
+
+  // If already on a login wall and credentials are available, attempt login first. Uses the
+  // same broader isLoginWallPage() the rest of the codebase relies on (covers OTP/segmented
+  // entry too, not just a visible password field) — B6 must start from a GENUINELY
+  // authenticated state, or clearing cookies tests nothing meaningful.
+  const onLoginWall = await isLoginWallPage(page);
+  if (onLoginWall) {
     const creds = ctx.config.credentials;
     if (!creds || creds.type === 'none' || !creds.username?.trim() || !creds.password?.trim()) {
       ctx.onLog('[B6] On login page with no credentials configured — skipping (cannot establish session to expire)');
@@ -299,6 +314,14 @@ export async function runSessionTimeout(
       return;
     }
     ctx.onLog('[B6] Login succeeded — proceeding with session timeout test');
+  } else if (!ctx.postLoginUrl) {
+    // Not currently on a login wall, but also no confirmed successful login anywhere earlier
+    // in this session (e.g. login silently failed and left the browser on some unauthenticated
+    // stub page with no visible password/OTP field) — proceeding here would test cookie-clear
+    // behavior on a page that was never actually logged into, the exact category error this
+    // whole guard exists to prevent.
+    ctx.onLog('[B6] Not on a login wall, but no confirmed successful login this session — skipping to avoid testing an unauthenticated page as if it were logged in');
+    return;
   }
 
   const urlBeforeClear = page.url();
@@ -405,7 +428,12 @@ export async function runSessionTimeout(
         severity: 'low',
         area: 'UI-Session',
         title: 'Leftover data in localStorage/sessionStorage after session cookie cleared',
-        steps: ['Log in', 'Clear cookies', 'Reload', 'Inspect localStorage and sessionStorage'],
+        steps: [
+          `Open ${urlBeforeClear} and log in`,
+          'Open DevTools → Application (Chrome) / Storage (Firefox) tab → delete all Cookies for this site',
+          'Reload the page',
+          'In DevTools → Application → Local Storage and Session Storage for this origin, check for remaining keys',
+        ],
         expected: 'All user-specific storage cleared on logout/session expiry',
         actual: `localStorage keys: [${leftoverStorage.lsKeys.join(', ')}], sessionStorage keys: [${leftoverStorage.ssKeys.join(', ')}]`,
         evidence: [s2],
@@ -416,6 +444,18 @@ export async function runSessionTimeout(
       ctx.onLog('[B6] No leftover storage after cookie clear — clean session teardown');
     }
   }
+
+  // This test deliberately logs the shared page out (that's the whole point of B6) but
+  // never logs back in — every task that runs after this one in the same session would
+  // otherwise inherit a logged-out page, including flows (cross-browser, device-matrix)
+  // that read the shared page's live state as their comparison baseline. Restore it here,
+  // once, rather than leaving every later flow to independently discover it's broken.
+  const restored = await restoreAuthenticatedState(page, ctx);
+  ctx.onLog(
+    restored
+      ? '[B6] Restored authenticated session for subsequent tasks'
+      : '[B6] Could not restore authenticated session — later tasks may see a logged-out page',
+  );
 }
 
 // B7 — Logout in another tab (silent 401 in active tab)

@@ -332,6 +332,66 @@ async function runWebsocketDisconnect(page: Page, ctx: ExecutorContext): Promise
   });
 }
 
+// CPU throttling — a distinct axis from slow-network above: simulates a low-end mobile CPU
+// rather than a slow connection, catching pages that load fine but never finish hydrating
+// (or take unacceptably long) on weak hardware.
+async function runCpuThrottle(page: Page, ctx: ExecutorContext): Promise<void> {
+  const targetUrl = page.url();
+  let cdp;
+  try {
+    cdp = await page.context().newCDPSession(page);
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: 6 });
+  } catch (err) {
+    ctx.onLog(`[CPUThrottle] CDP not available on this engine (${(err as Error).message.slice(0, 100)}) — skipping, Chromium-only check`);
+    return;
+  }
+
+  try {
+    const start = Date.now();
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    const deadline = Date.now() + 15000;
+    let hasContent = false;
+    while (Date.now() < deadline) {
+      hasContent = await page.evaluate(() => (document.body?.innerText ?? '').trim().length > 100).catch(() => false);
+      if (hasContent) break;
+      await page.waitForTimeout(300);
+    }
+    const elapsed = Date.now() - start;
+
+    if (!hasContent) {
+      ctx.onFinding({
+        severity: 'medium',
+        area: 'Perf-CPUThrottle',
+        title: 'Page fails to render meaningful content under CPU throttling (6x slowdown)',
+        steps: [`Open ${targetUrl} with CPU throttled 6x (simulating a low-end mobile device)`],
+        expected: 'Page still renders usable content within a reasonable time on slower hardware',
+        actual: `No meaningful content rendered within 15s of throttled load (elapsed ${elapsed}ms)`,
+        evidence: [],
+        reproRate: '1/1',
+        automationCandidate: true,
+        pageUrl: targetUrl,
+      });
+    } else if (elapsed > 8000) {
+      ctx.onFinding({
+        severity: 'low',
+        area: 'Perf-CPUThrottle',
+        title: `Slow initial render under CPU throttling (${(elapsed / 1000).toFixed(1)}s)`,
+        steps: [`Open ${targetUrl} with CPU throttled 6x`],
+        expected: 'Content renders reasonably quickly even on low-end hardware',
+        actual: `Took ${(elapsed / 1000).toFixed(1)}s to render meaningful content under 6x CPU throttling`,
+        evidence: [],
+        reproRate: '1/1',
+        automationCandidate: true,
+        pageUrl: targetUrl,
+      });
+    } else {
+      ctx.onLog(`[CPUThrottle] Rendered in ${elapsed}ms under 6x throttling — acceptable`);
+    }
+  } finally {
+    await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 }).catch(() => {});
+  }
+}
+
 const CHAOS_HANDLERS: Record<string, (page: Page, ctx: ExecutorContext) => Promise<void>> = {
   'slow-network': runSlowNetwork,
   'offline-mid-request': runOfflineMidRequest,
@@ -340,6 +400,7 @@ const CHAOS_HANDLERS: Record<string, (page: Page, ctx: ExecutorContext) => Promi
   'flaky-network': runFlakyNetwork,
   'timeout-retry': runTimeoutRetry,
   'websocket-disconnect': runWebsocketDisconnect,
+  'cpu-throttle': runCpuThrottle,
   'back-during-post': async (_page, ctx) => {
     ctx.onLog('[Chaos] back-during-post handled by UI executor');
   },

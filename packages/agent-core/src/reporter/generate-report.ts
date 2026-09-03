@@ -1,11 +1,55 @@
+import { readFileSync } from 'node:fs';
+import { basename, extname } from 'node:path';
 import type {
   ExplorationPlan,
   Finding,
   FlowTask,
+  HealthScore,
   SessionState,
   Severity,
 } from '@qa/shared';
-import { FLOW_TITLES } from '@qa/shared';
+import { computeHealthScore, FLOW_TITLES } from '@qa/shared';
+
+const IMAGE_MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+};
+
+/**
+ * Inline a screenshot as a base64 data URI directly into the report HTML, rather than
+ * printing its absolute local filesystem path as inert text. This is what actually makes a
+ * generated report a durable, self-contained artifact: the image bytes live inside report.html
+ * itself, so the report keeps showing its evidence even if the session folder it was generated
+ * from is later deleted, moved, or the API server that served it restarts — all of which
+ * otherwise silently orphaned every screenshot reference (confirmed: evidence paths were only
+ * ever rendered as plain escaped text, never as an <img>, so screenshots never actually
+ * displayed in the report at all before this — this is what "retaining" them means in practice).
+ * Falls back to the bare filename (not the meaningless local absolute path) if the file can't
+ * be read at generation time.
+ */
+function embedEvidenceHtml(path: string): string {
+  const ext = extname(path).toLowerCase();
+  const mime = IMAGE_MIME[ext];
+  if (mime) {
+    try {
+      const data = readFileSync(path).toString('base64');
+      // NOT loading="lazy" — confirmed via a real headless-browser test that a long report
+      // (many findings, most images far down the page) never triggers the lazy-load fetch
+      // during a Print-to-PDF/PDF-export pass (0 of 30 images loaded even after the page's
+      // own `load` event), so every screenshot silently renders as blank space in the
+      // exported PDF despite being correctly embedded in the HTML. Eager loading fixed it
+      // (29 of 30 loaded immediately in the same test) at the cost of loading all images
+      // up front in the live web view, which is an acceptable trade for a report whose
+      // primary export path is a PDF a reader expects to see evidence in.
+      return `<a href="data:${mime};base64,${data}" target="_blank" rel="noopener"><img class="evidence-shot" src="data:${mime};base64,${data}" alt="${escapeHtml(basename(path))}" loading="eager" /></a>`;
+    } catch {
+      /* file missing/unreadable at generation time — fall through to filename-only display */
+    }
+  }
+  return `<span class="evidence-file">${escapeHtml(basename(path))}</span>`;
+}
 
 const SEVERITY_ORDER: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
 
@@ -63,14 +107,20 @@ export interface SessionReport {
   markdown: string;
   html: string;
   summary: {
+    /** Count of actual bugs — excludes info-severity items, which aren't defects */
     total: number;
     bySeverity: SeverityCounts;
+    healthScore: HealthScore;
     executiveSummary: string;
     recommendedNextSteps: string[];
     flowsCovered: FlowCoverageRow[];
     findingsByArea: AreaFindingGroup[];
-    /** Findings with steps-to-reproduce always populated for report consumers */
+    /** Bug findings only (severity !== 'info'), steps-to-reproduce always populated */
     findings: Finding[];
+    /** Info-severity items — not defects, kept separate: discovered endpoints, coverage
+     *  summaries, confirmation checks that may be useful context for future exploration */
+    infoFindings: Finding[];
+    infoByArea: AreaFindingGroup[];
   };
 }
 
@@ -95,16 +145,98 @@ function sortFindings(findings: Finding[]): Finding[] {
 }
 
 /** Deduplicate findings that share the same title + actual outcome. */
+function normalizeTitleTokens(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((t) => t.length > 2),
+  );
+}
+
+function tokenOverlap(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let shared = 0;
+  for (const t of a) if (b.has(t)) shared++;
+  return shared / Math.min(a.size, b.size);
+}
+
+/** Same page + same actual DOM element — a stronger root-cause signal than title wording,
+ * so this alone is enough to merge even across different areas/severities/phrasing. */
+function sameTarget(a: Finding, b: Finding): boolean {
+  return !!a.pageUrl && !!a.targetSelector && a.pageUrl === b.pageUrl && a.targetSelector === b.targetSelector;
+}
+
+const SEVERITY_RANK: Record<Finding['severity'], number> = {
+  info: 0,
+  low: 1,
+  medium: 2,
+  high: 3,
+  critical: 4,
+};
+
 export function dedupeFindings(findings: Finding[]): Finding[] {
   const seen = new Set<string>();
-  const out: Finding[] = [];
+  const exact: Finding[] = [];
   for (const f of findings) {
     const key = `${f.severity}|${f.area}|${f.title}|${f.actual}`.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push(f);
+    exact.push(f);
   }
-  return out;
+
+  // Second pass: merge NEAR-duplicates. The same underlying defect frequently gets
+  // surfaced by several independent flows (action-inventory, journey, keyboard-nav all
+  // separately clicking the same broken element) — exact-string dedup above can't catch
+  // that, since each flow words its finding slightly differently. This groups by
+  // severity+area and folds titles with high token overlap into one finding instead of
+  // reporting the same defect several times over, which is what actually made past
+  // reports read as repetitive/shallow rather than the underlying checks themselves.
+  const merged: Finding[] = [];
+  const altTitles = new Map<string, Set<string>>();
+
+  for (const f of exact) {
+    const titleTokens = normalizeTitleTokens(f.title);
+    // Strongest signal first: same page + same actual element, regardless of wording —
+    // and even across severity/area, since a locator match is firmer evidence of "same
+    // defect" than either of those. Title-overlap is the fallback for findings that don't
+    // carry a target locator (most flows still don't attach one).
+    const target =
+      merged.find((m) => sameTarget(f, m)) ??
+      merged.find(
+        (m) =>
+          m.severity === f.severity &&
+          m.area === f.area &&
+          // Only merge across DIFFERENT tasks — this pass exists for "the same defect
+          // independently found by two different flows," not "one flow enumerating several
+          // genuinely distinct instances" (one finding per device/zoom-level/DOM-element),
+          // which share the same task and near-identical wording by construction but are
+          // each independently meaningful. Findings without a taskId (older sessions, before
+          // this was tracked) fall back to title-overlap alone rather than being unmergeable.
+          (!m.taskId || !f.taskId || m.taskId !== f.taskId) &&
+          tokenOverlap(titleTokens, normalizeTitleTokens(m.title)) >= 0.6,
+      );
+    if (!target) {
+      merged.push({ ...f, evidence: [...f.evidence] });
+      continue;
+    }
+    if (SEVERITY_RANK[f.severity] > SEVERITY_RANK[target.severity]) {
+      target.severity = f.severity;
+    }
+    if (!altTitles.has(target.id)) altTitles.set(target.id, new Set());
+    if (f.title !== target.title) altTitles.get(target.id)!.add(f.title);
+    for (const e of f.evidence) if (!target.evidence.includes(e)) target.evidence.push(e);
+  }
+
+  for (const m of merged) {
+    const alts = altTitles.get(m.id);
+    if (alts && alts.size > 0) {
+      m.actual = `${m.actual} (also observed via ${alts.size} other check${alts.size > 1 ? 's' : ''}: ${[...alts].slice(0, 3).join('; ')})`;
+    }
+  }
+
+  return merged;
 }
 
 function flowTitle(flowClass: string): string {
@@ -112,12 +244,14 @@ function flowTitle(flowClass: string): string {
 }
 
 function findingMatchesTask(finding: Finding, task: FlowTask): boolean {
+  // taskId is the authoritative link (set by the orchestrator when the finding is raised).
+  // Fall back to fuzzy area/title matching only for legacy findings that predate taskId.
+  if (finding.taskId) return finding.taskId === task.id;
   const area = finding.area.toLowerCase();
   const title = finding.title.toLowerCase();
   const fc = task.flowClass.toLowerCase();
   return (
     area.includes(fc) ||
-    area.includes(task.area) ||
     title.includes(fc.replace(/-/g, ' ')) ||
     finding.area === task.area
   );
@@ -175,7 +309,9 @@ function buildExecutiveSummary(
   counts: SeverityCounts,
   total: number,
   flowCount: number,
+  health: HealthScore,
 ): string {
+  const healthClause = `**Health Score: ${health.grade} (${health.score}/100).** `;
   const site = state.classification?.siteType;
   const siteClause = site && site !== 'generic' ? ` Classified as ${site}.` : '';
   const risk =
@@ -192,7 +328,7 @@ function buildExecutiveSummary(
   const depth = state.config.depth;
   const tasks = `${state.progress.completedTasks}/${state.progress.totalTasks} tasks`;
   const flows = flowCount > 0 ? ` Covered ${flowCount} exploration flow${flowCount === 1 ? '' : 's'}.` : '';
-  return `Explored ${state.config.targetUrl} at ${depth} depth (${tasks}).${siteClause}${flows} Recorded ${total} finding${total === 1 ? '' : 's'} (${counts.critical} critical, ${counts.high} high, ${counts.medium} medium). ${risk}`;
+  return `${healthClause}Explored ${state.config.targetUrl} at ${depth} depth (${tasks}).${siteClause}${flows} Recorded ${total} finding${total === 1 ? '' : 's'} (${counts.critical} critical, ${counts.high} high, ${counts.medium} medium). ${risk}`;
 }
 
 function buildRecommendedNextSteps(
@@ -262,23 +398,47 @@ function formatFindingMarkdown(f: Finding): string {
   lines.push('');
   lines.push(`**Expected:** ${f.expected}`);
   lines.push(`**Actual:** ${f.actual}`);
-  lines.push(`**Evidence:** ${f.evidence.length > 0 ? f.evidence.join(', ') : 'None attached'}`);
+  lines.push(
+    `**Evidence:** ${f.evidence.length > 0 ? f.evidence.map((e) => basename(e)).join(', ') + ' (see HTML report for images)' : 'None attached'}`,
+  );
   lines.push(`**Repro rate:** ${f.reproRate}`);
   lines.push(`**Automation candidate:** ${f.automationCandidate ? 'Yes' : 'No'}`);
+  if (f.confidence) {
+    lines.push(
+      `**Confidence:** ${f.confidence === 'verified' ? 'Verified (multiple independent signals)' : 'Heuristic (spot-check recommended)'}` +
+        (f.confidenceReason ? ` — ${f.confidenceReason}` : ''),
+    );
+  }
   lines.push('');
   return lines.join('\n');
 }
 
-function formatFindingHtml(f: Finding, index: number): string {
-  const id = `F-${String(index + 1).padStart(3, '0')}`;
+function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F'): string {
+  const id = `${idPrefix}-${String(index + 1).padStart(3, '0')}`;
   const steps =
     f.steps.length > 0
       ? `<ol class="steps">${f.steps.map((s) => `<li>${escapeHtml(s)}</li>`).join('')}</ol>`
       : '<p class="muted"><em>(no steps recorded)</em></p>';
   const evidence =
     f.evidence.length > 0
-      ? `<ul class="evidence">${f.evidence.map((e) => `<li>${escapeHtml(e)}</li>`).join('')}</ul>`
+      ? `<div class="evidence-shots">${f.evidence.map((e) => embedEvidenceHtml(e)).join('')}</div>`
       : '<p class="muted">None attached</p>';
+
+  // Newlines in `actual`/`expected` (e.g. a consolidated finding listing several raw error
+  // messages) need to survive into the rendered HTML — escapeHtml alone collapses them, since
+  // whitespace inside a plain <p> renders as a single line.
+  const withLineBreaks = (s: string) => escapeHtml(s).replace(/\n/g, '<br>');
+
+  const confidenceBadge = f.confidence
+    ? `<span class="confidence-badge ${f.confidence}" title="${escapeHtml(f.confidenceReason ?? '')}">${f.confidence === 'verified' ? '✓ Verified' : '⚠ Heuristic'}</span>`
+    : '';
+  // The badge's title= tooltip is easy to miss entirely (no hover on touch, and invisible in
+  // any copy-pasted or printed version of the report) — confidenceReason is exactly the kind
+  // of context ("verified" doesn't mean "always reproduces") that shouldn't depend on a reader
+  // thinking to hover over a small badge, so it's also shown as plain, always-visible text.
+  const confidenceNote = f.confidenceReason
+    ? `<p class="confidence-note"><span class="label">Confidence note</span>${escapeHtml(f.confidenceReason)}</p>`
+    : '';
 
   return `
 <article class="finding" data-severity="${escapeHtml(f.severity)}">
@@ -286,14 +446,16 @@ function formatFindingHtml(f: Finding, index: number): string {
     <span class="finding-id">${id}</span>
     <span class="sev-badge ${escapeHtml(f.severity)}">${escapeHtml(f.severity)}</span>
     <span class="area-chip">${escapeHtml(f.area)}</span>
+    ${confidenceBadge}
   </header>
   <h4>${escapeHtml(f.title)}</h4>
   ${f.preconditions ? `<p class="pre"><span class="label">Preconditions</span>${escapeHtml(f.preconditions)}</p>` : ''}
   <div class="block"><span class="label">Steps to reproduce</span>${steps}</div>
   <div class="ea-grid">
-    <div class="ea expected"><span class="label">Expected</span><p>${escapeHtml(f.expected)}</p></div>
-    <div class="ea actual"><span class="label">Actual</span><p>${escapeHtml(f.actual)}</p></div>
+    <div class="ea expected"><span class="label">Expected</span><p>${withLineBreaks(f.expected)}</p></div>
+    <div class="ea actual"><span class="label">Actual</span><p>${withLineBreaks(f.actual)}</p></div>
   </div>
+  ${confidenceNote}
   <div class="block"><span class="label">Evidence</span>${evidence}</div>
   <footer class="finding-foot">
     <span>Repro rate: <strong>${escapeHtml(f.reproRate)}</strong></span>
@@ -373,7 +535,53 @@ function buildFlowsMarkdown(flows: FlowCoverageRow[]): string {
   return lines.join('\n');
 }
 
+function buildPageCoverageMarkdown(state: SessionState): string {
+  const discovered = state.discoveredRoutes ?? [];
+  const visited = new Set(state.visitedRoutes ?? []);
+  if (discovered.length === 0) return '';
+
+  const notVisited = discovered.filter((r) => !visited.has(r));
+  const visitedCount = discovered.length - notVisited.length;
+
+  const lines: string[] = [
+    '## Page Coverage',
+    '',
+    `**${visitedCount}/${discovered.length}** routes discovered on the landing page were actually visited during this session.`,
+    '',
+  ];
+  if (notVisited.length > 0) {
+    lines.push('**Not visited:**', '', ...notVisited.map((r) => `- ${r}`), '');
+  }
+  return lines.join('\n');
+}
+
+function buildActionInventoryMarkdown(state: SessionState): string {
+  const inv = state.actionInventory;
+  if (!inv || inv.totalFound === 0) return '';
+
+  const lines: string[] = [
+    '## Action Inventory',
+    '',
+    `Found **${inv.totalFound}** distinct action element(s) (buttons, icon-buttons, menu items, tabs) — ` +
+      `tested **${inv.totalTested}**, skipped **${inv.totalSkippedRisky}** as risky (delete/pay/send-style actions).`,
+    '',
+    '| Outcome | Count |',
+    '|---------|-------|',
+    ...Object.entries(inv.byResult).map(([result, count]) => `| ${result} | ${count} |`),
+    '',
+  ];
+  return lines.join('\n');
+}
+
+function buildFindingDiffMarkdown(state: SessionState): string {
+  if (!state.findingDiff) return '';
+  return ['## Regression vs Previous Run', '', state.findingDiff.markdown].join('\n');
+}
+
 function buildFindingsMarkdown(groups: AreaFindingGroup[], bySeverity: SeverityCounts): string {
+  // Info-severity items are intentionally excluded here — they're not defects (computeHealthScore
+  // already gives them zero weight), so they're broken out into their own "Additional Notes"
+  // section below rather than diluting a section that's meant to be exclusively real bugs.
   const lines: string[] = [
     '## 3. Findings',
     '',
@@ -385,7 +593,6 @@ function buildFindingsMarkdown(groups: AreaFindingGroup[], bySeverity: SeverityC
     `| High     | ${bySeverity.high} |`,
     `| Medium   | ${bySeverity.medium} |`,
     `| Low      | ${bySeverity.low} |`,
-    `| Info     | ${bySeverity.info} |`,
     `| **Total** | **${groups.reduce((n, g) => n + g.count, 0)}** |`,
     '',
   ];
@@ -414,21 +621,62 @@ function buildFindingsMarkdown(groups: AreaFindingGroup[], bySeverity: SeverityC
   return lines.join('\n');
 }
 
+/**
+ * Info-severity items, broken out of the Findings section: not defects (expected and actual
+ * agree by construction — "Endpoint exists" / "HTTP 200 with JSON response" — so they can't be
+ * a bug), but still worth keeping as a record — discovered API endpoints, coverage summaries,
+ * confirmation checks a future QA pass might want to build on.
+ */
+function buildInfoNotesMarkdown(groups: AreaFindingGroup[]): string {
+  if (groups.length === 0) return '';
+  const total = groups.reduce((n, g) => n + g.count, 0);
+  const lines: string[] = [
+    `## 4. Additional Notes (${total})`,
+    '',
+    '_Not defects — informational observations (discovered endpoints, coverage summaries, ' +
+      'confirmation checks) that may be useful context for future exploration._',
+    '',
+  ];
+  for (const g of groups) {
+    lines.push(`### ${g.area} (${g.count})`, '');
+    let idx = 0;
+    for (const f of g.findings) {
+      idx += 1;
+      lines.push(`#### ${idx}. ${f.title}`, '');
+      const body = formatFindingMarkdown(f).split('\n').slice(2).join('\n');
+      lines.push(body);
+    }
+  }
+  return lines.join('\n');
+}
+
 export function generateSessionReport(state: SessionState): SessionReport {
   const targetUrl = state.config.targetUrl;
   const findings = sortFindings(dedupeFindings(state.findings)).map((f) =>
     withReproSteps(f, targetUrl),
   );
+  // "info" severity is structurally not a defect — computeHealthScore already gives it zero
+  // penalty and excludes it from the issue count — so it doesn't belong mixed into a
+  // "Findings" list that's otherwise exclusively real bugs (a QA discovering "GET /api/x
+  // returned 200 JSON" listed the same way as an actual defect reads as noise/confusion, not
+  // a bug report). Split it out into its own section instead of dropping it: these are still
+  // useful notes (discovered endpoints, coverage summaries, confirmation checks) worth keeping
+  // for future exploration, just not co-mingled with things that need fixing.
+  const bugFindings = findings.filter((f) => f.severity !== 'info');
+  const infoFindings = findings.filter((f) => f.severity === 'info');
   const bySeverity = countBySeverity(findings);
+  const healthScore = computeHealthScore(findings);
   const flowsCovered = buildFlowCoverage(state.plan, findings, targetUrl);
-  const findingsByArea = groupFindingsByArea(findings);
+  const findingsByArea = groupFindingsByArea(bugFindings);
+  const infoByArea = groupFindingsByArea(infoFindings);
   const executiveSummary = buildExecutiveSummary(
     state,
     bySeverity,
-    findings.length,
+    bugFindings.length,
     flowsCovered.length,
+    healthScore,
   );
-  const recommendedNextSteps = buildRecommendedNextSteps(findings, bySeverity);
+  const recommendedNextSteps = buildRecommendedNextSteps(bugFindings, bySeverity);
   const date = state.updatedAt || state.createdAt || new Date().toISOString();
   const areas = state.config.areas.join(', ') || 'n/a';
 
@@ -437,10 +685,14 @@ export function generateSessionReport(state: SessionState): SessionReport {
     '',
     executiveSummary,
     '',
-    buildOverviewMarkdown(state, flowsCovered, findings),
+    buildOverviewMarkdown(state, flowsCovered, bugFindings),
     buildFlowsMarkdown(flowsCovered),
+    buildPageCoverageMarkdown(state),
+    buildActionInventoryMarkdown(state),
+    buildFindingDiffMarkdown(state),
     buildFindingsMarkdown(findingsByArea, bySeverity),
-    '## 4. Recommended Next Steps',
+    buildInfoNotesMarkdown(infoByArea),
+    `## ${infoByArea.length > 0 ? '5' : '4'}. Recommended Next Steps`,
     '',
     ...recommendedNextSteps.map((s, i) => `${i + 1}. ${s}`),
     '',
@@ -475,7 +727,7 @@ export function generateSessionReport(state: SessionState): SessionReport {
     ['Areas selected', areas],
     ['Tasks completed', `${state.progress.completedTasks} / ${state.progress.totalTasks}`],
     ['Flows exercised', String(flowsCovered.length)],
-    ['Findings', String(findings.length)],
+    ['Findings', String(bugFindings.length)],
     [
       'Site type',
       state.classification
@@ -497,7 +749,7 @@ export function generateSessionReport(state: SessionState): SessionReport {
     ? `${state.classification.siteType} (${Math.round(state.classification.confidence * 100)}%)`
     : 'Not classified';
 
-  const risk = overallRisk(bySeverity, findings.length);
+  const risk = overallRisk(bySeverity, bugFindings.length);
 
   const flowsByArea = groupFlowsByArea(flowsCovered);
   let flowsHtml = '<p class="empty">No plan tasks were recorded for this session.</p>';
@@ -578,9 +830,98 @@ export function generateSessionReport(state: SessionState): SessionReport {
           })
           .join('\n');
 
+  // Info-severity items get the same two-part treatment (area summary + detail cards) as
+  // bug findings above, just in their own section with their own N- prefixed ids — reusing
+  // formatFindingHtml keeps the visual language consistent while id/section placement makes
+  // clear these aren't part of the bug list.
+  const infoAreaSummaryHtml =
+    infoByArea.length === 0
+      ? ''
+      : `<table class="data-table">
+        <thead><tr><th>Area</th><th style="width:12%">Count</th></tr></thead>
+        <tbody>
+          ${infoByArea
+            .map((g) => `<tr><td>${escapeHtml(g.area)}</td><td class="num">${g.count}</td></tr>`)
+            .join('\n')}
+        </tbody>
+      </table>`;
+
+  let infoIdx = 0;
+  const infoNotesHtml =
+    infoByArea.length === 0
+      ? ''
+      : infoByArea
+          .map((g) => {
+            const cards = g.findings
+              .map((f) => {
+                const html = formatFindingHtml(f, infoIdx, 'N');
+                infoIdx += 1;
+                return html;
+              })
+              .join('\n');
+            return `
+            <div class="area-group">
+              <div class="area-group-head">
+                <h3>${escapeHtml(g.area)}</h3>
+                <span class="count-chip">${g.count}</span>
+              </div>
+              ${cards}
+            </div>`;
+          })
+          .join('\n');
+
   const nextStepsHtml = recommendedNextSteps
     .map((s) => `<li>${escapeHtml(s)}</li>`)
     .join('\n');
+
+  const pageCoverageHtml = (() => {
+    const discovered = state.discoveredRoutes ?? [];
+    const visited = new Set(state.visitedRoutes ?? []);
+    if (discovered.length === 0) return '';
+    const notVisited = discovered.filter((r) => !visited.has(r));
+    const visitedCount = discovered.length - notVisited.length;
+    const notVisitedList =
+      notVisited.length > 0
+        ? `<div class="table-block-title">Not visited (${notVisited.length})</div>
+           <ul>${notVisited.map((r) => `<li>${escapeHtml(r)}</li>`).join('')}</ul>`
+        : '<p class="muted">All discovered routes were visited.</p>';
+    return `<p class="muted" style="margin:0 0 0.75rem">
+        <strong>${visitedCount}/${discovered.length}</strong> routes discovered on the landing page were actually visited during this session.
+      </p>
+      ${notVisitedList}`;
+  })();
+
+  const actionInventoryHtml = (() => {
+    const inv = state.actionInventory;
+    if (!inv || inv.totalFound === 0) return '';
+    const rows = Object.entries(inv.byResult)
+      .map(([result, count]) => `<tr><td>${escapeHtml(result)}</td><td>${count}</td></tr>`)
+      .join('');
+    return `<p class="muted" style="margin:0 0 0.75rem">
+        Found <strong>${inv.totalFound}</strong> distinct action element(s) (buttons, icon-buttons,
+        menu items, tabs) — tested <strong>${inv.totalTested}</strong>, skipped
+        <strong>${inv.totalSkippedRisky}</strong> as risky (delete/pay/send-style actions).
+      </p>
+      <table class="overview-table"><thead><tr><th>Outcome</th><th>Count</th></tr></thead><tbody>${rows}</tbody></table>`;
+  })();
+
+  const findingDiffHtml = (() => {
+    const diff = state.findingDiff;
+    if (!diff) return '';
+    const list = (title: string, items: string[]) =>
+      items.length === 0
+        ? ''
+        : `<div class="table-block-title">${escapeHtml(title)} (${items.length})</div>
+           <ul>${items.slice(0, 20).map((t) => `<li>${escapeHtml(t)}</li>`).join('')}</ul>`;
+    return `<p class="muted" style="margin:0 0 0.75rem">
+        Compared against the previous completed run against this target${diff.previousSessionId ? ` (session <code>${escapeHtml(diff.previousSessionId.slice(0, 8))}</code>)` : ''}.
+      </p>
+      <div class="two-col">
+        <div>${list('New', diff.newFindings)}</div>
+        <div>${list('Fixed', diff.fixedFindings)}</div>
+      </div>
+      ${list('Recurring', diff.recurringFindings)}`;
+  })();
 
   const severityBars = SEVERITY_ORDER.map((sev) => {
     const n = bySeverity[sev];
@@ -626,6 +967,16 @@ export function generateSessionReport(state: SessionState): SessionReport {
       background: #eef2f6;
       line-height: 1.55;
       -webkit-font-smoothing: antialiased;
+      /* Systemic fix, not a one-off: findings routinely contain long unbroken strings (a
+         full query-string URL, a concatenated selector list) that a browser otherwise treats
+         as unbreakable, whose full-string width becomes the min-content size of whatever
+         grid/flex column holds it — silently blowing that column, and the whole page, past
+         the viewport. overflow-wrap is inherited, so setting it once here protects every
+         current and future container in this report, rather than patching each layout only
+         after a long enough string happens to land in it (as already happened three times:
+         the evidence list, the finding cards, and the New/Fixed regression columns). */
+      overflow-wrap: break-word;
+      word-break: break-word;
     }
     .doc {
       max-width: 900px;
@@ -791,6 +1142,12 @@ export function generateSessionReport(state: SessionState): SessionReport {
       gap: 1.25rem;
       margin-top: 0.75rem;
     }
+    /* Grid items default to min-width:auto — a single long unbroken string (a finding title
+       carrying a full query-string URL, common in rate-limit/API findings) can otherwise
+       force a column wider than its track and overflow the page, the same issue fixed
+       elsewhere for the live app's chat/findings columns. */
+    .two-col > div { min-width: 0; }
+    .two-col li { overflow-wrap: break-word; word-break: break-word; }
     @media (max-width: 700px) { .two-col { grid-template-columns: 1fr; } }
     .overview-table, .data-table {
       width: 100%;
@@ -932,6 +1289,33 @@ export function generateSessionReport(state: SessionState): SessionReport {
       padding: 0.15rem 0.4rem;
       border-radius: 3px;
     }
+    .confidence-badge {
+      font-size: 0.68rem;
+      font-weight: 600;
+      padding: 0.15rem 0.4rem;
+      border-radius: 3px;
+      border: 1px solid;
+    }
+    .confidence-badge.verified {
+      color: #1a7f37;
+      background: #eaf7ee;
+      border-color: #b7e3c3;
+    }
+    .confidence-badge.heuristic {
+      color: #9a6700;
+      background: #fff8e6;
+      border-color: #f0dca0;
+    }
+    .confidence-note {
+      margin: 0 0 0.75rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+      background: var(--soft);
+      border-left: 3px solid var(--line);
+      padding: 0.5rem 0.75rem;
+      border-radius: 0 4px 4px 0;
+    }
+    .confidence-note .label { display: block; margin-bottom: 0.2rem; }
     .finding h4 {
       margin: 0 0 0.75rem;
       font-size: 1rem;
@@ -950,6 +1334,20 @@ export function generateSessionReport(state: SessionState): SessionReport {
     .block { margin-bottom: 0.75rem; }
     .pre { margin: 0 0 0.75rem; }
     .steps, .evidence { margin: 0.15rem 0 0; padding-left: 1.15rem; }
+    .evidence-shots { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.25rem; }
+    .evidence-shot {
+      max-width: 240px;
+      max-height: 160px;
+      object-fit: cover;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      display: block;
+    }
+    .evidence-file {
+      font-size: 0.8rem;
+      color: var(--muted);
+      font-family: monospace;
+    }
     .ea-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -1023,15 +1421,19 @@ export function generateSessionReport(state: SessionState): SessionReport {
       <div class="kpi-grid">
         <div class="kpi"><div class="v">${flowsCovered.length}</div><div class="l">Flows tested</div></div>
         <div class="kpi"><div class="v">${state.progress.completedTasks}/${state.progress.totalTasks}</div><div class="l">Tasks completed</div></div>
-        <div class="kpi"><div class="v">${findings.length}</div><div class="l">Findings</div></div>
+        <div class="kpi"><div class="v">${bugFindings.length}</div><div class="l">Findings</div></div>
         <div class="kpi"><div class="v">${bySeverity.critical + bySeverity.high}</div><div class="l">Critical + High</div></div>
       </div>
 
       <ul class="toc">
         <li><a href="#overview">1. Overview</a></li>
         <li><a href="#flows">2. Flows tested</a></li>
+        ${pageCoverageHtml ? '<li><a href="#page-coverage">Page Coverage</a></li>' : ''}
+        ${actionInventoryHtml ? '<li><a href="#action-inventory">Action Inventory</a></li>' : ''}
+        ${findingDiffHtml ? '<li><a href="#regression">Regression vs Previous Run</a></li>' : ''}
         <li><a href="#findings">3. Findings</a></li>
-        <li><a href="#next-steps">4. Recommendations</a></li>
+        ${infoNotesHtml ? `<li><a href="#info-notes">4. Additional Notes</a></li>` : ''}
+        <li><a href="#next-steps">${infoNotesHtml ? '5' : '4'}. Recommendations</a></li>
       </ul>
 
       <section class="sec" id="overview">
@@ -1052,14 +1454,36 @@ export function generateSessionReport(state: SessionState): SessionReport {
         ${flowsHtml}
       </section>
 
+      ${pageCoverageHtml ? `<section class="sec" id="page-coverage">
+        <h2>Page Coverage</h2>
+        ${pageCoverageHtml}
+      </section>` : ''}
+
+      ${actionInventoryHtml ? `<section class="sec" id="action-inventory">
+        <h2>Action Inventory</h2>
+        ${actionInventoryHtml}
+      </section>` : ''}
+
+      ${findingDiffHtml ? `<section class="sec" id="regression">
+        <h2>Regression vs Previous Run</h2>
+        ${findingDiffHtml}
+      </section>` : ''}
+
       <section class="sec" id="findings">
         <h2>3. Findings</h2>
         ${areaSummaryHtml ? `<div style="margin:0.75rem 0 1.25rem">${areaSummaryHtml}</div>` : ''}
         ${findingsHtml}
       </section>
 
+      ${infoNotesHtml ? `<section class="sec" id="info-notes">
+        <h2>4. Additional Notes <span class="muted small">(${infoFindings.length})</span></h2>
+        <p class="muted" style="margin:0 0 0.75rem">Not defects — informational observations (discovered endpoints, coverage summaries, confirmation checks) that may be useful context for future exploration.</p>
+        ${infoAreaSummaryHtml ? `<div style="margin:0.75rem 0 1.25rem">${infoAreaSummaryHtml}</div>` : ''}
+        ${infoNotesHtml}
+      </section>` : ''}
+
       <section class="sec" id="next-steps">
-        <h2>4. Recommendations</h2>
+        <h2>${infoNotesHtml ? '5' : '4'}. Recommendations</h2>
         <ol class="next-steps">${nextStepsHtml}</ol>
       </section>
     </div>
@@ -1077,13 +1501,16 @@ export function generateSessionReport(state: SessionState): SessionReport {
     markdown,
     html,
     summary: {
-      total: findings.length,
+      total: bugFindings.length,
       bySeverity,
+      healthScore,
       executiveSummary,
       recommendedNextSteps,
       flowsCovered,
       findingsByArea,
-      findings,
+      findings: bugFindings,
+      infoFindings,
+      infoByArea,
     },
   };
 }

@@ -6,17 +6,29 @@ import { isLoginWallPage } from '../flows/helpers.js';
 
 const POST_LOGIN_FILE = 'post-login-url.txt';
 
-/** Common authenticated entry paths when root URL is still a login page */
+/**
+ * Common authenticated entry paths when root URL is still a login page. Deliberately spans
+ * multiple site categories (SaaS, fintech, content, e-commerce) rather than assuming one —
+ * this list is a last-resort guess, tried only after a plain reload fails to reveal a
+ * naturally-redirected authenticated page.
+ */
 const POST_AUTH_PATHS = [
-  '/inventory.html',
-  '/inventory',
   '/dashboard',
   '/home',
   '/app',
+  '/main',
+  '/overview',
+  '/console',
+  '/workspace',
+  '/portal',
+  '/accounts',
+  '/account',
+  '/feed',
+  '/admin',
+  '/inventory.html',
+  '/inventory',
   '/products',
   '/catalog',
-  '/main',
-  '/portal',
 ];
 
 export function sessionAuthDir(ctx: ExecutorContext): string {
@@ -48,7 +60,9 @@ export function resolveExplorationStartUrl(ctx: ExecutorContext): string {
 
 /**
  * If cookies say we're logged in but the current page is still the login form
- * (common on Sauce Demo `/`), try known post-auth paths and the saved URL.
+ * (some SPAs need a moment to recognize the restored session, or the root path is
+ * always the login screen regardless of auth state), try a reload, the saved
+ * post-login URL, and a category-spanning list of common authenticated paths.
  */
 export async function ensureAuthenticatedLanding(
   page: Page,
@@ -60,6 +74,17 @@ export async function ensureAuthenticatedLanding(
 
   if (!hasSavedAuthState(ctx)) {
     return false;
+  }
+
+  // Try a plain reload first — many SPAs just need a moment to recognize the restored
+  // session client-side. This needs no site-specific knowledge and resolves the common
+  // case without ever falling back to guessed paths.
+  await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+  await page.waitForTimeout(800);
+  if (!(await isLoginWallPage(page))) {
+    savePostLoginUrl(sessionAuthDir(ctx), page.url());
+    ctx.onLog(`[Auth] Authenticated landing OK after reload: ${page.url()}`);
+    return true;
   }
 
   const origin = new URL(ctx.config.targetUrl).origin;
@@ -74,7 +99,11 @@ export async function ensureAuthenticatedLanding(
 
   for (const url of candidates) {
     ctx.onLog(`[Auth] Still on login form — trying authenticated URL: ${url}`);
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
+    if (response && !response.ok()) {
+      ctx.onLog(`[Auth] ${url} returned ${response.status()} — not a real landing, skipping`);
+      continue;
+    }
     await page.waitForTimeout(500);
     if (!(await isLoginWallPage(page))) {
       savePostLoginUrl(sessionAuthDir(ctx), page.url());
@@ -97,15 +126,28 @@ export async function finalizePostLoginLanding(
   targetUrl: string,
   onLog: (m: string) => void,
 ): Promise<string> {
-  await page.waitForTimeout(800);
+  // Poll for the app's own post-submit redirect before guessing at URLs — many apps
+  // (esp. server-rendered front-controller apps like OrangeHRM's index.php router) take
+  // several seconds to redirect off the login form, and a single 800ms check mistakes
+  // "still redirecting" for "login failed".
   let url = page.url();
+  const deadline = Date.now() + 6000;
+  let onWall = await isLoginWallPage(page);
+  while (onWall && Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    onWall = await isLoginWallPage(page);
+  }
 
-  if (await isLoginWallPage(page)) {
+  if (onWall) {
     const origin = new URL(targetUrl).origin;
     for (const path of POST_AUTH_PATHS) {
       const tryUrl = `${origin}${path}`;
       onLog(`[Auth] Post-login still on form — navigating to ${tryUrl}`);
-      await page.goto(tryUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+      const response = await page.goto(tryUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => null);
+      if (response && !response.ok()) {
+        onLog(`[Auth] ${tryUrl} returned ${response.status()} — not a real landing, skipping`);
+        continue;
+      }
       await page.waitForTimeout(500);
       if (!(await isLoginWallPage(page))) {
         url = page.url();
