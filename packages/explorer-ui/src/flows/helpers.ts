@@ -38,6 +38,39 @@ export async function waitForRealContent(page: Page, timeoutMs = 8000): Promise<
   }
 }
 
+/**
+ * Wait until document.title stops changing, rather than trusting waitForRealContent alone —
+ * that only confirms the page LOOKS loaded (real text + an interactive element), not that an
+ * SPA's async title-setting effect (title starts as a generic app name, then updates once
+ * page-specific data resolves) has actually finished. Any check that captures page.title() at
+ * a waitForRealContent-settled-but-not-title-stable moment is racing that update — confirmed
+ * as a real, live source of noise: the SAME page's title flip-flopped between two values
+ * across consecutive real sessions purely depending on which side of that race each capture
+ * landed on, producing a comparison-based finding (device/engine "differs from baseline") that
+ * was really just measuring which run got lucky, not a genuine rendering difference.
+ *
+ * Requires the title to be unchanged across TWO consecutive checks, not one, after an initial
+ * grace period. Checking only once is indistinguishable between "already settled" and "hasn't
+ * started changing yet" — sampled a beat before the update begins, both look identical, and a
+ * single-check version returns "stable" while genuinely still mid-change.
+ */
+export async function waitForTitleStable(page: Page, timeoutMs = 5000): Promise<void> {
+  await page.waitForTimeout(1000); // let a title-changing script have a real chance to start
+  const deadline = Date.now() + timeoutMs;
+  let last = await page.title().catch(() => '');
+  let stableRounds = 0;
+  while (Date.now() < deadline && stableRounds < 2) {
+    await page.waitForTimeout(300);
+    const current = await page.title().catch(() => '');
+    if (current === last) {
+      stableRounds++;
+    } else {
+      stableRounds = 0;
+      last = current;
+    }
+  }
+}
+
 /** Path to this session's saved auth state (cookies + localStorage), or null if none exists. */
 export function savedSessionStatePath(ctx: ExecutorContext): string | null {
   const stateFile = join(ctx.sessionsDir, ctx.sessionId, 'auth-state.json');
@@ -258,6 +291,136 @@ export function isRiskyActionLabel(buttonLabel: string): boolean {
   );
 }
 
+// Broader than modals.ts's own detection (which only cares about a modal it just opened
+// itself): this also has to catch a modal that was ALREADY open from a previous, unrelated
+// click — the case that actually causes cascading false positives. `[role="dialog"]`/
+// `[aria-modal="true"]` cover accessible implementations; `.modal`/`[class*="modal-overlay"]`/
+// `[data-modal-overlay="true"]` cover the common non-ARIA custom-component pattern (confirmed
+// via a live repro: a real target app's overlay used exactly `data-modal-overlay="true"` with
+// no ARIA role at all, which `role="dialog"`-only detection completely misses).
+const BLOCKING_OVERLAY_SELECTOR =
+  '[role="dialog"]:visible, [role="alertdialog"]:visible, [aria-modal="true"]:visible, ' +
+  '.modal:visible, [class*="modal-overlay" i]:visible, [class*="dialog-overlay" i]:visible, ' +
+  '[data-modal-overlay="true"]:visible, [data-state="open"][role="dialog"]:visible';
+
+const CLOSE_CONTROL_SELECTOR =
+  'button:has-text("Cancel"), button:has-text("Close"), button:has-text("×"), button:has-text("✕"), ' +
+  '[aria-label*="close" i], [aria-label*="dismiss" i], [title*="close" i], [class*="close" i]:visible';
+
+/**
+ * How many modal/dialog-like overlays are currently visible — not just whether one is (used
+ * by callers like action-inventory.ts's captureState that need to detect a NEW one appearing,
+ * by comparing this count before and after an action).
+ */
+export async function countBlockingOverlays(page: Page): Promise<number> {
+  return page.locator(BLOCKING_OVERLAY_SELECTOR).count().catch(() => 0);
+}
+
+/**
+ * True if a modal/dialog-like overlay is currently visible and would intercept clicks meant
+ * for whatever's underneath it.
+ */
+export async function hasBlockingOverlay(page: Page): Promise<boolean> {
+  return (await countBlockingOverlays(page)) > 0;
+}
+
+/**
+ * Tries, in order, to close whatever modal/overlay is currently blocking the page: Escape,
+ * then a close/cancel-labeled control, then clicking the overlay's own backdrop (a corner far
+ * from the centered dialog box — the common "click outside to dismiss" pattern). Returns
+ * whether the page is clear of blocking overlays afterward.
+ *
+ * This matters beyond just "closing a modal we ourselves opened" — the same fixed selector
+ * scan used by action-inventory.ts and agentic-explore.ts (and anything else that walks
+ * through many candidate elements in one page visit) will otherwise keep trying to click
+ * elements hidden behind a modal that was left open by an EARLIER click, and every one of
+ * those attempts times out and gets misreported as "clicking X threw an error" — a cascade of
+ * false positives against the target site for what is really one stuck overlay.
+ */
+export async function dismissBlockingOverlay(page: Page): Promise<boolean> {
+  if (!(await hasBlockingOverlay(page))) return true;
+
+  await page.keyboard.press('Escape').catch(() => {});
+  if (!(await hasBlockingOverlay(page))) return true;
+
+  const closeBtn = page.locator(CLOSE_CONTROL_SELECTOR).first();
+  if (await closeBtn.isVisible().catch(() => false)) {
+    await closeBtn.click({ timeout: 2000 }).catch(() => {});
+    await page.waitForTimeout(300);
+    if (!(await hasBlockingOverlay(page))) return true;
+  }
+
+  const overlay = page.locator(BLOCKING_OVERLAY_SELECTOR).first();
+  await overlay.click({ position: { x: 5, y: 5 }, timeout: 2000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  return !(await hasBlockingOverlay(page));
+}
+
+/**
+ * Consent gate for a risky-looking action (per site-policies.md): if `buttonLabel` doesn't
+ * look risky, proceeds immediately. If it does, checks whether the required data (a
+ * confirmation, a recipient, etc.) is already in `ctx.config.credentials.extras` — from an
+ * earlier gate this session, or supplied up front — and if not, pauses via
+ * `ctx.onPreActionNeeded` and waits for it. A user reply of `skip`/`no`/`cancel` sets
+ * `extras['_user_skip']`, which short-circuits every future gate in the session rather than
+ * asking again per action. Shared by every flow that can reach a Send/Share/Pay/Delete-style
+ * action — journeys, and the AI-driven exploration loop alike — so there is exactly one place
+ * this safety rule is implemented, not one copy per caller.
+ */
+export async function gateIfSensitive(
+  page: Page,
+  ctx: ExecutorContext,
+  buttonLabel: string,
+): Promise<boolean> {
+  const label = buttonLabel.toLowerCase();
+
+  if (!isRiskyActionLabel(buttonLabel)) return true; // Not sensitive, proceed
+
+  // Check what data is already available in extras
+  const extras = ctx.config.credentials?.extras ?? {};
+
+  // If user explicitly said "skip" in chat, honour it
+  if (extras['_user_skip'] === 'true') {
+    ctx.onLog(`[Gate] Action "${buttonLabel}" skipped — user requested skip`);
+    return false;
+  }
+
+  // Determine what extra we need based on the action type
+  let requiredKey = 'confirm';
+  let actionType: 'send_link' | 'payment' | 'purchase' | 'generic' = 'generic';
+
+  if (/pay|transfer/.test(label)) {
+    actionType = 'payment';
+    requiredKey = 'confirm';
+  } else if (/order/.test(label)) {
+    actionType = 'purchase';
+    requiredKey = 'confirm';
+  } else if (/send|share|invite|whatsapp|sms|email|message|forward/.test(label)) {
+    actionType = 'send_link';
+    requiredKey = 'recipient';
+  }
+
+  if (extras[requiredKey]) return true; // User already provided data
+
+  // Emit gate — pause and ask user
+  const provided = ctx.onPreActionNeeded?.({
+    type: actionType,
+    description: `"${buttonLabel}" — this will send a real communication or payment`,
+    requiredExtras: [requiredKey],
+    pageUrl: page.url(),
+  });
+
+  if (provided && provided[requiredKey]) {
+    // Merge provided value into config extras for use by the flow
+    ctx.config.credentials = ctx.config.credentials ?? { type: 'none' };
+    ctx.config.credentials.extras = { ...extras, ...provided };
+    return true;
+  }
+
+  ctx.onLog(`[Gate] Skipped sensitive action "${buttonLabel}" — user did not provide required data`);
+  return false;
+}
+
 /**
  * Returns true if the current page looks like a login/auth wall.
  * Only counts *visible* password / OTP fields so hidden template fields
@@ -373,6 +536,46 @@ export async function findVisibleErrorText(
     if (text && looksLikeRealMessage(text)) return text;
   }
 
+  return null;
+}
+
+const SUCCESS_TEXT_PATTERN = /\b(success|saved|created|updated|added|submitted|done|completed)\b/i;
+
+/**
+ * Mirrors findVisibleErrorText, but for a success/confirmation toast — used to cross-check
+ * what the UI told the user against what the backend actually did (data-integrity.ts). A
+ * bare "*" or a single icon-only toast passes a naive length check but conveys nothing on its
+ * own, same false-positive class findVisibleErrorText already guards against.
+ */
+export async function findVisibleSuccessText(page: Page, waitMs = 600): Promise<string | null> {
+  await page.waitForTimeout(waitMs);
+  const looksLikeRealMessage = (text: string): boolean => text.length > 2 && /[a-zA-Z]/.test(text);
+
+  const ORDERED_SELECTORS = [
+    '[data-test*="success"]',
+    '[data-testid*="success"]',
+    '[data-test*="toast"]',
+    '[data-testid*="toast"]',
+    '[role="status"]',
+    '[aria-live="polite"]',
+    '.toast',
+    '[class*="toast"]',
+    '[class*="success"]',
+    '[class*="notification"]',
+  ];
+
+  for (const sel of ORDERED_SELECTORS) {
+    const els = await page.locator(sel).all();
+    for (const el of els) {
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) continue;
+      const text = (await el.textContent().catch(() => null))?.trim();
+      // Require the text to actually sound like a success confirmation, not just any
+      // visible toast/notification-styled element (a "3 new leads" badge would otherwise
+      // false-positive as "the action succeeded").
+      if (text && looksLikeRealMessage(text) && SUCCESS_TEXT_PATTERN.test(text)) return text;
+    }
+  }
   return null;
 }
 

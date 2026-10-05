@@ -328,6 +328,14 @@ export async function runSessionTimeout(
   const s1 = shot('before-clear');
   await page.screenshot({ path: s1 });
 
+  // Whether this app ever relied on a cookie for its session in the first place. Plenty of
+  // real, deliberately-designed SPAs are entirely bearer-token/localStorage-based and never
+  // set a session cookie at all — for those, "does clearing cookies log you out" isn't a
+  // meaningful question (there was nothing to clear that the app was ever using), and it's
+  // misleading to report it as if the app failed to honor a cookie-based expiry it never had.
+  const cookiesBeforeClear = await page.context().cookies();
+  const hadAnyCookies = cookiesBeforeClear.length > 0;
+
   // ── Phase 1: Clear ONLY cookies ────────────────────────────────────────────
   // This simulates real-world server-side session expiry: the server marks the
   // cookie as expired/invalid. localStorage and sessionStorage are NOT touched
@@ -353,21 +361,35 @@ export async function runSessionTimeout(
     urlAfterCookieClear !== urlBeforeClear;
 
   if (!cookieClearLoggedOut) {
-    // App stayed authenticated even after cookies cleared — real security finding
+    // Reframed around the actual risk (an XSS-readable token) rather than assuming every app
+    // is supposed to be cookie-session-based — plenty of real SPAs deliberately use bearer
+    // tokens in localStorage and were never relying on a cookie to begin with, which isn't a
+    // defect on its own. Severity/framing branches on whether a session cookie even existed:
+    // one that was set but silently ignored is a genuine inconsistency worth a "medium" look;
+    // an app that never set one at all is just informing a security review, not reporting a
+    // broken expiry mechanism it never claimed to have.
     ctx.onFinding({
-      severity: 'high',
+      severity: hadAnyCookies ? 'medium' : 'low',
       area: 'UI-Session',
-      title: 'Session persists after cookies cleared — auth stored outside secure cookie',
+      title: hadAnyCookies
+        ? 'A session cookie exists but is not what actually gates access — auth token readable from localStorage/sessionStorage'
+        : 'Auth token stored in localStorage/sessionStorage, not an httpOnly cookie',
       steps: [
         'Log in and reach an authenticated page',
-        'Clear all browser cookies (simulating server-side session expiry)',
+        'Clear all browser cookies only (localStorage/sessionStorage untouched)',
         'Reload the page',
       ],
-      expected: 'App redirects to login page after cookie-based session is removed',
-      actual: `Still showing authenticated content at ${urlAfterCookieClear} — auth likely stored in localStorage or sessionStorage, not cookies`,
+      expected: hadAnyCookies
+        ? 'If a session cookie is being set, it should be the thing that actually gates access — an ignored cookie alongside a separately-trusted localStorage token is confusing session-management surface, not a coherent single mechanism'
+        : 'No specific behavior expected here by default — bearer-token/localStorage auth is a common, valid architecture. Flagged only because a token readable by any injected script carries materially higher exposure than an httpOnly cookie if this app has (or ever gets) an XSS issue elsewhere',
+      actual: `Still showing authenticated content at ${urlAfterCookieClear} after clearing cookies — auth is not cookie-bound. ${hadAnyCookies ? `A cookie WAS present before clearing (${cookiesBeforeClear.length} cookie(s)) but evidently isn't what's actually checked.` : 'No cookies were set on this domain at all before clearing — this app appears to be bearer-token/localStorage-based by design.'}`,
       evidence: [s1, s2],
       reproRate: '1/1',
       automationCandidate: true,
+      confidence: hadAnyCookies ? undefined : 'heuristic',
+      confidenceReason: hadAnyCookies
+        ? undefined
+        : 'This is a common, often deliberate architecture choice, not inherently a bug — worth a security-review conversation about XSS exposure, not necessarily a fix.',
     });
 
     // ── Phase 2: Now also clear localStorage + sessionStorage ──────────────

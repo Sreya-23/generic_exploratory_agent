@@ -11,6 +11,7 @@ import {
   type SessionState,
 } from '../api/client';
 import { FindingCard } from '../components/session/FindingCard';
+import { QualityPilotConnect } from '../components/session/QualityPilotConnect';
 import { SessionProgress } from '../components/session/SessionProgress';
 import { ChatPanel } from '../components/chat/ChatPanel';
 import { SETUP_CONV_KEY } from './ChatSetupPage';
@@ -283,6 +284,7 @@ export function LiveSessionPage() {
         </section>
 
         <section className="findings-panel">
+          <QualityPilotConnect sessionId={session.id} />
           <h2>Findings ({findings.length})</h2>
           {findings.length === 0 ? (
             <p className="empty-state">
@@ -291,7 +293,7 @@ export function LiveSessionPage() {
           ) : (
             <div className="findings-list">
               {findings.map((f) => (
-                <FindingCard key={f.id} finding={f} />
+                <FindingCard key={f.id} finding={f} sessionId={session.id} />
               ))}
             </div>
           )}

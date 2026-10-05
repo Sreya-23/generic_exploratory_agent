@@ -6,7 +6,15 @@ import type {
   ExecutorContext,
   FlowTask,
 } from '@qa/shared';
-import { isRiskyActionLabel, explorationBreadth, describeElement, elementFingerprint } from './helpers.js';
+import {
+  isRiskyActionLabel,
+  explorationBreadth,
+  describeElement,
+  elementFingerprint,
+  hasBlockingOverlay,
+  dismissBlockingOverlay,
+  countBlockingOverlays,
+} from './helpers.js';
 
 /**
  * Action Inventory — the "explore every button, not just every link" pass.
@@ -62,6 +70,70 @@ function summarizeClickError(message: string): string {
   return tail.startsWith(firstLine) ? tail : `${firstLine}\n…\n${tail}`;
 }
 
+// Confirmed against a real run (amazon.in): ~10 core, definitely-clickable nav elements
+// (search box, cart, account menu) all "threw an error" with this exact oscillating
+// signature — scroll succeeds, element is immediately re-flagged outside the viewport, retry,
+// timeout. That's a sticky/fixed-position element re-asserting its own position right after
+// Playwright scrolls it into view, not a real site defect — a human never "scrolls toward" a
+// sticky header, they just click it where it already always sits on-screen.
+function isStickyScrollOscillation(message: string): boolean {
+  return /scrolling into view if needed/.test(message) && /element is outside of the viewport/.test(message);
+}
+
+async function clickWithStickyRetry(el: Locator, ctx: ExecutorContext, label: string): Promise<void> {
+  try {
+    await el.click({ timeout: 4000 });
+  } catch (err) {
+    if (!isStickyScrollOscillation((err as Error).message)) throw err;
+    // force:true clicks at the element's current computed position directly, skipping the
+    // scroll-and-recheck loop entirely that was oscillating — exactly how a sticky element is
+    // actually reachable. If this also fails, the original error still surfaces normally via
+    // the outer catch block (this call is allowed to throw again here, unhandled on purpose).
+    ctx.onLog(`[ActionInventory] "${label}": scroll-then-click oscillated against a likely sticky/fixed element — retrying with a direct (unscrolled) click`);
+    await el.click({ timeout: 4000, force: true });
+  }
+}
+
+// §15 — stuck loading state ("spinner never stops", "button remains disabled indefinitely").
+// Deliberately gated on a spinner actually being observed first (a cheap, near-instant check)
+// rather than adding a long wait to every single click — action-inventory already clicks
+// dozens of elements per page, so an unconditional multi-second wait per click would make the
+// whole sweep impractically slow. Reported as a performance OBSERVATION per this codebase's
+// existing discipline (see web-vitals.ts/spike-load.ts), never asserted as a definitive hang —
+// the request may simply be slow rather than truly stuck.
+const SPINNER_SELECTOR = '[class*="spinner" i], [class*="loading" i]:not(input):not(textarea), [role="progressbar"], [aria-busy="true"]';
+const STUCK_LOADING_TIMEOUT_MS = 8000;
+
+async function checkStuckLoadingState(page: Page, ctx: ExecutorContext, label: string, pageUrl: string): Promise<void> {
+  const spinner = page.locator(SPINNER_SELECTOR).first();
+  if (!(await spinner.isVisible().catch(() => false))) return;
+
+  const deadline = Date.now() + STUCK_LOADING_TIMEOUT_MS;
+  let stillVisible = true;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(500);
+    stillVisible = await spinner.isVisible().catch(() => false);
+    if (!stillVisible) break;
+  }
+
+  if (stillVisible) {
+    ctx.onFinding({
+      severity: 'medium',
+      area: 'UI-Performance',
+      title: `Loading indicator never resolves after clicking "${label}"`,
+      steps: [`Open ${pageUrl}`, `Click "${label}"`, `Wait ${STUCK_LOADING_TIMEOUT_MS / 1000}s`],
+      expected: 'A loading/spinner state should resolve within a reasonable time',
+      actual: `A loading indicator was still visible ${STUCK_LOADING_TIMEOUT_MS / 1000}s after clicking "${label}"`,
+      evidence: [],
+      reproRate: '1/1',
+      automationCandidate: true,
+      pageUrl,
+      confidence: 'heuristic',
+      confidenceReason: 'A performance observation, not a confirmed hang — the underlying request may simply be slow rather than truly stuck, and a longer wait might still resolve it.',
+    });
+  }
+}
+
 async function shot(page: Page, ctx: ExecutorContext, name: string): Promise<string | undefined> {
   const p = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `action-inventory-${name}.png`);
   try {
@@ -76,10 +148,7 @@ async function shot(page: Page, ctx: ExecutorContext, name: string): Promise<str
 }
 
 async function captureState(page: Page): Promise<PageState> {
-  const dialogCount = await page
-    .locator('[role="dialog"]:visible, [role="alertdialog"]:visible')
-    .count()
-    .catch(() => 0);
+  const dialogCount = await countBlockingOverlays(page);
   const bodyLength = await page
     .evaluate(() => (document.body?.innerText ?? '').length)
     .catch(() => 0);
@@ -181,14 +250,29 @@ async function scanCurrentPage(
       continue;
     }
 
+    // A modal left open by an earlier click in THIS SAME scan (one that this flow's own
+    // post-click cleanup below failed to close — e.g. an overlay with no matching close
+    // control) blocks every candidate underneath it identically: each click times out on
+    // "subtree intercepts pointer events" and gets misreported as a distinct "clicking X
+    // threw an error" finding — a cascade of false positives against the target for what is
+    // really one stuck overlay. Check and try to clear it before spending a click attempt.
+    if (await hasBlockingOverlay(page)) {
+      const cleared = await dismissBlockingOverlay(page);
+      if (!cleared) {
+        entries.push({ label, kind, pageUrl: page.url(), result: 'skipped-blocked' });
+        continue;
+      }
+    }
+
     const before = await captureState(page);
     let result: ActionInventoryResult;
     let detail: string | undefined;
     let evidence: string | undefined;
 
     try {
-      await el.click({ timeout: 4000 });
+      await clickWithStickyRetry(el, ctx, label);
       await page.waitForTimeout(500);
+      await checkStuckLoadingState(page, ctx, label, before.url);
       const after = await captureState(page);
 
       if (after.url !== before.url) {
@@ -202,20 +286,33 @@ async function scanCurrentPage(
         await page.waitForTimeout(1200);
       } else if (after.dialogCount > before.dialogCount) {
         result = 'modal';
-        await page.keyboard.press('Escape').catch(() => {});
-        const closeBtn = page
-          .locator('button:has-text("Cancel"), button:has-text("Close"), [aria-label*="close" i]')
-          .first();
-        if (await closeBtn.isVisible().catch(() => false)) {
-          await closeBtn.click().catch(() => {});
-        }
-        await page.waitForTimeout(300);
+        // Use the same close attempt every other caller relies on (Escape → close/cancel
+        // control → click-outside-the-dialog fallback) — if it doesn't fully succeed here,
+        // the pre-click check a few candidates later will catch the leftover overlay instead
+        // of letting it silently cascade into a run of misreported "threw an error" findings.
+        await dismissBlockingOverlay(page);
       } else if (Math.abs(after.bodyLength - before.bodyLength) > 20) {
         result = 'dom-change';
       } else {
-        result = 'no-effect';
-        noEffectLabels.push(label);
-        evidence = await shot(page, ctx, `p${pageIndex}-no-effect-${tested}`);
+        // A nav item for the page you're already ON producing "no effect" is expected
+        // behavior, not a defect — confirmed real false positive (clicking "Dashboard" while
+        // already on /dashboard). aria-current="page" is the ARIA-standard way a nav item
+        // marks itself as the active page; falling back to a loose label-vs-URL-path match
+        // covers the common case where a site doesn't bother with aria-current at all.
+        const ariaCurrent = await el.getAttribute('aria-current').catch(() => null);
+        const labelSlug = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        const isCurrentPageLink =
+          ariaCurrent === 'page' ||
+          (labelSlug.length > 2 && new URL(before.url).pathname.toLowerCase().includes(labelSlug));
+
+        if (isCurrentPageLink) {
+          result = 'no-effect-expected';
+          detail = 'No effect, but this appears to be the nav item for the current page — expected, not flagged as a defect';
+        } else {
+          result = 'no-effect';
+          noEffectLabels.push(label);
+          evidence = await shot(page, ctx, `p${pageIndex}-no-effect-${tested}`);
+        }
       }
     } catch (err) {
       result = 'error';

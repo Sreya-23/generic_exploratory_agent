@@ -65,10 +65,11 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | A9 | Error UI | `error-ui` | ✅ | `findVisibleErrorText` after submit; toast duration (8s); error clears after field correction |
 | A10 | Copy/paste & autofill | `autofill` | ✅ | Browser autofill, paste behaviour, masked field detection |
 | A11 | File upload | `file-upload` | ✅ | Wrong MIME type, 10MB+ file, empty file, cancel mid-upload |
-| A12 | Pagination | `pagination-ui` | ✅ | Last page, jump pages, prev/next disabled states, refresh mid-scroll |
+| A12 | Pagination | `pagination-ui` | ✅ | Last page, jump pages, prev/next disabled states, refresh mid-scroll, search result-count consistency, sort-control reordering, filter-control narrowing |
 | A13 | Multi-step wizard | `wizard` | ✅ | URL step-skip, back on step 3, data persistence across steps |
 | A14 | Malicious file upload content | `file-upload-security` | 📋 | Double extension (`.jpg.exe`), script embedded in SVG, zip bomb, polyglot file — extends A11's MIME/size-only checks |
 | A15 | Internationalization & RTL | `i18n-rtl` | 📋 | RTL layout rendering, bidi/non-Latin text input, locale-specific date/number formats |
+| A16 | Empty-credential login boundary | — | ✅ | Submits the login/OTP form with every field left blank, in its own throwaway browser context before the real login runs. Zero real-account risk (no credential guess made, so it can never count against a lockout counter) — flags silent no-feedback submissions and, most importantly, blank credentials being accepted as valid. Not a scheduled matrix task: runs once from the orchestrator (`runEmptyCredentialLoginCheck` in `run-session.ts`) before `performSessionLogin`, so it has no `FLOW_CLASSES`/`FLOW_HANDLERS` entry. Deliberately does NOT test wrong (non-blank) credentials — that risks tripping the real site's own lockout/fraud-alert policy against a live account and was intentionally scoped out |
 
 ## Navigation & Session
 
@@ -83,6 +84,9 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | B7 | Logout in another tab | `multi-tab-logout` | ✅ | Two-context test; reloads tab 1 after tab 2 logs out |
 | B8 | Bookmark stale URL | — | 📋 | Requires persisted session IDs from prior run |
 | B9 | Concurrent edit / lost update | `concurrent-write` | 📋 | Two sessions/tabs edit the same resource simultaneously; checks for last-write-wins silently discarding one edit vs a conflict warning |
+| B10 | Unexpected external redirect | `navigation` | ✅ | A link queued same-origin at discovery time (external links are filtered out of the BFS queue up front) that lands on a different domain after navigating — a genuine app-initiated redirect, not a link that was external to begin with. Heuristic: SSO/payment-gateway redirects are a common legitimate cause |
+| B11 | Infinite redirect loop | `navigation` | ✅ | Browser-engine-detected redirect loop (ERR_TOO_MANY_REDIRECTS) during BFS traversal, surfaced as its own finding instead of a generic nav-failure log line |
+| B12 | Orphan page (in sitemap, no discoverable link) | `coverage-report` | ✅ | Fetches sitemap.xml (+ any `Sitemap:` entries in robots.txt), compares each listed page against routes actually discovered by crawling — flags any with no discoverable link path |
 
 ## Network & Chaos
 
@@ -124,6 +128,7 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | F7 | Cookie security flags | `cookie-flags` | 📋 | Secure / HttpOnly / SameSite attributes on session cookies |
 | F8 | Clickjacking | `clickjacking-probe` | 📋 | Page frameable via iframe; missing frame-busting / CSP `frame-ancestors` |
 | F9 | Open redirect | `open-redirect` | 📋 | Manipulate redirect/return-url query params to point at an external domain |
+| F10 | Hidden route access | `hidden-route-access` | ✅ | Finds links present in the DOM but hidden/disabled from view, navigates their href directly in the same session, and flags it if the destination renders real content instead of a login wall or permission-denied message — a client-side-only authorization gap |
 
 ## Accessibility
 

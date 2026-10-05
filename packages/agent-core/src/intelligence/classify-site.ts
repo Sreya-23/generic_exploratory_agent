@@ -173,6 +173,36 @@ const RULES: SiteRule[] = [
     },
   },
   {
+    type: 'ai-product',
+    journeys: [
+      'Submit a prompt and verify a response is generated (not exact-match — just present, no error, no stuck loading state)',
+      'Submit an empty prompt and verify graceful validation (not a crash or silent no-op)',
+      'Verify a long-running/streaming response either completes or shows a clear stop/cancel control',
+      'Check behavior when the AI backend is slow — is there a visible "thinking" state, or does the UI look frozen',
+      'Light prompt-injection probe — does asking the assistant to reveal its system instructions produce a suspicious verbatim leak (flagged for human review, not asserted as confirmed)',
+    ],
+    features: ['chat-input', 'ai-response', 'streaming', 'conversation-history'],
+    score(s) {
+      const text = all(s);
+      const strong = countMatches(text, [
+        'ask ai', 'new chat', 'send a message', 'type a message', 'type your message',
+        'ai assistant', 'chat with', 'regenerate response', 'stop generating',
+        'copilot', 'chatbot',
+      ]);
+      const medium = countMatches(text, [
+        'prompt', 'generate', 'assistant', 'gpt', 'llm', 'chat', 'conversation',
+        'thinking...', 'ai-powered', 'ai powered',
+      ]);
+      // Down-weight if strong ecommerce/booking/fintech signals are also present — a lot of
+      // ordinary SaaS products now bolt on a small "ask AI" widget without being AI-native
+      // products themselves; the bolt-on case shouldn't hijack the whole site's classification.
+      const hasOtherStrongDomain = countMatches(text, [
+        'add to cart', 'checkout', 'book now', 'balance', 'transfer',
+      ]) > 0;
+      return strong * 0.22 + medium * 0.06 - (hasOtherStrongDomain ? 0.3 : 0);
+    },
+  },
+  {
     type: 'fintech',
     journeys: [
       'View account balance / dashboard',

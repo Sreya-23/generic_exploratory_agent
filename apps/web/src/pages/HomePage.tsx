@@ -30,14 +30,11 @@ export function HomePage() {
         <h1>Generic Exploratory QA Agent</h1>
         <p>
           Intelligently explore any web application for edge cases, interruptions, API issues,
-          and chaos scenarios — with or without a PRD.
+          and chaos scenarios.
         </p>
         <div className="hero-actions">
           <Link to="/chat" className="btn btn-primary">
             Start with Chat
-          </Link>
-          <Link to="/setup" className="btn btn-secondary">
-            Classic Setup
           </Link>
         </div>
       </section>

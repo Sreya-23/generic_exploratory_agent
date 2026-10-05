@@ -2,11 +2,27 @@
 // only. This flow opens the same landing page in Firefox and WebKit too, and flags
 // meaningful divergence (console errors, missing content, broken layout) that a
 // Chromium-only run structurally cannot see.
-import { firefox, webkit, type Browser } from 'playwright';
+import { chromium, firefox, webkit, type Browser } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
 import type { Page } from 'playwright';
 import { join } from 'node:path';
-import { savedSessionStatePath, restoreSessionStorage, waitForRealContent } from './helpers.js';
+import { savedSessionStatePath, restoreSessionStorage, waitForRealContent, waitForTitleStable } from './helpers.js';
+
+// Ground truth for the report's environment-comparison grid: findings alone only ever record
+// failures, so without this, a page that PASSED in an environment would render as a blank cell
+// rather than a ✓ — indistinguishable from "never checked."
+function recordCheck(
+  ctx: ExecutorContext,
+  pageUrl: string,
+  environment: string,
+  ok: boolean,
+  note?: string,
+): void {
+  ctx.environmentChecks = [
+    ...(ctx.environmentChecks ?? []),
+    { pageUrl, environment, kind: 'browser', ok, note },
+  ];
+}
 
 interface EngineSignals {
   engine: string;
@@ -17,35 +33,6 @@ interface EngineSignals {
   consoleErrors: string[];
   loadError?: string;
   screenshotPath?: string;
-}
-
-/**
- * Wait until document.title stops changing, rather than a fixed delay. Different browser
- * engines take genuinely different, variable amounts of time to run the same client-side JS
- * (an SPA setting its title post-load, for instance) — a fixed wait that happens to be enough
- * for one engine is routinely not enough for another, producing a false "differs" finding
- * that's really just a race, not a real difference.
- *
- * Requires the title to be unchanged across TWO consecutive checks, not one, after an initial
- * grace period. Checking only once is indistinguishable between "already settled" and "hasn't
- * started changing yet" — sampled a beat before the update begins, both look identical, and a
- * single-check version returns "stable" while genuinely still mid-change.
- */
-async function waitForTitleStable(page: Page, timeoutMs = 5000): Promise<void> {
-  await page.waitForTimeout(1000); // let a title-changing script have a real chance to start
-  const deadline = Date.now() + timeoutMs;
-  let last = await page.title().catch(() => '');
-  let stableRounds = 0;
-  while (Date.now() < deadline && stableRounds < 2) {
-    await page.waitForTimeout(300);
-    const current = await page.title().catch(() => '');
-    if (current === last) {
-      stableRounds++;
-    } else {
-      stableRounds = 0;
-      last = current;
-    }
-  }
 }
 
 async function collectSignals(page: Page, engine: string): Promise<EngineSignals> {
@@ -131,22 +118,35 @@ async function checkEngine(
 }
 
 /**
- * `page` here is the existing Chromium page (used as the baseline); this flow additionally
- * launches Firefox and WebKit against the same URL and compares.
+ * Checks ONE url across Firefox/WebKit against a Chromium baseline and emits findings.
+ * `liveChromiumPage`, when given, is reused for the baseline (saves a browser launch for
+ * whichever page the task is already sitting on) — otherwise a fresh Chromium instance is
+ * launched for the baseline too, exactly like checkEngine() already does for the other two
+ * engines, so every additional page gets the same three-way comparison, not a degraded one.
  */
-export async function runCrossBrowserCheck(
-  page: Page,
+async function checkPageAcrossEngines(
+  targetUrl: string,
   ctx: ExecutorContext,
-  _task: FlowTask,
+  liveChromiumPage: Page | null,
 ): Promise<void> {
-  const targetUrl = page.url();
   ctx.onLog(`[CrossBrowser] Checking ${targetUrl} in Firefox and WebKit against the Chromium baseline`);
 
-  // Same stability wait as checkEngine() uses for Firefox/WebKit below, so all three engines
-  // are captured on equal footing regardless of which one happens to settle slower this run.
-  await waitForTitleStable(page);
-  await waitForRealContent(page);
-  const chromiumSignals = await collectSignals(page, 'chromium');
+  let chromiumSignals: EngineSignals;
+  if (liveChromiumPage) {
+    // Same stability wait as checkEngine() uses for Firefox/WebKit below, so all three
+    // engines are captured on equal footing regardless of which one settles slower.
+    await waitForTitleStable(liveChromiumPage);
+    await waitForRealContent(liveChromiumPage);
+    chromiumSignals = await collectSignals(liveChromiumPage, 'chromium');
+  } else {
+    chromiumSignals = await checkEngine(chromium, 'chromium', targetUrl, ctx);
+    if (chromiumSignals.loadError) {
+      recordCheck(ctx, targetUrl, 'Chromium', false, chromiumSignals.loadError);
+      ctx.onLog(`[CrossBrowser] Chromium itself failed to load ${targetUrl} — skipping this page's comparison entirely (nothing to baseline against)`);
+      return;
+    }
+  }
+  recordCheck(ctx, targetUrl, 'Chromium', true);
 
   const [firefoxSignals, webkitSignals] = await Promise.all([
     checkEngine(firefox, 'firefox', targetUrl, ctx),
@@ -154,7 +154,9 @@ export async function runCrossBrowserCheck(
   ]);
 
   for (const other of [firefoxSignals, webkitSignals]) {
+    const engineLabel = other.engine.charAt(0).toUpperCase() + other.engine.slice(1);
     if (other.loadError) {
+      recordCheck(ctx, targetUrl, engineLabel, false, other.loadError);
       ctx.onFinding({
         severity: 'high',
         area: 'CrossBrowser',
@@ -200,6 +202,7 @@ export async function runCrossBrowserCheck(
     }
 
     if (issues.length > 0) {
+      recordCheck(ctx, targetUrl, engineLabel, false, issues.join('; '));
       ctx.onFinding({
         severity: 'medium',
         area: 'CrossBrowser',
@@ -212,7 +215,48 @@ export async function runCrossBrowserCheck(
         automationCandidate: true,
       });
     } else {
+      recordCheck(ctx, targetUrl, engineLabel, true);
       ctx.onLog(`[CrossBrowser] ${other.engine} matches Chromium baseline — no divergence detected`);
+    }
+  }
+}
+
+// Pages whose URL suggests real interactive/transactional content are where a cross-engine
+// rendering difference is actually likely to matter (a form that silently fails to render in
+// WebKit is a real problem; a static content page rendering identically everywhere is much
+// less likely to diverge in the first place) — preferred over an arbitrary alternate page.
+const HIGH_VALUE_PATH_HINT = /checkout|payment|pay|form|create|edit|settings|cart|invoice|collect/i;
+
+function pickAdditionalPage(currentUrl: string, discoveredRoutes: string[] | undefined): string | null {
+  if (!discoveredRoutes || discoveredRoutes.length === 0) return null;
+  const candidates = discoveredRoutes.filter((u) => u !== currentUrl);
+  if (candidates.length === 0) return null;
+  return candidates.find((u) => HIGH_VALUE_PATH_HINT.test(u)) ?? candidates[0];
+}
+
+/**
+ * `page` here is the existing Chromium page (used as the baseline for whichever page the
+ * task is already on); this flow additionally launches Firefox and WebKit against that same
+ * URL and compares — and, at standard/deep depth, does the same three-way comparison again
+ * for one more discovered page, since a single landing-page spot-check structurally cannot
+ * catch a rendering divergence that only shows up on a form/checkout/settings page it never
+ * visits. Bounded to exactly one extra page — each one costs 3 more browser launches.
+ */
+export async function runCrossBrowserCheck(
+  page: Page,
+  ctx: ExecutorContext,
+  _task: FlowTask,
+): Promise<void> {
+  const currentUrl = page.url();
+  await checkPageAcrossEngines(currentUrl, ctx, page);
+
+  if (ctx.config.depth === 'standard' || ctx.config.depth === 'deep') {
+    const extraUrl = pickAdditionalPage(currentUrl, ctx.discoveredRoutes);
+    if (extraUrl) {
+      ctx.onLog(`[CrossBrowser] Also checking a second discovered page: ${extraUrl}`);
+      await checkPageAcrossEngines(extraUrl, ctx, null);
+    } else {
+      ctx.onLog('[CrossBrowser] No additional discovered page available to check beyond the current one');
     }
   }
 }

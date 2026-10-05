@@ -84,22 +84,12 @@ export function sessionEventToChatMessage(event: SessionEvent): ChatMessage | nu
       const s = event.payload as SessionState;
       const critical = s.findings.filter((f) => f.severity === 'critical').length;
       const high = s.findings.filter((f) => f.severity === 'high').length;
-      const coverageLine = s.prdCoverage
-        ? `\n\n📋 **PRD coverage:** ${s.prdCoverage.passedCount} passed · ${s.prdCoverage.failedCount} failed · ${s.prdCoverage.gaps.length} gaps · ${s.prdCoverage.blocked.length} blocked`
-        : '';
       return msg(
         'assistant',
         `✅ Exploration complete — **${s.findings.length} findings** recorded (${critical} critical, ${high} high).` +
-          (s.config.prdPath ? `\nMode was **PRD-only**.` : '') +
-          coverageLine +
           `\n\nOpen the **Report** page to view the full write-up, or download Markdown / HTML.`,
         { kind: 'status' },
       );
-    }
-
-    case 'prd:coverage': {
-      const p = event.payload as { summary?: string };
-      return msg('assistant', p.summary ?? 'PRD coverage ready.', { kind: 'status' });
     }
 
     case 'session:failed': {

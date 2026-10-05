@@ -1,11 +1,11 @@
 # Generic Exploratory QA Agent
 
-A project-agnostic exploratory testing agent with an interactive UI. Explore any web application for edge cases, chaos scenarios, API issues, and regression — with or without a PRD.
+A project-agnostic exploratory testing agent with an interactive UI. Explore any web application for edge cases, chaos scenarios, API issues, and regression.
 
 ## Features
 
-- **Interactive UI** — configure target URL, upload PRD, pick exploration areas
-- **No PRD required** — generic baseline protocol for any public site
+- **Interactive UI** — configure target URL, pick exploration areas
+- **Generic baseline protocol** — works out of the box for any public site
 - **Chaos testing** — back button mid-POST, offline recovery, double-submit on slow network
 - **Live findings** — WebSocket stream with severity-tagged results
 - **Export reports** — Markdown and HTML
@@ -29,7 +29,7 @@ npm run dev
 1. Open http://localhost:5173
 2. Click **Start New Exploration**
 3. Enter target URL (e.g. `https://example.com`)
-4. Optionally add context, PRD, credentials
+4. Optionally add context, credentials
 5. Select exploration areas and depth
 6. Watch live findings stream in
 7. Export report when complete
@@ -56,9 +56,8 @@ generic_exploratory_agent/
 │   ├── agent-core/   # Planner, orchestrator, reporter
 │   ├── explorer-ui/  # Playwright UI executor
 │   ├── explorer-api/ # HTTP API executor
-│   ├── chaos-engine/ # Network chaos executor
-│   └── prd-parser/   # PRD file parser
-├── .cursor/skills/   # Cursor IDE skill
+│   └── chaos-engine/ # Network chaos executor
+├── .claude/skills/   # Claude Code skill
 └── sessions/         # Runtime output (gitignored)
 ```
 
@@ -74,12 +73,12 @@ generic_exploratory_agent/
 | GET | `/api/sessions/:id/report?format=md\|html\|json` | Export report |
 | WS | `/api/sessions/:id/ws` | Live event stream |
 
-## Cursor Skill
+## Claude Code Skill
 
-Use inside Cursor IDE for PRD-driven or generic exploratory testing:
+Invocable in Claude Code (`/generic-exploratory-qa`) for generic exploratory testing:
 
 ```
-.cursor/skills/generic-exploratory-qa/SKILL.md
+.claude/skills/generic-exploratory-qa/SKILL.md
 ```
 
 ## Environment Variables

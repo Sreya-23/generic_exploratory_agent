@@ -30,9 +30,6 @@ export function AppShell({ children }: { children: ReactNode }) {
           >
             Chat Setup
           </Link>
-          <Link to="/setup" className={location.pathname === '/setup' ? 'active' : ''}>
-            Form Setup
-          </Link>
         </nav>
         <Link to="/chat" className="btn btn-primary btn-sm new-session-btn" onClick={startNewSession}>
           + New Session

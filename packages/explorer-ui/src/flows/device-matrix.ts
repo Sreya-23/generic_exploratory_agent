@@ -10,12 +10,22 @@ import { chromium, firefox, webkit, devices, type Browser } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
 import type { Page } from 'playwright';
 import { join } from 'node:path';
-import { savedSessionStatePath, restoreSessionStorage, waitForRealContent, isLoginWallPage } from './helpers.js';
+import { savedSessionStatePath, restoreSessionStorage, waitForRealContent, waitForTitleStable, isLoginWallPage } from './helpers.js';
 import { matchesKnownNonBugPattern } from './non-bug-patterns.js';
 
 interface DeviceProfile {
   name: string;
   category: 'phone' | 'tablet';
+}
+
+// Ground truth for the report's environment-comparison grid: findings alone only ever record
+// failures, so without this, a device that PASSED would render as a blank cell rather than a
+// ✓ — indistinguishable from "never checked."
+function recordCheck(ctx: ExecutorContext, pageUrl: string, environment: string, ok: boolean, note?: string): void {
+  ctx.environmentChecks = [
+    ...(ctx.environmentChecks ?? []),
+    { pageUrl, environment, kind: 'device', ok, note },
+  ];
 }
 
 const DEVICE_CATALOG: DeviceProfile[] = [
@@ -45,6 +55,11 @@ interface DeviceSignals {
   interactiveCount: number;
   hoverOnlyCount: number;
   hoverOnlyLabels: string[];
+  /** Horizontal overflow at this device's OWN real width/UA/touch profile — distinct from
+   *  viewport.ts (arbitrary resized-Chromium widths) and zoom-reflow.ts (desktop zoom levels):
+   *  a layout that only breaks at, say, the Galaxy Z Fold 6's near-square 928px width would
+   *  never be exercised by either of those. */
+  overflowPx: number;
   /** Set when the rendered text matches a known legitimate pattern (app-gate, cookie banner,
    *  maintenance page, etc.) — sparse content here is by design, not a rendering defect. */
   nonBugPattern: string | null;
@@ -93,11 +108,13 @@ async function checkDevice(
         interactiveCount: 0,
         hoverOnlyCount: 0,
         hoverOnlyLabels: [],
+        overflowPx: 0,
         nonBugPattern: null,
         loadError: (err as Error).message.slice(0, 200),
       };
     }
     await waitForRealContent(page);
+    await waitForTitleStable(page);
 
     const title = await page.title().catch(() => '');
     const bodyText = await page
@@ -140,6 +157,17 @@ async function checkDevice(
       })
       .catch(() => [] as string[]);
 
+    // body.scrollWidth vs. documentElement.clientWidth — the same measurement zoom-reflow.ts
+    // already validated as reliable (documentElement.scrollWidth itself was found to balloon
+    // independent of real overflow under certain zoom/device conditions).
+    const overflowPx = await page
+      .evaluate(() => {
+        const scrollWidth = document.body?.scrollWidth ?? document.documentElement.scrollWidth;
+        const clientWidth = document.documentElement.clientWidth;
+        return Math.max(0, scrollWidth - clientWidth);
+      })
+      .catch(() => 0);
+
     let screenshotPath: string | undefined;
     let screenshotError: string | undefined;
     try {
@@ -172,6 +200,7 @@ async function checkDevice(
       interactiveCount,
       hoverOnlyCount: hoverOnly.length,
       hoverOnlyLabels: hoverOnly,
+      overflowPx,
       nonBugPattern,
       screenshotPath,
       screenshotError,
@@ -186,16 +215,24 @@ async function checkDevice(
       interactiveCount: 0,
       hoverOnlyCount: 0,
       hoverOnlyLabels: [],
+      overflowPx: 0,
       nonBugPattern: null,
       loadError: (err as Error).message.slice(0, 200),
     };
   }
 }
 
-export async function runDeviceMatrixCheck(
+/**
+ * Checks the CURRENT page (page.url(), re-navigated fresh as this function's own first step)
+ * across the device catalog. Kept as its own function so runDeviceMatrixCheck below can call
+ * it twice — once for whatever page the task landed on, once more (deep depth only) for an
+ * additional discovered page repositioned onto the same shared `page` first — without
+ * threading a parallel "fresh baseline" code path through this already-involved function.
+ */
+async function checkDeviceMatrixForCurrentPage(
   page: Page,
   ctx: ExecutorContext,
-  _task: FlowTask,
+  deviceCountOverride?: number,
 ): Promise<void> {
   const targetUrl = page.url();
   ctx.onLog(`[DeviceMatrix] Checking ${targetUrl} across real device profiles (phone + tablet, iOS + Android engines)`);
@@ -203,9 +240,11 @@ export async function runDeviceMatrixCheck(
   // smoke/chaos: one quick sample. standard: iOS + Android, phone + tablet (the original
   // 4-device core). deep: the full catalog, including small-screen, landscape, and
   // foldable profiles — each a genuinely distinct layout mode, not just "more of the same."
-  const deviceCount = ctx.config.depth === 'smoke' || ctx.config.depth === 'chaos' ? 1
-    : ctx.config.depth === 'deep' ? DEVICE_CATALOG.length
-    : 4;
+  const deviceCount =
+    deviceCountOverride ??
+    (ctx.config.depth === 'smoke' || ctx.config.depth === 'chaos' ? 1
+      : ctx.config.depth === 'deep' ? DEVICE_CATALOG.length
+      : 4);
   const profiles = DEVICE_CATALOG.slice(0, deviceCount);
 
   // Reload fresh before measuring the baseline — each device check below does a brand-new
@@ -214,6 +253,7 @@ export async function runDeviceMatrixCheck(
   // makes real device differences indistinguishable from "the baseline just hadn't loaded yet."
   await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
   await waitForRealContent(page);
+  await waitForTitleStable(page);
   // If auth was expected but the baseline page is still a login/OTP wall, a "content differs"
   // finding below could reflect a real device bug OR just this session's login never having
   // completed — surfaced as an extra confidence caveat rather than skipped, since real bugs
@@ -231,10 +271,13 @@ export async function runDeviceMatrixCheck(
     .count()
     .catch(() => 0);
 
+  recordCheck(ctx, targetUrl, 'Desktop (baseline)', !baselineOnLoginWall, baselineOnLoginWall ? 'Baseline page was still on a login/OTP wall' : undefined);
+
   const results = await Promise.all(profiles.map((p) => checkDevice(p, targetUrl, ctx)));
 
   for (const r of results) {
     if (!r.loaded) {
+      recordCheck(ctx, targetUrl, r.device, false, r.loadError);
       ctx.onFinding({
         severity: 'medium',
         area: 'DeviceMatrix',
@@ -253,6 +296,8 @@ export async function runDeviceMatrixCheck(
     const titleDiffers = r.title !== baselineTitle;
     const contentShrunk = baselineBodyLength > 0 && r.bodyTextLength < baselineBodyLength * 0.5;
     const fewerInteractive = baselineInteractive > 0 && r.interactiveCount < baselineInteractive * 0.5;
+    let deviceOk = true;
+    const deviceNotes: string[] = [];
 
     if (r.nonBugPattern) {
       // A known legitimate pattern (app-download gate, cookie banner, maintenance page, etc.)
@@ -270,6 +315,8 @@ export async function runDeviceMatrixCheck(
       // design." Surfaced in both the visible actual text (so it's not silently missing) and
       // the confidence note (so it can upgrade confidence when it's a crash specifically).
       const crashed = !!r.screenshotError?.toLowerCase().includes('crash');
+      deviceOk = false;
+      deviceNotes.push('content/title differs from desktop baseline');
       ctx.onFinding({
         severity: 'medium',
         area: 'DeviceMatrix',
@@ -293,9 +340,43 @@ export async function runDeviceMatrixCheck(
               ? ' This session may not have completed login — verify this issue reproduces with a genuinely authenticated session, not just an auth-wall stub.'
               : ''),
       });
+    } else if (r.screenshotError) {
+      // The device's own measurements (title/content/interactive count) matched baseline, so
+      // the branch above never fires — but a screenshot failure is still real, independent
+      // signal (see the comment on the `crashed` check above) that would otherwise vanish
+      // with zero trace once the session ends, since ctx.onLog output isn't persisted anywhere
+      // after the live stream closes. A crash gets reported properly (medium, verified); a
+      // non-crash failure (timeout, etc.) is downgraded to info — evidence is genuinely
+      // missing for this device, not evidence of a defect, but a reader should still know
+      // this device profile couldn't be visually confirmed rather than assuming it was.
+      const crashed = r.screenshotError.toLowerCase().includes('crash');
+      if (crashed) {
+        deviceOk = false;
+        deviceNotes.push('rendering engine crashed while compositing');
+      }
+      ctx.onFinding({
+        severity: crashed ? 'medium' : 'info',
+        area: 'DeviceMatrix',
+        title: crashed
+          ? `Rendering engine crashed while compositing ${r.device}`
+          : `No visual evidence captured for ${r.device} — screenshot failed`,
+        steps: [`Open ${targetUrl} on ${r.device}`],
+        expected: 'Page renders and a screenshot can be captured for evidence',
+        actual: `Content/title measurements matched the desktop baseline, but the screenshot itself failed: ${r.screenshotError}`,
+        evidence: [],
+        reproRate: '1/1',
+        automationCandidate: false,
+        pageUrl: targetUrl,
+        confidence: crashed ? 'verified' : 'heuristic',
+        confidenceReason: crashed
+          ? `The rendering engine itself crashed while compositing this page ("${r.screenshotError}") — independent evidence of a real cross-engine problem, separate from the content-diff check above.`
+          : 'A one-off screenshot failure (not a crash) — could be a transient timing issue rather than a real device-specific problem. Flagged as info because this device\'s visual state is genuinely unverified, not because a defect is confirmed.',
+      });
     }
 
     if (r.hoverOnlyCount > 0) {
+      deviceOk = false;
+      deviceNotes.push(`${r.hoverOnlyCount} hover-only element(s)`);
       ctx.onFinding({
         severity: 'medium',
         area: 'DeviceMatrix',
@@ -313,9 +394,71 @@ export async function runDeviceMatrixCheck(
       });
     }
 
+    // A meaningful margin above noise (sub-pixel rounding, scrollbar width) — matches the same
+    // threshold reasoning as element-overflow.ts's own overflow check.
+    if (r.overflowPx > 5) {
+      deviceOk = false;
+      deviceNotes.push(`${r.overflowPx}px horizontal overflow`);
+      ctx.onFinding({
+        severity: 'medium',
+        area: 'DeviceMatrix',
+        title: `Horizontal scroll required on ${r.device}`,
+        steps: [`Open ${targetUrl} on ${r.device}`, 'Observe that content extends beyond the visible width'],
+        expected: 'No horizontal scrolling on any device profile — content should reflow to fit the viewport',
+        actual: `Content is ${r.overflowPx}px wider than this device's viewport`,
+        evidence: r.screenshotPath ? [r.screenshotPath] : [],
+        reproRate: '1/1',
+        automationCandidate: true,
+        pageUrl: targetUrl,
+        confidence: 'verified',
+        confidenceReason: `Direct DOM measurement (scrollWidth vs. clientWidth) at ${r.device}'s real width/UA — not a resized desktop browser window (viewport.ts) or a desktop zoom level (zoom-reflow.ts), so this can catch overflow specific to this device's actual dimensions.`,
+      });
+    }
+
+    recordCheck(ctx, targetUrl, r.device, deviceOk, deviceNotes.join('; ') || undefined);
+
     ctx.onLog(
       `[DeviceMatrix] ${r.device}: title="${r.title}", content=${r.bodyTextLength} chars, ` +
-        `interactive=${r.interactiveCount}, hover-only=${r.hoverOnlyCount}`,
+        `interactive=${r.interactiveCount}, hover-only=${r.hoverOnlyCount}, overflow=${r.overflowPx}px`,
     );
+  }
+}
+
+// Same reasoning as cross-browser.ts: a device-matrix pass on only the landing page can't
+// catch a layout that breaks specifically on a form/checkout/settings page it never visits.
+// Reuses the exact keyword hint cross-browser.ts already uses for the same "which extra page
+// is actually worth checking" judgment, rather than a second, divergent heuristic.
+const HIGH_VALUE_PATH_HINT = /checkout|payment|pay|form|create|edit|settings|cart|invoice|collect/i;
+
+function pickAdditionalPage(currentUrl: string, discoveredRoutes: string[] | undefined): string | null {
+  if (!discoveredRoutes || discoveredRoutes.length === 0) return null;
+  const candidates = discoveredRoutes.filter((u) => u !== currentUrl);
+  if (candidates.length === 0) return null;
+  return candidates.find((u) => HIGH_VALUE_PATH_HINT.test(u)) ?? candidates[0];
+}
+
+export async function runDeviceMatrixCheck(
+  page: Page,
+  ctx: ExecutorContext,
+  _task: FlowTask,
+): Promise<void> {
+  const currentUrl = page.url();
+  await checkDeviceMatrixForCurrentPage(page, ctx);
+
+  // Only at deep depth, and capped to the core 4-device set regardless of the overall depth's
+  // own device count — this already runs up to 8 profiles concurrently for ONE page; a second
+  // full 8-device pass would double an already-heavy step for one supplementary check.
+  if (ctx.config.depth === 'deep') {
+    const extraUrl = pickAdditionalPage(currentUrl, ctx.discoveredRoutes);
+    if (extraUrl) {
+      ctx.onLog(`[DeviceMatrix] Also checking a second discovered page: ${extraUrl}`);
+      await page.goto(extraUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+      await checkDeviceMatrixForCurrentPage(page, ctx, 4);
+      // Return the shared page to where it started — later tasks in this session shouldn't
+      // silently inherit "wherever device-matrix happened to leave it."
+      await page.goto(currentUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    } else {
+      ctx.onLog('[DeviceMatrix] No additional discovered page available to check beyond the current one');
+    }
   }
 }

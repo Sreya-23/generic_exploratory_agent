@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { basename, extname } from 'node:path';
 import type {
+  AccessMapEntry,
+  EnvironmentCheck,
   ExplorationPlan,
   Finding,
   FlowTask,
@@ -9,6 +11,7 @@ import type {
   Severity,
 } from '@qa/shared';
 import { computeHealthScore, FLOW_TITLES } from '@qa/shared';
+import { dedupeFindingsWithAI, summarizeWithAI, validateFindingsWithAI } from './ai-report-enhance.js';
 
 const IMAGE_MIME: Record<string, string> = {
   '.png': 'image/png',
@@ -535,6 +538,48 @@ function buildFlowsMarkdown(flows: FlowCoverageRow[]): string {
   return lines.join('\n');
 }
 
+/**
+ * §2 — a lightweight hierarchical application map, built by grouping discoveredRoutes by
+ * top-level path segment. Not a hand-curated feature tree (this codebase has no concept of
+ * "Authentication" or "Settings" as named modules) — a real, evidence-based grouping of what
+ * was actually discovered, which is what's actually available to build one from.
+ */
+/** The persistent per-CATEGORY knowledge-base doc (site-knowledge-base.ts), when one exists
+ *  for this target's classified site type — generated once the first time that category is
+ *  seen (from whichever site happened to be first), reused silently for every other site that
+ *  classifies into the same category after. */
+function buildSiteKnowledgeMarkdown(state: SessionState): string {
+  if (!state.siteKnowledge) return '';
+  return ['## Application Knowledge Base', '', state.siteKnowledge, ''].join('\n');
+}
+
+function buildApplicationMapMarkdown(state: SessionState): string {
+  const routes = state.discoveredRoutes ?? [];
+  if (routes.length === 0) return '';
+
+  const groups = new Map<string, string[]>();
+  for (const route of routes) {
+    let path: string;
+    try {
+      path = new URL(route).pathname;
+    } catch {
+      path = route;
+    }
+    const segment = path.split('/').filter(Boolean)[0] ?? '';
+    const key = segment || '(root)';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(path);
+  }
+
+  const lines: string[] = ['## Application Map', '', 'Discovered routes grouped by top-level section:', ''];
+  for (const [segment, paths] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    lines.push(`- **/${segment}**`);
+    for (const p of [...new Set(paths)].sort()) lines.push(`  - ${p}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
 function buildPageCoverageMarkdown(state: SessionState): string {
   const discovered = state.discoveredRoutes ?? [];
   const visited = new Set(state.visitedRoutes ?? []);
@@ -552,6 +597,100 @@ function buildPageCoverageMarkdown(state: SessionState): string {
   if (notVisited.length > 0) {
     lines.push('**Not visited:**', '', ...notVisited.map((r) => `- ${r}`), '');
   }
+  return lines.join('\n');
+}
+
+function shortenPageUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return (u.pathname === '/' ? u.pathname : u.pathname.replace(/\/$/, '')) + u.search || '/';
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * The "does behavior differ between environments" grid — page × browser/device, ✓/✗ — that
+ * distinguishes this from a generic per-mismatch findings list. Built from environmentChecks
+ * (recorded for every check regardless of outcome), not from findings alone: findings only
+ * ever record the ✗ side, so a page/environment pair that genuinely passed would otherwise
+ * render as an indistinguishable blank rather than a real ✓.
+ */
+function buildEnvironmentMatrixMarkdown(state: SessionState): string {
+  const checks = state.environmentChecks ?? [];
+  if (checks.length === 0) return '';
+
+  const pages = [...new Set(checks.map((c) => c.pageUrl))];
+
+  // Browsers first (Chromium baseline pinned first), then devices — both in first-seen order
+  // rather than alphabetical, so the grid reads baseline-then-comparison left to right
+  // regardless of which page happened to be checked first.
+  const browserEnvs: string[] = [];
+  const deviceEnvs: string[] = [];
+  for (const c of checks) {
+    const bucket = c.kind === 'browser' ? browserEnvs : deviceEnvs;
+    if (!bucket.includes(c.environment)) bucket.push(c.environment);
+  }
+  browserEnvs.sort((a, b) => (a === 'Chromium' ? -1 : b === 'Chromium' ? 1 : 0));
+  const environments = [...browserEnvs, ...deviceEnvs];
+
+  const byPageEnv = new Map<string, EnvironmentCheck>();
+  for (const c of checks) byPageEnv.set(`${c.pageUrl}\u0000${c.environment}`, c);
+
+  const lines: string[] = [
+    '## Environment Comparison',
+    '',
+    'Every page × browser/device combination actually checked this session, and whether it matched the baseline — not just the individual mismatches listed under Findings.',
+    '',
+    `| Page | ${environments.join(' | ')} |`,
+    `|------|${environments.map(() => '------').join('|')}|`,
+  ];
+
+  const notes: string[] = [];
+  for (const pageUrl of pages) {
+    const shortUrl = shortenPageUrl(pageUrl);
+    const cells = environments.map((env) => {
+      const c = byPageEnv.get(`${pageUrl}\u0000${env}`);
+      if (!c) return '—';
+      if (c.ok) return '✓';
+      if (c.note) notes.push(`- **${shortUrl}** × ${env}: ${c.note}`);
+      return '✗';
+    });
+    lines.push(`| ${shortUrl} | ${cells.join(' | ')} |`);
+  }
+  lines.push('');
+  if (notes.length > 0) {
+    lines.push('**✗ details:**', '', ...notes, '');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * §18 — role/authorization access map, built from every UI-hidden link that was actually
+ * checked for direct reachability this session. Reflects the SINGLE currently-authenticated
+ * role, not a side-by-side Admin/Manager/User comparison — see AccessMapEntry's own comment
+ * for why a true multi-role grid isn't built here (would need multiple real credential sets
+ * and multiple real logins against what may be a live account).
+ */
+function buildAccessMapMarkdown(state: SessionState): string {
+  const entries: AccessMapEntry[] = state.accessMap ?? [];
+  if (entries.length === 0) return '';
+
+  const lines: string[] = [
+    '## Access Map',
+    '',
+    'UI-hidden links found in the DOM, checked for direct reachability under the current session\'s authenticated role. This is not a cross-role comparison (see note below) — only whether hiding something in the UI is actually backed by a real access control.',
+    '',
+    '| Feature/Link | Visible in UI | Directly Reachable | Note |',
+    '|---|---|---|---|',
+    ...entries.map(
+      (e) =>
+        `| ${e.feature.replace(/\|/g, '\\|')} | ✗ | ${e.directlyReachable ? '✓' : '✗'} | ${e.note ?? ''} |`,
+    ),
+    '',
+    '_A true multi-role (Admin vs. Manager vs. User) access matrix would require multiple real credential sets and multiple real logins, which this session\'s single-login architecture doesn\'t support without added risk to a live account._',
+    '',
+  ];
   return lines.join('\n');
 }
 
@@ -650,11 +789,33 @@ function buildInfoNotesMarkdown(groups: AreaFindingGroup[]): string {
   return lines.join('\n');
 }
 
-export function generateSessionReport(state: SessionState): SessionReport {
+export async function generateSessionReport(state: SessionState): Promise<SessionReport> {
   const targetUrl = state.config.targetUrl;
-  const findings = sortFindings(dedupeFindings(state.findings)).map((f) =>
+  // Deterministic dedup always runs and is the guaranteed result; the AI pass on top of it
+  // is a strict upgrade attempt that only ever REMOVES additional duplicates the token-
+  // overlap heuristic missed — it returns null (keep going with what we have) on anything
+  // from an unset API key to a malformed response, never blocking report generation.
+  const deterministicallyDeduped = dedupeFindings(state.findings);
+  const aiDeduped = await dedupeFindingsWithAI(deterministicallyDeduped).catch(() => null);
+  let findings = sortFindings(aiDeduped ?? deterministicallyDeduped).map((f) =>
     withReproSteps(f, targetUrl),
   );
+
+  // §30 — Validator pass: a second-opinion sanity check on heuristic-confidence findings,
+  // additive only (see validateFindingsWithAI's own doc comment for why nothing is ever
+  // dropped, only annotated).
+  const validations = await validateFindingsWithAI(findings).catch(() => null);
+  if (validations) {
+    findings = findings.map((f, i) => {
+      const v = validations.get(i);
+      if (!v || v.plausible) return f;
+      const note = `⚠ Automated second-pass check flagged this as possibly not a real defect: ${v.note}`;
+      return {
+        ...f,
+        confidenceReason: f.confidenceReason ? `${f.confidenceReason} ${note}` : note,
+      };
+    });
+  }
   // "info" severity is structurally not a defect — computeHealthScore already gives it zero
   // penalty and excludes it from the issue count — so it doesn't belong mixed into a
   // "Findings" list that's otherwise exclusively real bugs (a QA discovering "GET /api/x
@@ -669,13 +830,23 @@ export function generateSessionReport(state: SessionState): SessionReport {
   const flowsCovered = buildFlowCoverage(state.plan, findings, targetUrl);
   const findingsByArea = groupFindingsByArea(bugFindings);
   const infoByArea = groupFindingsByArea(infoFindings);
-  const executiveSummary = buildExecutiveSummary(
+  const templatedSummary = buildExecutiveSummary(
     state,
     bySeverity,
     bugFindings.length,
     flowsCovered.length,
     healthScore,
   );
+  // Same pattern: the templated summary is always computed and is the guaranteed fallback;
+  // the AI version only replaces it if it comes back and passes basic sanity bounds.
+  const aiSummary = await summarizeWithAI(
+    bugFindings,
+    bySeverity,
+    healthScore,
+    state.classification?.siteType,
+    targetUrl,
+  ).catch(() => null);
+  const executiveSummary = aiSummary ?? templatedSummary;
   const recommendedNextSteps = buildRecommendedNextSteps(bugFindings, bySeverity);
   const date = state.updatedAt || state.createdAt || new Date().toISOString();
   const areas = state.config.areas.join(', ') || 'n/a';
@@ -687,8 +858,12 @@ export function generateSessionReport(state: SessionState): SessionReport {
     '',
     buildOverviewMarkdown(state, flowsCovered, bugFindings),
     buildFlowsMarkdown(flowsCovered),
+    buildSiteKnowledgeMarkdown(state),
+    buildApplicationMapMarkdown(state),
     buildPageCoverageMarkdown(state),
     buildActionInventoryMarkdown(state),
+    buildEnvironmentMatrixMarkdown(state),
+    buildAccessMapMarkdown(state),
     buildFindingDiffMarkdown(state),
     buildFindingsMarkdown(findingsByArea, bySeverity),
     buildInfoNotesMarkdown(infoByArea),
@@ -921,6 +1096,101 @@ export function generateSessionReport(state: SessionState): SessionReport {
         <div>${list('Fixed', diff.fixedFindings)}</div>
       </div>
       ${list('Recurring', diff.recurringFindings)}`;
+  })();
+
+  // The three sections below have a markdown-only equivalent (buildApplicationMapMarkdown /
+  // buildEnvironmentMatrixMarkdown / buildAccessMapMarkdown) — mirrored here rather than
+  // shared because this whole HTML template independently reimplements every section already
+  // (see pageCoverageHtml/actionInventoryHtml/findingDiffHtml above, none of which call their
+  // markdown counterparts either). Missing an HTML mirror here means these sections would
+  // exist in the downloaded .md report but be genuinely invisible in the HTML report and the
+  // web app's own rendering of it — confirmed as a real gap, not hypothetical.
+  // Rendered as preformatted text rather than converted to HTML — this codebase has no
+  // markdown-to-HTML renderer anywhere else (executiveSummary is deliberately plain prose to
+  // avoid needing one), and writing a one-off parser just for this single field isn't worth
+  // the edge-case risk for a first pass.
+  const siteKnowledgeHtml = state.siteKnowledge
+    ? `<pre style="white-space:pre-wrap;font-family:inherit;font-size:0.9rem;line-height:1.6">${escapeHtml(state.siteKnowledge)}</pre>`
+    : '';
+
+  const applicationMapHtml = (() => {
+    const routes = state.discoveredRoutes ?? [];
+    if (routes.length === 0) return '';
+    const groups = new Map<string, string[]>();
+    for (const route of routes) {
+      let path: string;
+      try {
+        path = new URL(route).pathname;
+      } catch {
+        path = route;
+      }
+      const segment = path.split('/').filter(Boolean)[0] ?? '';
+      const key = segment || '(root)';
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(path);
+    }
+    const items = [...groups.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(
+        ([segment, paths]) => `<li><strong>/${escapeHtml(segment)}</strong>
+          <ul>${[...new Set(paths)].sort().map((p) => `<li>${escapeHtml(p)}</li>`).join('')}</ul>
+        </li>`,
+      )
+      .join('');
+    return `<p class="muted" style="margin:0 0 0.75rem">Discovered routes grouped by top-level section:</p><ul>${items}</ul>`;
+  })();
+
+  const environmentMatrixHtml = (() => {
+    const checks = state.environmentChecks ?? [];
+    if (checks.length === 0) return '';
+    const pages = [...new Set(checks.map((c) => c.pageUrl))];
+    const browserEnvs: string[] = [];
+    const deviceEnvs: string[] = [];
+    for (const c of checks) {
+      const bucket = c.kind === 'browser' ? browserEnvs : deviceEnvs;
+      if (!bucket.includes(c.environment)) bucket.push(c.environment);
+    }
+    browserEnvs.sort((a, b) => (a === 'Chromium' ? -1 : b === 'Chromium' ? 1 : 0));
+    const environments = [...browserEnvs, ...deviceEnvs];
+    const byPageEnv = new Map<string, EnvironmentCheck>();
+    for (const c of checks) byPageEnv.set(`${c.pageUrl}\u0000${c.environment}`, c);
+
+    const notes: string[] = [];
+    const rows = pages
+      .map((pageUrl) => {
+        const shortUrl = shortenPageUrl(pageUrl);
+        const cells = environments
+          .map((env) => {
+            const c = byPageEnv.get(`${pageUrl}\u0000${env}`);
+            if (!c) return '<td class="num">—</td>';
+            if (c.ok) return '<td class="num">✓</td>';
+            if (c.note) notes.push(`<li><strong>${escapeHtml(shortUrl)}</strong> × ${escapeHtml(env)}: ${escapeHtml(c.note)}</li>`);
+            return '<td class="num">✗</td>';
+          })
+          .join('');
+        return `<tr><td>${escapeHtml(shortUrl)}</td>${cells}</tr>`;
+      })
+      .join('');
+
+    return `<p class="muted" style="margin:0 0 0.75rem">Every page × browser/device combination actually checked this session, and whether it matched the baseline.</p>
+      <table class="data-table"><thead><tr><th>Page</th>${environments.map((e) => `<th>${escapeHtml(e)}</th>`).join('')}</tr></thead>
+      <tbody>${rows}</tbody></table>
+      ${notes.length > 0 ? `<div class="table-block-title" style="margin-top:0.75rem">✗ details</div><ul>${notes.join('')}</ul>` : ''}`;
+  })();
+
+  const accessMapHtml = (() => {
+    const entries: AccessMapEntry[] = state.accessMap ?? [];
+    if (entries.length === 0) return '';
+    const rows = entries
+      .map(
+        (e) =>
+          `<tr><td>${escapeHtml(e.feature)}</td><td class="num">✗</td><td class="num">${e.directlyReachable ? '✓' : '✗'}</td><td>${escapeHtml(e.note ?? '')}</td></tr>`,
+      )
+      .join('');
+    return `<p class="muted" style="margin:0 0 0.75rem">UI-hidden links checked for direct reachability under the current session's authenticated role. Not a cross-role comparison — see note below.</p>
+      <table class="data-table"><thead><tr><th>Feature/Link</th><th>Visible in UI</th><th>Directly Reachable</th><th>Note</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+      <p class="muted small" style="margin-top:0.5rem">A true multi-role (Admin vs. Manager vs. User) access matrix would require multiple real credential sets and multiple real logins, which this session's single-login architecture doesn't support without added risk to a live account.</p>`;
   })();
 
   const severityBars = SEVERITY_ORDER.map((sev) => {
@@ -1428,8 +1698,12 @@ export function generateSessionReport(state: SessionState): SessionReport {
       <ul class="toc">
         <li><a href="#overview">1. Overview</a></li>
         <li><a href="#flows">2. Flows tested</a></li>
+        ${siteKnowledgeHtml ? '<li><a href="#site-knowledge">Application Knowledge Base</a></li>' : ''}
+        ${applicationMapHtml ? '<li><a href="#application-map">Application Map</a></li>' : ''}
         ${pageCoverageHtml ? '<li><a href="#page-coverage">Page Coverage</a></li>' : ''}
         ${actionInventoryHtml ? '<li><a href="#action-inventory">Action Inventory</a></li>' : ''}
+        ${environmentMatrixHtml ? '<li><a href="#environment-matrix">Environment Comparison</a></li>' : ''}
+        ${accessMapHtml ? '<li><a href="#access-map">Access Map</a></li>' : ''}
         ${findingDiffHtml ? '<li><a href="#regression">Regression vs Previous Run</a></li>' : ''}
         <li><a href="#findings">3. Findings</a></li>
         ${infoNotesHtml ? `<li><a href="#info-notes">4. Additional Notes</a></li>` : ''}
@@ -1454,6 +1728,16 @@ export function generateSessionReport(state: SessionState): SessionReport {
         ${flowsHtml}
       </section>
 
+      ${siteKnowledgeHtml ? `<section class="sec" id="site-knowledge">
+        <h2>Application Knowledge Base</h2>
+        ${siteKnowledgeHtml}
+      </section>` : ''}
+
+      ${applicationMapHtml ? `<section class="sec" id="application-map">
+        <h2>Application Map</h2>
+        ${applicationMapHtml}
+      </section>` : ''}
+
       ${pageCoverageHtml ? `<section class="sec" id="page-coverage">
         <h2>Page Coverage</h2>
         ${pageCoverageHtml}
@@ -1462,6 +1746,16 @@ export function generateSessionReport(state: SessionState): SessionReport {
       ${actionInventoryHtml ? `<section class="sec" id="action-inventory">
         <h2>Action Inventory</h2>
         ${actionInventoryHtml}
+      </section>` : ''}
+
+      ${environmentMatrixHtml ? `<section class="sec" id="environment-matrix">
+        <h2>Environment Comparison</h2>
+        ${environmentMatrixHtml}
+      </section>` : ''}
+
+      ${accessMapHtml ? `<section class="sec" id="access-map">
+        <h2>Access Map</h2>
+        ${accessMapHtml}
       </section>` : ''}
 
       ${findingDiffHtml ? `<section class="sec" id="regression">

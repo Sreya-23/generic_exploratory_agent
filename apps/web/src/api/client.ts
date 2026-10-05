@@ -37,6 +37,74 @@ export async function fetchMeta(): Promise<{
   return res.json();
 }
 
+export interface SavedCredential {
+  username?: string;
+  password?: string;
+  authMethod?: string;
+  extras?: Record<string, string>;
+}
+
+export async function getSavedCredentials(hostname: string): Promise<Record<string, SavedCredential>> {
+  const res = await fetch(`${API_BASE}/api/credentials?hostname=${encodeURIComponent(hostname)}`);
+  if (!res.ok) return {};
+  return res.json();
+}
+
+export async function saveCredentialAs(
+  hostname: string,
+  role: string,
+  credential: SavedCredential,
+): Promise<void> {
+  await fetch(`${API_BASE}/api/credentials?hostname=${encodeURIComponent(hostname)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ role, ...credential }),
+  });
+}
+
+export async function deleteSavedCredential(hostname: string, role: string): Promise<void> {
+  await fetch(
+    `${API_BASE}/api/credentials?hostname=${encodeURIComponent(hostname)}&role=${encodeURIComponent(role)}`,
+    { method: 'DELETE' },
+  );
+}
+
+export interface QualityPilotConfig {
+  baseUrl: string;
+  workspaceId: string;
+  projectId: string;
+  token: string;
+}
+
+export async function getQualityPilotConfig(): Promise<QualityPilotConfig | null> {
+  const res = await fetch(`${API_BASE}/api/integrations/qualitypilot`);
+  if (!res.ok) return null;
+  const data = await res.json();
+  return data?.configured === false ? null : data;
+}
+
+export async function saveQualityPilotConfig(config: QualityPilotConfig): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/integrations/qualitypilot`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? 'Failed to save QualityPilot config');
+}
+
+export async function raiseBugsInQualityPilot(
+  sessionId: string,
+  findingIds?: string[],
+): Promise<{ created: number; bugs: Array<{ id: string; title: string }> }> {
+  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/raise-bugs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ findingIds }),
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? 'Failed to raise bugs in QualityPilot');
+  return res.json();
+}
+
 export async function createSession(config: SessionConfig): Promise<SessionState> {
   const res = await fetch(`${API_BASE}/api/sessions`, {
     method: 'POST',
@@ -75,23 +143,10 @@ export async function clearSessions(): Promise<void> {
   await fetch(`${API_BASE}/api/sessions`, { method: 'DELETE' });
 }
 
-export async function uploadPrd(sessionId: string, file: File): Promise<void> {
-  const form = new FormData();
-  form.append('file', file);
-  const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/upload-prd`, {
-    method: 'POST',
-    body: form,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error((err as { error?: string }).error ?? 'Failed to upload PRD');
-  }
-}
-
 export async function fetchSessionReport(
   sessionId: string,
   format: 'md' | 'json' = 'md',
-): Promise<string | { reportMarkdown: string; prdCoverage: unknown }> {
+): Promise<string | { reportMarkdown: string }> {
   const res = await fetch(`${API_BASE}/api/sessions/${sessionId}/report?format=${format}`);
   if (!res.ok) throw new Error('Failed to load report');
   if (format === 'json') return res.json();
@@ -231,6 +286,16 @@ export async function getSessionReport(id: string): Promise<SessionReportPayload
 
 export function reportDownloadUrl(id: string, format: 'md' | 'html'): string {
   return `${API_BASE}/api/sessions/${id}/report?format=${format}`;
+}
+
+// Finding.evidence entries are absolute local filesystem paths (e.g.
+// "/…/sessions/<id>/screenshots/foo.png") — meaningful on the server, not in the browser.
+// The API serves SESSIONS_DIR under /sessions-files/, so the servable URL is always
+// /sessions-files/<sessionId>/screenshots/<basename>, regardless of the server's own
+// absolute path on disk.
+export function evidenceUrl(sessionId: string, evidencePath: string): string {
+  const filename = evidencePath.split(/[/\\]/).pop() ?? evidencePath;
+  return `${API_BASE}/sessions-files/${sessionId}/screenshots/${filename}`;
 }
 
 export async function askAboutFindings(sessionId: string, question: string): Promise<string> {

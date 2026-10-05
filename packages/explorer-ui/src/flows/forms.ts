@@ -14,9 +14,9 @@ const BOUNDARY_INPUTS = ['', ' ', 'a', 'x'.repeat(500), '<script>alert(1)</scrip
  *   'sensitive'  — PII that belongs to a real person; ask user for real value
  *   'safe'       — generic test field; random/placeholder data is fine
  */
-type InputRisk = 'high-risk' | 'sensitive' | 'safe';
+export type InputRisk = 'high-risk' | 'sensitive' | 'safe';
 
-function classifyInputRisk(
+export function classifyInputRisk(
   name: string,
   placeholder: string,
   label: string,

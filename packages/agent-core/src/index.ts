@@ -1,8 +1,7 @@
-export { buildPlan, buildGenericPlan, buildPlanFromContext, buildPrdOnlyPlan } from './planner/index.js';
+export { buildPlan, buildGenericPlan, buildPlanFromContext } from './planner/index.js';
 export {
   saveSessionState,
   generateSessionReportMarkdown,
-  chatSummaryFromCoverage,
   writeSessionReport,
   generateSessionReport,
   dedupeFindings,
