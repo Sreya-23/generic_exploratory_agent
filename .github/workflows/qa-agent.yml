@@ -37,7 +37,10 @@ jobs:
         run: npm ci
 
       - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
+        # chromium + firefox + webkit — the cross-browser and device-matrix flows (part of
+        # the default "ui" area) need all three, or they fail every run with a Playwright
+        # "Executable doesn't exist" error misreported as a HIGH-severity site bug.
+        run: npx playwright install --with-deps chromium firefox webkit
 
       - name: Build
         run: npm run build

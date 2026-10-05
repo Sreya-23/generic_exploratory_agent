@@ -1,32 +1,33 @@
 import { randomUUID } from 'node:crypto';
-import { copyFile, access, readFile } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type {
   BaseExecutor,
   ExecutorContext,
   Finding,
   FlowTask,
   PreActionRequest,
-  PrdCoverageSummary,
-  PrdFeatureCoverage,
   SessionCredentials,
   SessionEvent,
   SessionState,
   SiteClassification,
   SiteIntelligenceSignals,
 } from '@qa/shared';
+import { hasAnyLLMKey, activeLLMProvider } from '@qa/shared';
 import { credentialsComplete, effectiveAuthState, authPromptForState } from '@qa/chat-agent';
 import { buildPlan, injectJourneyTasks, removeUnlikelyTasks } from '../planner/index.js';
 import { classifySite } from '../intelligence/classify-site.js';
-import { saveSessionState, chatSummaryFromCoverage, writeSessionReport } from '../reporter/index.js';
+import { classifySiteWithAI } from '../intelligence/classify-site-ai.js';
+import { ensureSiteKnowledge } from '../intelligence/site-knowledge-base.js';
+import { saveSessionState, writeSessionReport } from '../reporter/index.js';
 import {
   attachFingerprints,
   diffFindingFingerprints,
   fingerprintFinding,
   loadPreviousSessionFindings,
 } from '../reporter/finding-diff.js';
-import { parsePrd, formatPrdCoverageMarkdown } from '@qa/prd-parser';
-import { UiExecutor, probeAuth, performSessionLogin } from '@qa/explorer-ui';
+import { UiExecutor, probeAuth, performSessionLogin, runEmptyCredentialLoginCheck } from '@qa/explorer-ui';
 import { ApiExecutor } from '@qa/explorer-api';
 import { ChaosExecutor } from '@qa/chaos-engine';
 
@@ -92,6 +93,11 @@ export class SessionOrchestrator {
   private abortControllers = new Map<string, AbortController>();
   private listeners = new Map<string, Set<EventCallback>>();
   private sessionsDirs = new Map<string, string>();
+  // beginExploration() can run twice for a password+OTP flow (once to submit the password and
+  // trigger the real OTP send, once again after the user supplies the code) — this ensures the
+  // empty-credential boundary check (§4) only ever runs on the first of those, never re-probing
+  // once a real login is already in progress.
+  private emptyLoginCheckedSessions = new Set<string>();
 
   createSession(config: SessionState['config']): SessionState {
     const id = randomUUID();
@@ -274,74 +280,7 @@ export class SessionOrchestrator {
     const abort = new AbortController();
     this.abortControllers.set(sessionId, abort);
 
-    let prdFeatures: string[] | undefined;
-    let prdConstraints: string[] = [];
-    let prdFeatureCriteria: string[] = [];
-    const prdCoverageResults: PrdFeatureCoverage[] = [];
-
-    if (state.config.prdPath) {
-      try {
-        const sessionPrdDir = join(sessionsDir, sessionId);
-        const destName = state.config.prdFilename ?? basename(state.config.prdPath);
-        const destPath = join(
-          sessionPrdDir,
-          destName.toLowerCase().startsWith('prd.') ? destName : `prd-${destName}`,
-        );
-        if (state.config.prdPath !== destPath) {
-          await copyFile(state.config.prdPath, destPath).catch(() => undefined);
-          const copied = await access(destPath).then(() => true).catch(() => false);
-          if (copied) state.config.prdPath = destPath;
-        }
-
-        const parsed = await parsePrd(state.config.prdPath);
-        prdFeatures = parsed.features;
-        prdConstraints = parsed.constraints;
-        prdFeatureCriteria = parsed.featureCriteria ?? [];
-        if (!state.config.prdFilename) state.config.prdFilename = parsed.filename;
-
-        const prdContextBlock = [
-          `PRD file: ${state.config.prdFilename ?? state.config.prdPath}`,
-          parsed.overview,
-          prdConstraints.length
-            ? `Constraints:\n${prdConstraints.map((c) => `- ${c}`).join('\n')}`
-            : '',
-        ]
-          .filter(Boolean)
-          .join('\n\n');
-        state.config.context = state.config.context
-          ? `${state.config.context}\n\n--- PRD ---\n${prdContextBlock}`
-          : prdContextBlock;
-
-        this.emit({
-          type: 'log',
-          sessionId,
-          timestamp: new Date().toISOString(),
-          payload: {
-            message: `[PRD] ${parsed.overview.replace(/\n+/g, ' · ').slice(0, 500)} — PRD-only mode (generic matrix skipped)`,
-          },
-        });
-      } catch (err) {
-        this.emit({
-          type: 'log',
-          sessionId,
-          timestamp: new Date().toISOString(),
-          payload: { message: `[PRD] Parse failed: ${(err as Error).message}` },
-        });
-      }
-    }
-
-    (state as SessionState & { _prdResults?: PrdFeatureCoverage[]; _prdFeatureCriteria?: string[] })._prdResults =
-      prdCoverageResults;
-    (state as SessionState & { _prdFeatureCriteria?: string[] })._prdFeatureCriteria = prdFeatureCriteria;
-
-    state.plan = buildPlan(
-      sessionId,
-      state.config,
-      prdFeatures,
-      undefined,
-      prdConstraints,
-      prdFeatureCriteria,
-    );
+    state.plan = await buildPlan(sessionId, state.config);
     state.progress = { completedTasks: 0, totalTasks: state.plan.tasks.length, percent: 0 };
     state.status = 'running';
     state.authState = 'ready';
@@ -355,7 +294,18 @@ export class SessionOrchestrator {
         sessionId,
         config: state.config,
         sessionsDir,
-        onFinding: () => {},
+        onFinding: (partial) => {
+          const finding: Finding = {
+            ...partial,
+            fingerprint: partial.fingerprint ?? fingerprintFinding(partial),
+            taskId: partial.taskId ?? 'login-boundary-check',
+            id: randomUUID(),
+            sessionId,
+            createdAt: new Date().toISOString(),
+          };
+          state.findings.push(finding);
+          this.emit({ type: 'session:finding', sessionId, timestamp: finding.createdAt, payload: finding });
+        },
         onLog: (message) => {
           this.emit({ type: 'log', sessionId, timestamp: new Date().toISOString(), payload: { message } });
         },
@@ -384,6 +334,16 @@ export class SessionOrchestrator {
           return otp ? { otp } : null;
         },
       };
+      // Zero-risk boundary check (§4): submits the login form with every field left blank in
+      // its own throwaway browser context, entirely separate from the real login attempt right
+      // below. Guarded to run exactly once per real login — not on OTP-continuation re-entry
+      // into this same block, and not on a session resume where a real login already happened.
+      if (!existsSync(join(sessionsDir, sessionId, 'auth-state.json')) && !this.emptyLoginCheckedSessions.has(sessionId)) {
+        this.emptyLoginCheckedSessions.add(sessionId);
+        await runEmptyCredentialLoginCheck(loginCtx).catch((err) => {
+          loginCtx.onLog(`[LoginBoundary] Check failed, continuing with real login: ${(err as Error).message.slice(0, 150)}`);
+        });
+      }
       const loginOk = await performSessionLogin(loginCtx);
       if (!loginOk && awaitingOtp) {
         // Genuinely paused, not failed — a real OTP send was just triggered and we're
@@ -464,8 +424,6 @@ export class SessionOrchestrator {
     signal: AbortSignal,
   ): Promise<void> {
     const state = this.states.get(sessionId)!;
-    /** When PRD auth smoke fails, remaining PRD feature tasks are skipped */
-    let prdAuthSmokeFailed = false;
     // Failure isolation: several consecutive tasks failing with the same page-load-timeout
     // signature means the TARGET is currently degraded, not that each is an independent app
     // bug. Track consecutive occurrences so they can be clustered into one note instead of
@@ -510,44 +468,6 @@ export class SessionOrchestrator {
         payload: { ...state.progress, status: state.status },
       });
 
-      // Fail-fast: skip deep PRD tasks after auth smoke failure
-      if (
-        prdAuthSmokeFailed &&
-        task.flowClass === 'prd-driven' &&
-        !task.meta?.isAuthSmoke
-      ) {
-        const bag = (state as SessionState & { _prdResults?: PrdFeatureCoverage[] })._prdResults;
-        bag?.push({
-          feature: task.meta?.prdFeature ?? task.title,
-          variant: task.meta?.prdVariant ?? 'happy',
-          status: 'skipped',
-          notes: 'Skipped — PRD auth smoke gate failed',
-          findingsCount: 0,
-          requirementId: task.meta?.prdRequirementId,
-          taskId: task.id,
-        });
-        this.emit({
-          type: 'log',
-          sessionId,
-          timestamp: new Date().toISOString(),
-          payload: {
-            message: `[PRD] Skipping ${task.id} — auth smoke gate failed`,
-          },
-        });
-        state.progress.completedTasks += 1;
-        state.progress.percent = Math.round(
-          (state.progress.completedTasks / state.progress.totalTasks) * 100,
-        );
-        this.emit({
-          type: 'task:completed',
-          sessionId,
-          timestamp: new Date().toISOString(),
-          payload: { taskId: task.id, skipped: true },
-        });
-        await saveSessionState(sessionsDir, state);
-        continue;
-      }
-
       const ctx: ExecutorContext = {
         sessionId,
         config: state.config,
@@ -557,6 +477,8 @@ export class SessionOrchestrator {
         postLoginUrl: state.postLoginUrl,
         actionInventory: state.actionInventory,
         discoveredRoutes: state.discoveredRoutes,
+        environmentChecks: state.environmentChecks,
+        accessMap: state.accessMap,
         envDegraded: consecutiveTimeoutFailures >= ENV_DEGRADED_THRESHOLD,
         onFinding: (partial) => {
           const withFp = {
@@ -590,10 +512,6 @@ export class SessionOrchestrator {
             timestamp: new Date().toISOString(),
             payload: { message },
           });
-        },
-        onPrdCoverageUpdate: (update: PrdFeatureCoverage) => {
-          const bag = (state as SessionState & { _prdResults?: PrdFeatureCoverage[] })._prdResults;
-          bag?.push(update);
         },
         onPreActionNeeded: (req: PreActionRequest): Record<string, string> | null => {
           const extras = state.config.credentials?.extras ?? {};
@@ -642,12 +560,34 @@ export class SessionOrchestrator {
 
           return extras;
         },
-        onClassification: (raw) => {
+        onClassification: async (raw) => {
           // recon.ts passes raw signals wrapped in a SiteClassification shell
           const signals = (raw as unknown as { _rawSignals?: SiteIntelligenceSignals })._rawSignals;
           if (!signals) return;
 
-          const classification: SiteClassification = classifySite(signals);
+          // The deterministic rule set is always computed first — it's free, synchronous,
+          // and is exactly what gets used if the AI call below is unavailable, slow, or
+          // returns something we can't validate. This is a strict upgrade path, never a
+          // replacement: classifySite() must keep working standalone regardless of Gemini.
+          const ruleBased: SiteClassification = classifySite(signals);
+          const aiClassification = await classifySiteWithAI(signals).catch(() => null);
+          const classification = aiClassification ?? ruleBased;
+
+          this.emit({
+            type: 'log',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            payload: {
+              message: aiClassification
+                ? `[Classify] Using AI (${activeLLMProvider() ?? 'configured provider'}) classification: ${classification.siteType} (${Math.round(classification.confidence * 100)}%)`
+                : `[Classify] Using rule-based classification: ${classification.siteType} (${Math.round(classification.confidence * 100)}%) — ${
+                    hasAnyLLMKey()
+                      ? 'AI classification unavailable or invalid this run'
+                      : 'no LLM API key configured'
+                  }`,
+            },
+          });
+
           state.classification = classification;
           state.updatedAt = new Date().toISOString();
 
@@ -658,8 +598,37 @@ export class SessionOrchestrator {
             payload: classification,
           });
 
-          // PRD-only mode: never inject domain journeys / matrix-adjacent tasks
-          if (state.config.prdPath) return;
+          // Per-CATEGORY knowledge base: keyed by classification.siteType, not hostname — a
+          // genuinely different site that lands in the same category (e.g. a second, unrelated
+          // fintech app) reuses the doc the FIRST fintech site ever produced. Generated ONLY
+          // the first time a category is seen (an explicit product decision — never
+          // regenerated/diffed on later runs, just reused silently), so this costs nothing on
+          // every subsequent session, even against a totally different site of the same kind.
+          try {
+            const hostname = new URL(state.config.targetUrl).hostname;
+            const knowledgeBaseDir = join(sessionsDir, '..', 'knowledge-base');
+            const knowledge = await ensureSiteKnowledge(knowledgeBaseDir, hostname, signals, classification);
+            if (knowledge) {
+              state.siteKnowledge = knowledge.content;
+              this.emit({
+                type: 'log',
+                sessionId,
+                timestamp: new Date().toISOString(),
+                payload: {
+                  message: knowledge.isNew
+                    ? `[Knowledge] First "${classification.siteType}"-category site seen (${hostname}) — captured a new application walkthrough doc for this category`
+                    : `[Knowledge] Reusing existing "${classification.siteType}"-category walkthrough doc (captured from a previously-seen site of this kind)`,
+                },
+              });
+            }
+          } catch (err) {
+            this.emit({
+              type: 'log',
+              sessionId,
+              timestamp: new Date().toISOString(),
+              payload: { message: `[Knowledge] Could not load/generate site knowledge: ${(err as Error).message.slice(0, 150)}` },
+            });
+          }
 
           // Dynamically inject journey tasks into the remaining plan, and drop
           // already-queued generic-matrix tasks recon gives clear evidence are moot
@@ -690,6 +659,8 @@ export class SessionOrchestrator {
         discoveredRoutes: ctx.discoveredRoutes,
         visitedRoutes: ctx.visitedRoutes,
         actionInventory: ctx.actionInventory,
+        environmentChecks: ctx.environmentChecks,
+        accessMap: ctx.accessMap,
       };
       if (executor) {
         try {
@@ -711,6 +682,12 @@ export class SessionOrchestrator {
           }
           if (ctx.visitedRoutes && ctx.visitedRoutes !== before.visitedRoutes) {
             state.visitedRoutes = ctx.visitedRoutes;
+          }
+          if (ctx.environmentChecks && ctx.environmentChecks !== before.environmentChecks) {
+            state.environmentChecks = ctx.environmentChecks;
+          }
+          if (ctx.accessMap && ctx.accessMap !== before.accessMap) {
+            state.accessMap = ctx.accessMap;
           }
           if (ctx.actionInventory && ctx.actionInventory !== before.actionInventory) {
             const mergedEntries = [
@@ -783,25 +760,6 @@ export class SessionOrchestrator {
         );
       }
 
-      // Detect PRD auth smoke failure → skip remaining PRD feature tasks
-      if (task.meta?.isAuthSmoke) {
-        const bag =
-          (state as SessionState & { _prdResults?: PrdFeatureCoverage[] })._prdResults ?? [];
-        const smoke = [...bag].reverse().find((r) => r.taskId === task.id || r.feature === 'Auth smoke gate');
-        if (smoke && (smoke.status === 'failed' || smoke.status === 'blocked')) {
-          prdAuthSmokeFailed = true;
-          this.emit({
-            type: 'log',
-            sessionId,
-            timestamp: new Date().toISOString(),
-            payload: {
-              message:
-                '[PRD] Auth smoke gate FAILED — remaining PRD feature tasks will be skipped',
-            },
-          });
-        }
-      }
-
       state.progress.completedTasks += 1;
       state.progress.percent = Math.round(
         (state.progress.completedTasks / state.progress.totalTasks) * 100,
@@ -818,137 +776,31 @@ export class SessionOrchestrator {
     }
 
     if (!signal.aborted) {
-      // Finalize PRD coverage summary (chat + report)
-      if (state.config.prdPath) {
-        const results =
-          (state as SessionState & { _prdResults?: PrdFeatureCoverage[] })._prdResults ?? [];
-        const featuresExtracted = [
-          ...new Set(
-            (state.plan?.tasks ?? [])
-              .filter(
-                (t) =>
-                  t.flowClass === 'prd-driven' &&
-                  t.meta?.prdFeature &&
-                  !t.meta?.isAuthSmoke,
-              )
-              .map((t) => t.meta!.prdFeature!),
-          ),
-        ];
-        const criteriaList =
-          (state as SessionState & { _prdFeatureCriteria?: string[] })._prdFeatureCriteria ?? [];
-        const featureDetails = featuresExtracted.map((name, i) => {
-          const taskMeta = (state.plan?.tasks ?? []).find(
-            (t) => t.meta?.prdFeature === name && t.meta?.prdRequirementId,
-          )?.meta;
-          return {
-            requirementId: taskMeta?.prdRequirementId ?? `F${i + 1}`,
-            name,
-            criteria: taskMeta?.prdCriteria ?? criteriaList[i],
-          };
-        });
-
-        // Enrich coverage rows with criteria
-        for (const r of results) {
-          if (!r.criteria && r.requirementId) {
-            r.criteria = featureDetails.find((d) => d.requirementId === r.requirementId)?.criteria;
-          }
-        }
-
-        const constraintsMatch = state.config.context?.match(/Constraints:\n([\s\S]*?)(?:\n\n|$)/);
-        const constraintsExtracted = constraintsMatch
-          ? constraintsMatch[1]
-              .split('\n')
-              .map((l) => l.replace(/^- /, '').trim())
-              .filter(Boolean)
-          : [];
-
-        const gaps = [...new Set(results.filter((r) => r.status === 'gap').map((r) => r.feature))];
-        const blocked = [
-          ...new Set(results.filter((r) => r.status === 'blocked').map((r) => r.feature)),
-        ];
-        const passedCount = results.filter((r) => r.status === 'passed').length;
-        const failedCount = results.filter((r) => r.status === 'failed').length;
-        const testedCount = results.filter((r) =>
-          ['tested', 'passed', 'failed'].includes(r.status),
-        ).length;
-
-        state.findings = attachFingerprints(state.findings);
-        const prev = await loadPreviousSessionFindings(
-          sessionsDir,
-          state.config.targetUrl,
-          sessionId,
-        );
-        const findingDiff = diffFindingFingerprints(
+      // Fingerprint findings and diff against the previous run against the same target,
+      // so the report can show a New / Fixed / Recurring breakdown.
+      state.findings = attachFingerprints(state.findings);
+      const prevGeneric = await loadPreviousSessionFindings(
+        sessionsDir,
+        state.config.targetUrl,
+        sessionId,
+      );
+      if (prevGeneric) {
+        state.findingDiff = diffFindingFingerprints(
           state.findings,
-          prev?.findings ?? [],
-          prev?.sessionId,
+          prevGeneric.findings,
+          prevGeneric.sessionId,
         );
-
-        const coverage: PrdCoverageSummary = {
-          prdFilename: state.config.prdFilename,
-          featuresExtracted,
-          constraintsExtracted,
-          featureDetails,
-          featureResults: results,
-          gaps,
-          blocked,
-          testedCount,
-          passedCount,
-          failedCount,
-          findingDiff,
-          markdown: formatPrdCoverageMarkdown({
-            prdFilename: state.config.prdFilename,
-            featuresExtracted,
-            constraintsExtracted,
-            featureDetails,
-            featureResults: results,
-            gaps,
-            blocked,
-            findingDiffMarkdown: findingDiff.markdown,
-          }),
-        };
-        state.prdCoverage = coverage;
-
         this.emit({
           type: 'log',
           sessionId,
           timestamp: new Date().toISOString(),
           payload: {
-            message: `[PRD] Finding diff vs previous: +${findingDiff.newFindings.length} new, -${findingDiff.fixedFindings.length} fixed, ${findingDiff.recurringFindings.length} recurring`,
+            message:
+              `[Regression] Finding diff vs previous session (${prevGeneric.sessionId.slice(0, 8)}): ` +
+              `+${state.findingDiff.newFindings.length} new, -${state.findingDiff.fixedFindings.length} fixed, ` +
+              `${state.findingDiff.recurringFindings.length} recurring`,
           },
         });
-
-        this.emit({
-          type: 'prd:coverage',
-          sessionId,
-          timestamp: new Date().toISOString(),
-          payload: { summary: chatSummaryFromCoverage(coverage), coverage },
-        });
-      } else {
-        state.findings = attachFingerprints(state.findings);
-        const prevGeneric = await loadPreviousSessionFindings(
-          sessionsDir,
-          state.config.targetUrl,
-          sessionId,
-        );
-        if (prevGeneric) {
-          state.findingDiff = diffFindingFingerprints(
-            state.findings,
-            prevGeneric.findings,
-            prevGeneric.sessionId,
-          );
-          this.emit({
-            type: 'log',
-            sessionId,
-            timestamp: new Date().toISOString(),
-            payload: {
-              message:
-                `[Regression] Finding diff vs previous session (${prevGeneric.sessionId.slice(0, 8)}): ` +
-                `+${state.findingDiff.newFindings.length} new, -${state.findingDiff.fixedFindings.length} fixed, ` +
-                `${state.findingDiff.recurringFindings.length} recurring`,
-            },
-          });
-        }
       }
 
       state.status = 'completed';

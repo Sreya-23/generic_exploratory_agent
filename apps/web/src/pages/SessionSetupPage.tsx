@@ -1,7 +1,23 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { ExplorationArea, SessionDepth, SessionCredentials } from '@qa/shared';
-import { createSession, fetchMeta, startSession, uploadPrd } from '../api/client';
+import {
+  createSession,
+  fetchMeta,
+  startSession,
+  getSavedCredentials,
+  saveCredentialAs,
+  deleteSavedCredential,
+  type SavedCredential,
+} from '../api/client';
+
+function hostnameOf(url: string): string | null {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
 
 export function SessionSetupPage() {
   const navigate = useNavigate();
@@ -15,14 +31,69 @@ export function SessionSetupPage() {
   const [apiKey, setApiKey] = useState('');
   const [authMethod, setAuthMethod] = useState<'password' | 'otp' | 'password-otp'>('password');
   const [otp, setOtp] = useState('');
-  const [prdFile, setPrdFile] = useState<File | null>(null);
   const [meta, setMeta] = useState<Awaited<ReturnType<typeof fetchMeta>> | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const [savedCredentials, setSavedCredentials] = useState<Record<string, SavedCredential>>({});
+  const [selectedRole, setSelectedRole] = useState('');
+  const [saveAsRole, setSaveAsRole] = useState('');
+  const [saveStatus, setSaveStatus] = useState('');
+
   useEffect(() => {
     fetchMeta().then(setMeta).catch(() => {});
   }, []);
+
+  const hostname = useMemo(() => hostnameOf(targetUrl), [targetUrl]);
+
+  // Re-fetch saved logins whenever the target's hostname changes — a site may have several
+  // saved roles (different accounts/phone numbers), so this only asks "what's known for THIS
+  // host", not a global list.
+  useEffect(() => {
+    if (!hostname) {
+      setSavedCredentials({});
+      return;
+    }
+    let active = true;
+    getSavedCredentials(hostname)
+      .then((creds) => {
+        if (active) setSavedCredentials(creds);
+      })
+      .catch(() => {
+        if (active) setSavedCredentials({});
+      });
+    return () => {
+      active = false;
+    };
+  }, [hostname]);
+
+  const applySavedRole = (role: string) => {
+    setSelectedRole(role);
+    const cred = savedCredentials[role];
+    if (!cred) return;
+    setCredentialType('login');
+    if (cred.username !== undefined) setUsername(cred.username);
+    if (cred.password !== undefined) setPassword(cred.password);
+    if (cred.authMethod) setAuthMethod(cred.authMethod as typeof authMethod);
+    // OTP is deliberately never saved/restored — it's a fresh code every login, not a
+    // reusable credential.
+  };
+
+  const handleSaveAsRole = async () => {
+    if (!hostname || !saveAsRole.trim()) return;
+    await saveCredentialAs(hostname, saveAsRole.trim(), { username, password, authMethod });
+    setSavedCredentials(await getSavedCredentials(hostname));
+    setSaveStatus(`Saved as "${saveAsRole.trim()}"`);
+    setSaveAsRole('');
+    setTimeout(() => setSaveStatus(''), 3000);
+  };
+
+  const handleDeleteRole = async (role: string) => {
+    if (!hostname) return;
+    await deleteSavedCredential(hostname, role);
+    setSavedCredentials(await getSavedCredentials(hostname));
+    if (selectedRole === role) setSelectedRole('');
+  };
 
   const toggleArea = (area: ExplorationArea) => {
     setAreas((prev) =>
@@ -55,10 +126,6 @@ export function SessionSetupPage() {
         areas: areas.length ? areas : ['ui'],
         credentials,
       });
-
-      if (prdFile) {
-        await uploadPrd(session.id, prdFile);
-      }
 
       // Navigate first so live page connects WebSocket before exploration starts
       navigate(`/session/${session.id}`);
@@ -97,19 +164,6 @@ export function SessionSetupPage() {
               rows={4}
             />
           </label>
-          <label>
-            PRD file (optional — PDF recommended)
-            <input
-              type="file"
-              accept=".pdf,.md,.txt,application/pdf,text/plain,text/markdown"
-              onChange={(e) => setPrdFile(e.target.files?.[0] ?? null)}
-            />
-            <span className="field-hint">
-              If provided, exploration runs <strong>PRD-only</strong>: happy path, negative/empty/invalid,
-              and interruption tests for each extracted feature (generic matrix skipped).
-            </span>
-          </label>
-          {prdFile && <p className="prd-upload-status prd-attached">Selected: {prdFile.name}</p>}
         </section>
 
         <section className="form-section">
@@ -129,6 +183,29 @@ export function SessionSetupPage() {
           </div>
           {credentialType === 'login' && (
             <div className="cred-fields">
+              {Object.keys(savedCredentials).length > 0 && (
+                <label>
+                  Use a saved login for {hostname}
+                  <select value={selectedRole} onChange={(e) => applySavedRole(e.target.value)}>
+                    <option value="">— pick a saved role —</option>
+                    {Object.keys(savedCredentials).map((role) => (
+                      <option key={role} value={role}>
+                        {role} {savedCredentials[role].username ? `(${savedCredentials[role].username})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                  {selectedRole && (
+                    <button
+                      type="button"
+                      className="btn btn-secondary"
+                      style={{ marginTop: '0.5rem' }}
+                      onClick={() => handleDeleteRole(selectedRole)}
+                    >
+                      Forget "{selectedRole}"
+                    </button>
+                  )}
+                </label>
+              )}
               <label>
                 Auth method
                 <select
@@ -159,6 +236,24 @@ export function SessionSetupPage() {
                   OTP code
                   <input value={otp} onChange={(e) => setOtp(e.target.value)} placeholder="123456" />
                 </label>
+              )}
+              {hostname && (username || password) && (
+                <div className="cred-save-as" style={{ marginTop: '0.5rem' }}>
+                  <label>
+                    Save this login as a role (e.g. "admin", "user") — OTP is never saved, only username/password/auth method
+                    <div style={{ display: 'flex', gap: '0.5rem' }}>
+                      <input
+                        value={saveAsRole}
+                        onChange={(e) => setSaveAsRole(e.target.value)}
+                        placeholder="role name"
+                      />
+                      <button type="button" className="btn btn-secondary" onClick={handleSaveAsRole}>
+                        Save
+                      </button>
+                    </div>
+                  </label>
+                  {saveStatus && <span className="session-meta">{saveStatus}</span>}
+                </div>
               )}
             </div>
           )}

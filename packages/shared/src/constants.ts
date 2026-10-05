@@ -57,7 +57,7 @@ export const SESSION_DEPTHS: {
   {
     id: 'standard',
     label: 'Standard',
-    description: 'PRD flows + generic baseline (~1-2 hrs)',
+    description: 'Full generic exploration baseline (~1-2 hrs)',
     estimatedMinutes: 90,
   },
   {
@@ -121,6 +121,23 @@ export const FLOW_CLASSES = {
     'dead-links',
     // Action inventory — every button/icon-button/menu-item/tab found and what clicking it did
     'action-inventory',
+    // Correlates a save/create/update action's REAL network response against what the UI
+    // actually tells the user happened — catches "shows success but the backend request
+    // failed" and its inverse, a class of bug no DOM-only or API-only check can see.
+    'data-integrity',
+    // Canceling an edit must discard the change — verified by reload, not just re-reading
+    // the live form. The one state-transition pattern with zero ambiguity about correctness.
+    'state-transition',
+    // A link present in the DOM but hidden/disabled from view (client-side conditional
+    // render) whose href is still directly reachable and renders real content — a common
+    // authorization gap where the UI hides an action but nothing enforces it server-side.
+    // UI-level (needs a live Playwright page), unlike auth-matrix/auth-bypass which are
+    // pure-HTTP checks owned by ApiExecutor — this stays in the 'ui' area for that reason.
+    'hidden-route-access',
+    // Generic, domain-agnostic CRUD lifecycle (create → verify → edit → verify → delete →
+    // verify) on any detected create-shaped form/list — distinct from journey.ts's per-site-
+    // type CRUD flows, which only fire for one classified domain.
+    'generic-crud',
     // Cross-browser compatibility spot-check (Firefox/WebKit vs the Chromium baseline)
     'cross-browser',
     // Consent & user agreement exploration (T&C, privacy, marketing, cookie, age, etc.)
@@ -131,11 +148,16 @@ export const FLOW_CLASSES = {
     // engines, distinct from viewport.ts (same engine, just resized) and cross-browser.ts
     // (desktop-sized engine comparison only)
     'device-matrix',
-    // AI-powered visual QA (Gemini vision) — catches rendering defects with no DOM/CSS
-    // signal at all (overlap, clipping, off-screen elements, leftover placeholder copy).
-    // Purely additive: skips gracefully if GEMINI_API_KEY isn't configured or the API
-    // call fails, never affecting any other flow.
+    // AI-powered visual QA (vision-capable LLM — Gemini/OpenAI/Anthropic, see llm-client.ts)
+    // — catches rendering defects with no DOM/CSS signal at all (overlap, clipping,
+    // off-screen elements, leftover placeholder copy). Purely additive: skips gracefully if
+    // no LLM API key is configured or the API call fails, never affecting any other flow.
     'visual-review',
+    // Live, per-step AI-driven exploration — a model decides the next action by looking at
+    // the actual current page, instead of running a pre-written script. Additive and bounded:
+    // skips gracefully if no LLM API key is configured, runs at standard/deep depth only,
+    // capped at a handful of actions per run.
+    'agentic-explore',
     // WCAG 1.4.10 — layout must reflow without 2D scrolling at up to 400% browser zoom
     'zoom-reflow',
     // prefers-color-scheme: dark support and base contrast under it
@@ -241,17 +263,21 @@ export const FLOW_TITLES: Record<string, string> = {
   // Journeys
   'journey': 'Domain Journey',
   'user-directed': 'User-Directed Flow',
-  'prd-driven': 'PRD Feature Test',
   // Element integrity
   'element-integrity': 'Element Integrity (occlusion, disabled-state)',
   'touch-target': 'Touch Target Size (mobile)',
   'dead-links': 'Dead Internal Links',
   'action-inventory': 'Action Inventory',
+  'data-integrity': 'Data Integrity (UI vs backend truth)',
+  'state-transition': 'State Transition (cancel discards changes)',
+  'hidden-route-access': 'Hidden Route Access (UI hidden, URL reachable)',
+  'generic-crud': 'Generic CRUD Lifecycle (create/edit/delete)',
   'cross-browser': 'Cross-Browser Compatibility',
   'consent-exploration': 'Consent & User Agreement Exploration',
   'business-logic-boundary': 'Business Logic Boundary (amount/price/quantity) (I1/I2)',
   'device-matrix': 'Real Device Matrix (iPhone/iPad/Pixel/Galaxy Tab)',
   'visual-review': 'AI Visual QA Review (Gemini vision, optional)',
+  'agentic-explore': 'AI Agentic Exploration (Gemini, optional)',
   'zoom-reflow': 'Zoom & Reflow (WCAG 1.4.10)',
   'dark-mode': 'Dark Mode (prefers-color-scheme)',
   'reduced-motion': 'Reduced Motion (prefers-reduced-motion)',

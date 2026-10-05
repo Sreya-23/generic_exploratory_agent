@@ -9,6 +9,7 @@ import {
   type SessionState,
 } from '../api/client';
 import { FindingCard } from '../components/session/FindingCard';
+import { QualityPilotConnect } from '../components/session/QualityPilotConnect';
 import { FindingsChatPanel } from '../components/chat/FindingsChatPanel';
 import { SETUP_CONV_KEY } from './ChatSetupPage';
 
@@ -58,6 +59,41 @@ export function ReportPage() {
     }
     return [...map.entries()];
   }, [report]);
+
+  const applicationMapGroups = useMemo(() => {
+    const routes = session?.discoveredRoutes ?? [];
+    const groups = new Map<string, string[]>();
+    for (const route of routes) {
+      let path = route;
+      try {
+        path = new URL(route).pathname;
+      } catch {
+        /* keep raw route */
+      }
+      const segment = path.split('/').filter(Boolean)[0] || '(root)';
+      const list = groups.get(segment) ?? [];
+      if (!list.includes(path)) list.push(path);
+      groups.set(segment, list);
+    }
+    return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b));
+  }, [session]);
+
+  const environmentMatrix = useMemo(() => {
+    const checks = session?.environmentChecks ?? [];
+    if (checks.length === 0) return null;
+    const pages = [...new Set(checks.map((c) => c.pageUrl))];
+    const browserEnvs: string[] = [];
+    const deviceEnvs: string[] = [];
+    for (const c of checks) {
+      const bucket = c.kind === 'browser' ? browserEnvs : deviceEnvs;
+      if (!bucket.includes(c.environment)) bucket.push(c.environment);
+    }
+    browserEnvs.sort((a, b) => (a === 'Chromium' ? -1 : b === 'Chromium' ? 1 : 0));
+    const environments = [...browserEnvs, ...deviceEnvs];
+    const byPageEnv = new Map<string, (typeof checks)[number]>();
+    for (const c of checks) byPageEnv.set(`${c.pageUrl}\u0000${c.environment}`, c);
+    return { pages, environments, byPageEnv };
+  }, [session]);
 
   if (error) {
     return (
@@ -268,6 +304,35 @@ export function ReportPage() {
             )}
           </section>
 
+          {session.siteKnowledge && (
+            <section style={{ marginBottom: '1.5rem' }}>
+              <h2>Application Knowledge Base</h2>
+              <p className="session-meta">
+                Generated the first time this app CATEGORY was seen (by site type); reused silently for every other site that classifies into the same category.
+              </p>
+              <pre style={{ whiteSpace: 'pre-wrap', fontFamily: 'inherit', fontSize: '0.9rem', lineHeight: 1.6 }}>
+                {session.siteKnowledge}
+              </pre>
+            </section>
+          )}
+
+          {applicationMapGroups.length > 0 && (
+            <section style={{ marginBottom: '1.5rem' }}>
+              <h2>Application Map</h2>
+              <p className="session-meta">Discovered routes grouped by top-level section:</p>
+              {applicationMapGroups.map(([segment, paths]) => (
+                <div key={segment} style={{ marginBottom: '0.5rem' }}>
+                  <strong>/{segment}</strong>
+                  <ul>
+                    {paths.map((p) => (
+                      <li key={p}>{p}</li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </section>
+          )}
+
           {session.actionInventory && session.actionInventory.totalFound > 0 && (
             <section style={{ marginBottom: '1.5rem' }}>
               <h2>Action Inventory</h2>
@@ -290,6 +355,78 @@ export function ReportPage() {
                     <tr key={result}>
                       <td>{result}</td>
                       <td>{count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          )}
+
+          {environmentMatrix && (
+            <section style={{ marginBottom: '1.5rem' }}>
+              <h2>Environment Comparison</h2>
+              <p className="session-meta">
+                Every page × browser/device combination actually checked this session, and whether it matched the baseline.
+              </p>
+              <table className="report-overview-table">
+                <thead>
+                  <tr>
+                    <th>Page</th>
+                    {environmentMatrix.environments.map((env) => (
+                      <th key={env}>{env}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {environmentMatrix.pages.map((pageUrl) => {
+                    let shortUrl = pageUrl;
+                    try {
+                      shortUrl = new URL(pageUrl).pathname || '/';
+                    } catch {
+                      /* keep raw url */
+                    }
+                    return (
+                      <tr key={pageUrl}>
+                        <td>{shortUrl}</td>
+                        {environmentMatrix.environments.map((env) => {
+                          const c = environmentMatrix.byPageEnv.get(`${pageUrl}\u0000${env}`);
+                          return (
+                            <td key={env} title={c?.note ?? ''}>
+                              {!c ? '—' : c.ok ? '✓' : '✗'}
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </section>
+          )}
+
+          {session.accessMap && session.accessMap.length > 0 && (
+            <section style={{ marginBottom: '1.5rem' }}>
+              <h2>Access Map</h2>
+              <p className="session-meta">
+                UI-hidden links checked for direct reachability under the current session's authenticated role — not a
+                cross-role comparison (that would need multiple real logins against a live account).
+              </p>
+              <table className="report-overview-table">
+                <thead>
+                  <tr>
+                    <th>Feature/Link</th>
+                    <th>Visible in UI</th>
+                    <th>Directly Reachable</th>
+                    <th>Note</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {session.accessMap.map((e, i) => (
+                    <tr key={i}>
+                      <td>{e.feature}</td>
+                      <td>✗</td>
+                      <td>{e.directlyReachable ? '✓' : '✗'}</td>
+                      <td>{e.note ?? ''}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -387,13 +524,15 @@ export function ReportPage() {
 
       {view === 'findings' && (
         <section className="findings-panel">
+          <QualityPilotConnect sessionId={session.id} />
+
           <h2>Findings ({sortedFindings.length})</h2>
           {sortedFindings.length === 0 ? (
             <p className="empty-state">No findings were recorded during this exploration.</p>
           ) : (
             <div className="findings-list">
               {sortedFindings.map((f: Finding) => (
-                <FindingCard key={f.id} finding={f} />
+                <FindingCard key={f.id} finding={f} sessionId={session.id} />
               ))}
             </div>
           )}

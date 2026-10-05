@@ -587,6 +587,22 @@ textarea {
   margin-bottom: 0.25rem;
 }
 
+.finding-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.finding-evidence-shot {
+  width: 140px;
+  height: 90px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  display: block;
+}
+
 .finding-card footer {
   display: flex;
   gap: 0.75rem;
@@ -1054,101 +1070,6 @@ textarea {
   .chat-panel {
     height: 50vh;
   }
-}
-
-/* PRD upload (chat + classic setup) */
-.prd-upload-bar {
-  margin-bottom: 1rem;
-  padding: 0.875rem 1rem;
-  border: 1px dashed var(--border, #cfcfcf);
-  border-radius: 8px;
-  background: var(--surface-2, #f7f7f5);
-}
-
-.prd-upload-label {
-  display: flex;
-  flex-direction: column;
-  gap: 0.35rem;
-  font-weight: 600;
-  font-size: 0.9rem;
-}
-
-.prd-upload-label input[type='file'] {
-  font-weight: 400;
-}
-
-.prd-upload-hint,
-.field-hint {
-  display: block;
-  margin-top: 0.4rem;
-  font-size: 0.8rem;
-  color: var(--text-muted, #666);
-  font-weight: 400;
-}
-
-.prd-upload-status {
-  display: inline-block;
-  margin-top: 0.35rem;
-  font-size: 0.85rem;
-}
-
-.prd-attached {
-  color: var(--success, #1a7f37);
-}
-
-.prd-error {
-  color: var(--danger, #b42318);
-}
-
-.prd-coverage-card {
-  margin: 1rem 0;
-  padding: 1rem;
-  border: 1px solid var(--border, #ddd);
-  border-radius: 8px;
-}
-
-.prd-coverage-card ul {
-  margin: 0.5rem 0 0;
-  padding-left: 1.2rem;
-}
-
-.prd-trace-table-wrap {
-  margin-top: 1rem;
-  overflow-x: auto;
-}
-
-.prd-trace-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.85rem;
-}
-
-.prd-trace-table th,
-.prd-trace-table td {
-  border: 1px solid var(--border, #ddd);
-  padding: 0.35rem 0.5rem;
-  text-align: left;
-  vertical-align: top;
-}
-
-.prd-trace-table th {
-  background: var(--surface-2, #f7f7f5);
-  font-weight: 600;
-}
-
-.prd-trace-table code {
-  font-size: 0.8em;
-}
-
-.prd-criteria-list {
-  margin-top: 1rem;
-}
-
-.prd-criteria-snip {
-  margin-top: 0.2rem;
-  color: var(--muted, #666);
-  font-size: 0.85rem;
-  font-style: italic;
 }
 
 .report-page .report-markdown {

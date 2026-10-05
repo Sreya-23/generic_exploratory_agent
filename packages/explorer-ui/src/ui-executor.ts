@@ -20,7 +20,6 @@ import { runEmptyStates } from './flows/empty-states.js';
 import { runBackDuringAction } from './flows/interruption.js';
 import { runJourneyFlow } from './flows/journey.js';
 import { runUserDirectedFlow } from './flows/user-directed.js';
-import { runPrdDrivenFlow } from './flows/prd-driven.js';
 import { runViewport } from './flows/viewport.js';
 import { runErrorUi } from './flows/error-ui.js';
 import { runAutofill } from './flows/autofill.js';
@@ -38,12 +37,17 @@ import { runLabelsCheck, runKeyboardCheck, runContrastCheck } from './flows/acce
 import { runElementIntegrity, runTouchTargetCheck } from './flows/element-integrity.js';
 import { runDeadLinksCheck } from './flows/dead-links.js';
 import { runActionInventory } from './flows/action-inventory.js';
+import { runDataIntegrityCheck } from './flows/data-integrity.js';
+import { runStateTransitionCheck } from './flows/state-transition.js';
+import { runHiddenRouteAccessCheck } from './flows/hidden-route-access.js';
+import { runGenericCrudCheck } from './flows/generic-crud.js';
 import { runCrossBrowserCheck } from './flows/cross-browser.js';
 import { runConsentExploration } from './flows/consent-exploration.js';
 import { runSecurityHeadersCheck } from './flows/security-headers.js';
 import { runBusinessLogicBoundary } from './flows/business-logic-boundary.js';
 import { runDeviceMatrixCheck } from './flows/device-matrix.js';
 import { runVisualReview } from './flows/visual-review.js';
+import { runAgenticExplore } from './flows/agentic-explore.js';
 import { runZoomReflow } from './flows/zoom-reflow.js';
 import { runDarkModeCheck } from './flows/dark-mode.js';
 import { runReducedMotionCheck } from './flows/reduced-motion.js';
@@ -533,7 +537,6 @@ const FLOW_HANDLERS: Record<
   'back-during-post': runBackDuringAction,
   'refresh-during-request': runBackDuringAction,
   'context-driven': runNavigation,
-  'prd-driven': runPrdDrivenFlow,
   'journey': runJourneyFlow,
   'user-directed': runUserDirectedFlow,
   // A6 — Viewport
@@ -570,12 +573,17 @@ const FLOW_HANDLERS: Record<
   // Dead internal links
   'dead-links': runDeadLinksCheck,
   'action-inventory': runActionInventory,
+  'data-integrity': runDataIntegrityCheck,
+  'state-transition': runStateTransitionCheck,
+  'hidden-route-access': runHiddenRouteAccessCheck,
+  'generic-crud': runGenericCrudCheck,
   'cross-browser': runCrossBrowserCheck,
   'consent-exploration': runConsentExploration,
   'security-headers': runSecurityHeadersCheck,
   'business-logic-boundary': runBusinessLogicBoundary,
   'device-matrix': runDeviceMatrixCheck,
   'visual-review': runVisualReview,
+  'agentic-explore': runAgenticExplore,
   'zoom-reflow': runZoomReflow,
   'dark-mode': runDarkModeCheck,
   'reduced-motion': runReducedMotionCheck,
@@ -596,6 +604,13 @@ const FLOW_HANDLERS: Record<
   'js-errors': runJsErrorsReport,
   'coverage-report': runCoverageReport,
 };
+
+// Both flows call out to Gemini and document themselves as purely additive — skipping
+// gracefully, never affecting any other task, if that call is slow/unavailable/fails. A
+// timeout at the outer task level is this agent's own infrastructure, not a target-site
+// observation, so it's excluded from the generic "Task error" finding below rather than
+// being misreported as a defect in the site under test.
+const SELF_GATING_OPTIONAL_FLOWS = new Set(['visual-review', 'agentic-explore']);
 
 export class UiExecutor implements BaseExecutor {
   name = 'ui';
@@ -722,6 +737,18 @@ export class UiExecutor implements BaseExecutor {
     } catch (err) {
       const msg = (err as Error).message;
       ctx.onLog(`[UI] Error: ${msg}`);
+      // visual-review and agentic-explore both call out to Gemini and explicitly document
+      // themselves as "never blocks, never affects any other task" if that call is slow,
+      // unavailable, or fails — a timeout here is this agent's own infrastructure not
+      // completing in time, not an observation about the target site, and reporting it as a
+      // "UI-Error: Task error" finding directly contradicts that documented behavior by
+      // presenting an internal failure as if it were evidence of a site defect.
+      if (SELF_GATING_OPTIONAL_FLOWS.has(task.flowClass)) {
+        ctx.onLog(
+          `[UI] "${task.title}" did not complete (likely a slow/unavailable Gemini call) — skipping without reporting a finding, per this flow's own graceful-failure design`,
+        );
+        return { taskId: task.id, success: false, findingsCount };
+      }
       if (page) {
         try {
           const shot = await screenshot(page, ctx, `error-${task.id}`);

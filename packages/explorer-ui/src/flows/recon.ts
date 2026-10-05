@@ -150,12 +150,16 @@ export async function runRecon(
     ctx.onLog(`[Recon] Sharing ${apiCalls.length} real API endpoints with API executor`);
   }
 
-  // Collect signals and notify orchestrator for classification
+  // Collect signals and notify orchestrator for classification. Awaited because the
+  // orchestrator's handler may call out to an LLM for classification before falling back
+  // to the deterministic rule set — recon is a one-shot early task, so it's the right place
+  // to absorb that extra latency rather than letting later tasks race ahead of a classification
+  // that hasn't landed yet.
   if (ctx.onClassification) {
     const signals = await collectIntelligenceSignals(page);
     // onClassification is wired by the orchestrator which has access to classifySite
     // We pass signals via a synthetic "signals" classification call
-    ctx.onClassification({ siteType: 'generic', confidence: 0, signals: [], inferredJourneys: [], keyFeatures: [], _rawSignals: signals } as unknown as import('@qa/shared').SiteClassification);
+    await ctx.onClassification({ siteType: 'generic', confidence: 0, signals: [], inferredJourneys: [], keyFeatures: [], _rawSignals: signals } as unknown as import('@qa/shared').SiteClassification);
   }
 
   if (hasLoginWall) {

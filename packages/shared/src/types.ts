@@ -83,10 +83,6 @@ export type AuthState =
 export interface SessionConfig {
   targetUrl: string;
   context?: string;
-  /** Absolute path to uploaded PRD file (.pdf, .md, .txt). When set, exploration is PRD-only. */
-  prdPath?: string;
-  /** Original filename for display (e.g. in chat / report). */
-  prdFilename?: string;
   depth: SessionDepth;
   areas: ExplorationArea[];
   credentials?: SessionCredentials;
@@ -97,56 +93,11 @@ export interface SessionConfig {
   selectedFlowClasses?: string[];
 }
 
-/** QA variant run against a single PRD feature */
-export type PrdTestVariant = 'happy' | 'negative' | 'interruption';
-
-export type PrdFeatureStatus = 'tested' | 'passed' | 'failed' | 'blocked' | 'skipped' | 'gap';
-
-export interface PrdFeatureCoverage {
-  feature: string;
-  variant: PrdTestVariant;
-  status: PrdFeatureStatus;
-  notes: string;
-  findingsCount: number;
-  /** Stable PRD requirement id (e.g. F1, SMOKE) for traceability */
-  requirementId?: string;
-  /** FlowTask.id that produced this result */
-  taskId?: string;
-  /** Truncated acceptance criteria / user story from the PRD */
-  criteria?: string;
-}
-
-export interface PrdFeatureDetail {
-  requirementId: string;
-  name: string;
-  /** User story or acceptance snippet from the PRD */
-  criteria?: string;
-}
-
 export interface FindingFingerprintDiff {
   previousSessionId?: string;
   newFindings: string[];
   fixedFindings: string[];
   recurringFindings: string[];
-  markdown: string;
-}
-
-export interface PrdCoverageSummary {
-  prdFilename?: string;
-  featuresExtracted: string[];
-  constraintsExtracted: string[];
-  /** F1…Fn with truncated criteria for report traceability */
-  featureDetails?: PrdFeatureDetail[];
-  featureResults: PrdFeatureCoverage[];
-  /** Features with no matching UI found */
-  gaps: string[];
-  /** Features blocked (login, sensitive gate, etc.) */
-  blocked: string[];
-  testedCount: number;
-  passedCount: number;
-  failedCount: number;
-  /** Diff vs previous session for same target (when available) */
-  findingDiff?: FindingFingerprintDiff;
   markdown: string;
 }
 
@@ -164,8 +115,6 @@ export interface Finding {
   reproRate: string;
   automationCandidate: boolean;
   createdAt: string;
-  /** PRD requirement id when finding came from PRD-driven QA */
-  requirementId?: string;
   /** FlowTask.id when finding came from a planned task */
   taskId?: string;
   /** Stable fingerprint for cross-session diff (area|normalized-title) */
@@ -201,6 +150,39 @@ export interface Finding {
   confidenceReason?: string;
 }
 
+/**
+ * One UI-hidden-but-DOM-present link, and whether it's actually reachable when navigated to
+ * directly — the ground truth behind hidden-route-access.ts's findings, recorded regardless of
+ * outcome so the report can show a real access map (what's hidden vs. what's hidden-and-also-
+ * enforced) rather than only the failures. Reflects the SINGLE currently-authenticated role —
+ * this codebase logs in once per session (see performSessionLogin), so a true side-by-side
+ * multi-role comparison (Admin vs. Manager vs. User) would need multiple real credential sets
+ * and multiple real logins, which isn't how session auth is architected here and would add
+ * real risk (extra OTP sends, lockout exposure) against a live account — out of scope for now.
+ */
+export interface AccessMapEntry {
+  feature: string;
+  pageUrl: string;
+  visibleInUi: false;
+  directlyReachable: boolean;
+  note?: string;
+}
+
+/**
+ * One (page, environment) pair that cross-browser.ts or device-matrix.ts actually checked,
+ * recorded regardless of outcome — the ground truth a report needs to render a real ✓/✗
+ * comparison grid, since findings alone only ever record the ✗ side.
+ */
+export interface EnvironmentCheck {
+  pageUrl: string;
+  /** e.g. "Chromium", "Firefox", "WebKit", or a device name like "iPhone 13" */
+  environment: string;
+  kind: 'browser' | 'device';
+  ok: boolean;
+  /** Short reason when ok is false — the finding title, or the load error. */
+  note?: string;
+}
+
 export interface FlowTask {
   id: string;
   area: ExplorationArea;
@@ -208,18 +190,6 @@ export interface FlowTask {
   title: string;
   description: string;
   priority: number;
-  /** Optional metadata — used heavily for PRD-driven tasks */
-  meta?: {
-    prdFeature?: string;
-    prdVariant?: PrdTestVariant;
-    prdConstraints?: string[];
-    /** e.g. F1, F2 — maps PRD feature → tasks → findings */
-    prdRequirementId?: string;
-    /** Truncated acceptance criteria from PRD */
-    prdCriteria?: string;
-    /** When true, this task is the pre-PRD auth smoke gate */
-    isAuthSmoke?: boolean;
-  };
 }
 
 export interface ExplorationPlan {
@@ -252,14 +222,12 @@ export interface SessionState {
    * (including API executor which runs later) can access them.
    */
   discoveredApiEndpoints?: string[];
-  /** Populated when a PRD was uploaded — coverage of PRD features vs what was tested */
-  prdCoverage?: PrdCoverageSummary;
   /** Every distinct button/icon-button/menu-item found and what happened when clicked. */
   actionInventory?: ActionInventorySummary;
   /**
    * Diff vs the most recent previous completed session for the same target — new / fixed /
-   * recurring findings. Populated for every session (not just PRD-driven ones) once a prior
-   * run against the same target exists.
+   * recurring findings. Populated for every session once a prior run against the same
+   * target exists.
    */
   findingDiff?: FindingFingerprintDiff;
   /**
@@ -271,6 +239,23 @@ export interface SessionState {
   discoveredRoutes?: string[];
   /** Distinct routes actually navigated to during the session — the "what did we really cover" answer. */
   visitedRoutes?: string[];
+  /**
+   * Every (page, environment) pair cross-browser.ts/device-matrix.ts actually checked, pass or
+   * fail — unlike findings (which only ever record failures), this is what lets the report
+   * build an honest comparison grid with real ✓ cells, not just blank-where-no-finding-exists.
+   */
+  environmentChecks?: EnvironmentCheck[];
+  /** Every UI-hidden link checked for direct reachability this session — see AccessMapEntry. */
+  accessMap?: AccessMapEntry[];
+  /**
+   * Persistent per-CATEGORY "what does this kind of application do" doc (see
+   * site-knowledge-base.ts) — keyed by classification.siteType (fintech, ecommerce,
+   * saas-dashboard, ...), not hostname: generated once the first time that category is seen,
+   * reused silently for every other, different site that later classifies into the same
+   * category. Markdown, human-readable, also saved to disk under
+   * knowledge-base/<siteType>.md so it survives independently of any one session.
+   */
+  siteKnowledge?: string;
   createdAt: string;
   updatedAt: string;
   error?: string;
@@ -301,8 +286,7 @@ export type SessionEventType =
   | 'chat:message'
   | 'chat:history'
   | 'auth:required'
-  | 'auth:otp_required'
-  | 'prd:coverage';
+  | 'auth:otp_required';
 
 export interface SessionEvent {
   type: SessionEventType;
@@ -334,7 +318,9 @@ export type ActionInventoryResult =
   | 'no-effect'
   | 'error'
   | 'skipped-risky'
-  | 'skipped-disabled';
+  | 'skipped-disabled'
+  | 'skipped-blocked'
+  | 'no-effect-expected';
 
 export interface ActionInventoryEntry {
   label: string;
@@ -392,7 +378,7 @@ export interface ExecutorContext {
   envDegraded?: boolean;
   onFinding: (finding: Omit<Finding, 'id' | 'sessionId' | 'createdAt'>) => void;
   onLog: (message: string) => void;
-  onClassification?: (c: SiteClassification) => void;
+  onClassification?: (c: SiteClassification) => void | Promise<void>;
   /**
    * Called before any risky / irreversible action (purchase, payment, send link, etc.).
    * Returns the extras data available (from credentials.extras) if the action can proceed,
@@ -400,12 +386,19 @@ export interface ExecutorContext {
    * The orchestrator also emits a live chat message prompting the user to provide missing data.
    */
   onPreActionNeeded?: (req: PreActionRequest) => Record<string, string> | null;
-  /** Called by PRD-driven flows to record per-feature coverage */
-  onPrdCoverageUpdate?: (update: PrdFeatureCoverage) => void;
   /** Distinct routes (origin+pathname) discovered from links on the landing page, set by recon. */
   discoveredRoutes?: string[];
   /** Distinct routes actually navigated to during the session, set by the coverage-report flow. */
   visitedRoutes?: string[];
+  /**
+   * Every (page, environment) pair cross-browser.ts/device-matrix.ts actually checked, pass or
+   * fail. Flows append to whatever they received (producing a new array reference) rather than
+   * overwriting — same "flow owns the merge, orchestrator just copies the reference across if
+   * it changed" contract as discoveredRoutes/visitedRoutes above.
+   */
+  environmentChecks?: EnvironmentCheck[];
+  /** Every UI-hidden link checked for direct reachability this session — see AccessMapEntry. */
+  accessMap?: AccessMapEntry[];
 }
 
 export interface ExecutorResult {
@@ -450,9 +443,6 @@ export interface SetupDraft {
   flowInstructions?: string[];
   /** Explicitly selected matrix flow IDs (e.g. "A6", "B2", "C4") mapped to flowClass strings */
   selectedFlowClasses?: string[];
-  /** Absolute path to PRD uploaded during setup chat (optional) */
-  prdPath?: string;
-  prdFilename?: string;
 }
 
 export interface SetupChatResponse {
@@ -474,6 +464,10 @@ export type SiteType =
   | 'blog-cms'
   | 'social'
   | 'fintech'
+  // A chat/copilot-style AI product (prompt input + generated response), not a traditional
+  // CRUD-shaped app — correctness here means "did it respond/degrade gracefully," not "does
+  // this exact text match," since the output is legitimately non-deterministic.
+  | 'ai-product'
   | 'generic';
 
 export interface SiteClassification {

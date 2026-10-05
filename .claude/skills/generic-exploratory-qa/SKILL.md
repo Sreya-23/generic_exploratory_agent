@@ -3,9 +3,9 @@
 name: generic-exploratory-qa
 description: >-
   Performs intelligent exploratory QA on web applications — edge cases, chaos
-  testing, API probes, regression, and PRD-driven flows. Use when the user asks
-  for exploratory testing, QA edge cases, chaos testing, test case discovery,
-  PRD testing, regression testing, API testing, or stress testing any web app.
+  testing, API probes, and regression. Use when the user asks for exploratory
+  testing, QA edge cases, chaos testing, test case discovery, regression
+  testing, API testing, or stress testing any web app.
 ---
 
 # Generic Exploratory QA
@@ -18,9 +18,8 @@ before pay/transfer/send, fintech-careful policies), use the sibling skill
 ## Quick Start
 
 1. Determine input mode:
-   - **PRD provided (optional)** → parse PRD → run **PRD-only** feature QA (see [PRD-Driven Protocol](#prd-driven-protocol-when-prd-uploaded))
-   - **Context provided (no PRD)** → derive flows from description, then generic matrix
-   - **Neither** → run Generic Baseline Protocol (below)
+   - **Context provided** → derive flows from description, then generic matrix
+   - **No context** → run Generic Baseline Protocol (below)
 
 2. Ask for target URL and credentials only if needed (login wall detected).
 
@@ -35,26 +34,15 @@ before pay/transfer/send, fintech-careful policies), use the sibling skill
 The agent uses a simple conversational setup:
 
 ```
-1. User pastes URL (and optionally uploads a PRD PDF via the upload control)
+1. User pastes URL
    → Agent auto-probes for auth type (password / OTP / OAuth / magic-link / SAML / none)
    → Agent asks exactly the right questions for that auth type
 
 2. If login required: Agent asks for credentials specific to the detected login type
    (see Auth Types table below)
 
-3. Session starts —
-   - If PRD uploaded → parse PRD, merge into context, run PRD-only feature QA
-   - If no PRD → login once, save session, run full matrix as before
+3. Session starts — login once, save session, run full matrix
 ```
-
-### Optional PRD upload (UI)
-
-| Entry point | How |
-|-------------|-----|
-| **Chat setup** (`/chat`) | File picker above the chat — `.pdf` (also `.md` / `.txt`) |
-| **Classic setup** (`/setup`) | "PRD file (optional)" field |
-
-PRD is **optional**. Without it, behaviour is unchanged (generic exploratory matrix).
 
 ---
 
@@ -171,11 +159,11 @@ Matrix IDs map to these flow classes:
 
 | Section | IDs | Flow classes |
 |---------|-----|-------------|
-| UI & Interaction | A1–A15 | navigation, form-validation, input-boundary, double-click, keyboard-nav, viewport, modal-lifecycle, empty-states, error-ui, autofill, file-upload, pagination-ui, wizard, `device-matrix` (real iPhone/iPad/Pixel/Galaxy Tab emulation — not just resized viewport), file-upload-security 📋, i18n-rtl 📋 |
-| Navigation & Session | B1–B9 | back-during-post, forward-after-back, refresh-during-request, deep-link, session-timeout, multi-tab-logout, concurrent-write 📋 |
+| UI & Interaction | A1–A16 | navigation, form-validation, input-boundary, double-click, keyboard-nav, viewport, modal-lifecycle, empty-states, error-ui, autofill, file-upload, pagination-ui (also covers search/filter result-count consistency — a declared count that disagrees with the actually-rendered rows), wizard, `device-matrix` (real iPhone/iPad/Pixel/Galaxy Tab emulation — not just resized viewport; also measures per-device horizontal overflow at each device's own real width, distinct from `viewport.ts`'s resized-Chromium widths and `zoom-reflow.ts`'s desktop zoom levels), file-upload-security 📋, i18n-rtl 📋, empty-credential login boundary (A16 — pre-login orchestrator check, not a scheduled flow class) |
+| Navigation & Session | B1–B12 | back-during-post, forward-after-back, refresh-during-request, deep-link, session-timeout, multi-tab-logout, concurrent-write 📋, unexpected-external-redirect (B10) and infinite-redirect-loop (B11) — both in `navigation.ts`'s BFS traversal, orphan-page-via-sitemap (B12) — in `coverage-report.ts` |
 | Network & Chaos | C1–C6 | slow-network, offline-mid-request, offline-recovery, flaky-network, timeout-retry, websocket-disconnect |
 | API | D1–D11 | crud, auth-matrix, idempotency, pagination, rate-limit, token-expiry 📋, csrf-probe 📋, graphql-probe 📋 |
-| Security | F1–F9 | idor-probe, horizontal-privilege, vertical-privilege, xss-probe, mass-assignment, security-headers (also covers cookie-flags + clickjacking-probe — one flow, one response's headers + cookie jar), open-redirect 📋 |
+| Security | F1–F10 | idor-probe, horizontal-privilege, vertical-privilege, xss-probe, mass-assignment, security-headers (also covers cookie-flags + clickjacking-probe — one flow, one response's headers + cookie jar), open-redirect 📋, hidden-route-access (F10 — UI-hidden link directly reachable and renders real content; distinct from F2/F3 which probe API endpoints, this checks client-side-only route gating) |
 | Performance | G1–G3 | spike-load, large-payload, n-plus-one |
 | Regression | H1–H3 | golden-path, visual-regression, schema-drift |
 | Accessibility | E1–E3 | labels, keyboard, contrast — 📋 **planned, no handler yet; falls back to `navigation`** |
@@ -207,71 +195,7 @@ Tell the agent specific paths to test in plain language. These run first, before
 "verify that logout redirects to login"
 ```
 
-## PRD-Driven Protocol (when PRD uploaded)
-
-When a PRD file is uploaded, **do not** run the generic A1–H3 matrix.
-
-```
-URL + optional credentials
-  ↓
-parsePrd()              Extract features + constraints from PDF/md/txt
-  ↓
-Merge into context      Overview, feature list, constraints on SessionConfig.context
-  ↓
-buildPrdOnlyPlan()      Auth smoke gate + for each feature (max 12):
-                          • happy path (with verified assertions)
-                          • negative / empty / invalid
-                          • interruption (back + refresh mid-submit)
-  ↓
-recon (light)           Map site so feature UI can be located
-  ↓
-prd-auth-smoke          Fail-fast: auth-state + post-login URL + not login wall
-  ↓
-prd-driven executor     Locate UI by intent → assert outcomes (not just "no crash")
-  ↓
-Coverage summary        Chat + report with Req ID → task ID → result traceability
-```
-
-### Per-feature QA (think like a QA engineer)
-
-| Variant | What is exercised |
-|---------|-------------------|
-| **Happy** | Seed required state (e.g. cart), exercise feature, **assert** outcomes: inventory count, cart badge/line items, checkout-complete URL, logout → login form (do not mistreat login-page validation as logout failure) |
-| **Negative** | Empty + wrong password + locked_out_user (login); empty cart / whitespace names / missing postal (checkout); inventory blocked after logout |
-| **Interruption** | Back + refresh mid-flow; **pass/fail** on healthy recovery (document whether fields retained or cleared) |
-
-**Auth landing (critical):** After one-time login, the agent saves `auth-state.json` **and** `post-login-url.txt`. Each task restores cookies and opens the post-login app URL (not the login page). If the target root is still a login form (e.g. Sauce Demo `/`), it tries `/inventory.html` and similar paths before testing. Login-related PRD features intentionally use the login page; other features must not be blocked by a false login-wall.
-
-**Auth smoke gate:** Runs after recon. If session restore / post-login landing fails, remaining PRD feature tasks are **skipped** (status `skipped`) instead of producing shallow false passes.
-
-**Traceability:** Each feature gets a requirement id (`F1`, `F2`, …; smoke = `SMOKE`) plus truncated acceptance criteria from the PRD. Findings and coverage rows include `requirementId` + `taskId`. Screenshots are named `{taskId}-{label}.png` (no overwrites).
-
-**Reliability harness:** Each UI task has a **90s timeout**, **10s heartbeat logs** (“Still working…”), short locator timeouts, and interruption `goBack` that ignores `about:blank` (history seeding / recover — not HIGH).
-
-**Finding hygiene:** Fingerprints enable **baseline diff** (new / fixed / recurring vs previous session for the same URL). Known demo quirks (e.g. Sauce empty-cart → step-one) are **quarantined** to info with an explicit reason.
-
-**State setup:** Cart/checkout happy paths call `seedCart()` so tests start from a known non-empty cart. Inventory asserts sort when present; cart asserts remove + price labels; checkout asserts overview totals before Finish.
-
-Sensitive / high-risk fields still follow the Sensitive Data policy (never random email/phone/card; gate Send/Pay).
-
-### Coverage summary (required when PRD was given)
-
-Emit in **live chat** and store on `state.prdCoverage` / session report:
-
-- Features extracted from PRD (with F1…Fn ids)
-- Constraints extracted
-- Per feature × variant: status (`passed` / `failed` / `tested` / `gap` / `blocked` / `skipped`) + notes + requirementId + taskId
-- Gaps: PRD feature mentioned, but no matching UI found
-- Blocked: login wall or sensitive gate stopped the test
-- Totals: passed / failed / gaps / blocked / skipped
-
-Report endpoint: `GET /api/sessions/:id/report?format=md|json`
-
-### No PRD → unchanged
-
-If no PRD is uploaded, follow the Generic Baseline Protocol and full matrix exactly as before.
-
-## Generic Baseline Protocol (No PRD)
+## Generic Baseline Protocol
 
 ```
 Phase 1 — Recon:        Map URLs, forms, API calls, text signals
@@ -283,6 +207,8 @@ Phase 5 — Auth:         Unauthenticated access probes
 Phase 6 — Chaos:        Offline, slow network, recovery
 Phase 7 — Report:       Dedupe, severity, repro steps
 ```
+
+**Finding hygiene:** Fingerprints enable **baseline diff** (new / fixed / recurring vs previous session for the same URL). Known demo quirks are **quarantined** to info with an explicit reason.
 
 ## Intelligence Pipeline — How the Agent Adapts to Any Site
 
@@ -412,11 +338,11 @@ all **auto-wait** for their locator to resolve to an attached element before run
 sub-locator (`el.locator('i, svg').first()`, `page.locator('label[for="x"]').first()`, etc.)
 matches ZERO elements, the call doesn't fail fast: it blocks for Playwright's full default
 actionability timeout (tens of seconds) before the surrounding `.catch()` ever fires. Found
-and fixed in 5+ places this session (`element-matcher.ts`'s scoring, `describeElement()`,
-`forms.ts`'s label lookup, `wizard.ts`'s back-button check, ~22 unguarded `.fill()`/`.click()`
-calls in `prd-driven.ts`) — this was the actual root cause behind every "Domain Journey
-timeout after 90s" finding seen across two completely different real sites, not a slow site
-or a single bad flow. Verified fix: one specific hang went from 39.5s to 8.8s.
+and fixed in several places this session (`element-matcher.ts`'s scoring, `describeElement()`,
+`forms.ts`'s label lookup, `wizard.ts`'s back-button check) — this was the actual root cause
+behind every "Domain Journey timeout after 90s" finding seen across two completely different
+real sites, not a slow site or a single bad flow. Verified fix: one specific hang went from
+39.5s to 8.8s.
 
 **When writing a new flow**, any locator that might legitimately not exist on the page:
 - For a read (`getAttribute`/`textContent`/`inputValue`): check `.count() > 0` first (a

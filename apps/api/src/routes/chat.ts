@@ -1,11 +1,8 @@
 import type { FastifyInstance } from 'fastify';
-import { mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
 import {
   getOrCreateSetupConversation,
   processSetupMessage,
   applyProbeToConversation,
-  attachPrdToSetupConversation,
   liveChatStore,
   processLiveMessage,
   sessionEventToChatMessage,
@@ -184,44 +181,8 @@ export function bridgeSessionEventToChat(event: SessionEvent): SessionEvent | nu
   };
 }
 
-/** PRD upload during setup chat + session report download */
-export function registerPrdAndReportRoutes(app: FastifyInstance, sessionsDir: string): void {
-  app.post<{ Querystring: { conversationId?: string } }>(
-    '/api/chat/setup/upload-prd',
-    async (req, reply) => {
-      const conversationId = req.query.conversationId;
-      if (!conversationId) {
-        return reply.status(400).send({ error: 'conversationId query param is required' });
-      }
-
-      try {
-        getOrCreateSetupConversation(conversationId);
-      } catch (err) {
-        return reply.status(404).send({ error: (err as Error).message });
-      }
-
-      const data = await req.file();
-      if (!data) return reply.status(400).send({ error: 'No file uploaded' });
-
-      const buffer = await data.toBuffer();
-      const filename = data.filename ?? 'prd.pdf';
-      const ext = filename.split('.').pop()?.toLowerCase() ?? 'pdf';
-      if (!['pdf', 'md', 'txt'].includes(ext)) {
-        return reply.status(400).send({
-          error: 'Unsupported file type. Upload a .pdf, .md, or .txt PRD.',
-        });
-      }
-
-      const setupDir = join(sessionsDir, `setup-${conversationId}`);
-      await mkdir(setupDir, { recursive: true });
-      const prdPath = join(setupDir, `prd.${ext}`);
-      const { writeFile } = await import('node:fs/promises');
-      await writeFile(prdPath, buffer);
-
-      return attachPrdToSetupConversation(conversationId, prdPath, filename);
-    },
-  );
-
+/** Session report download (Markdown / HTML / JSON) + findings Q&A */
+export function registerReportRoutes(app: FastifyInstance, sessionsDir: string): void {
   app.get<{ Params: { id: string }; Querystring: { format?: string } }>(
     '/api/sessions/:id/report',
     async (req, reply) => {
@@ -230,7 +191,7 @@ export function registerPrdAndReportRoutes(app: FastifyInstance, sessionsDir: st
 
       const format = (req.query.format ?? 'json').toLowerCase();
 
-      let report = generateSessionReport(session);
+      let report = await generateSessionReport(session);
       if (session.status === 'completed' || session.status === 'failed') {
         try {
           report = await writeSessionReport(sessionsDir, session);
@@ -240,7 +201,7 @@ export function registerPrdAndReportRoutes(app: FastifyInstance, sessionsDir: st
       }
 
       if (format === 'md' || format === 'markdown') {
-        // Prefer rich template report; fall back to PRD-aware markdown if needed
+        // Prefer the rich template report; fall back to the plain markdown generator
         const md = report.markdown || generateSessionReportMarkdown(session);
         return reply
           .header('Content-Type', 'text/markdown; charset=utf-8')
@@ -268,7 +229,6 @@ export function registerPrdAndReportRoutes(app: FastifyInstance, sessionsDir: st
         markdown: report.markdown,
         html: report.html,
         findings: report.summary.findings,
-        prdCoverage: session.prdCoverage ?? null,
         reportMarkdown: generateSessionReportMarkdown(session),
         session,
       };
@@ -286,7 +246,6 @@ export function registerPrdAndReportRoutes(app: FastifyInstance, sessionsDir: st
       const answer = answerFindingsQuestion(question, {
         findings: session.findings,
         targetUrl: session.config.targetUrl,
-        prdCoverage: session.prdCoverage,
       });
       return { answer };
     },

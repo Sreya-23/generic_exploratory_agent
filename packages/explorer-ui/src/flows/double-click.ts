@@ -65,6 +65,79 @@ async function readCartCount(page: Page): Promise<number | null> {
 }
 
 /**
+ * §16 — toggle idempotency: Like/Follow/Subscribe-style buttons are binary state toggles, and
+ * two deliberate, spaced clicks (not the rapid-fire stress test below — this is about STATE
+ * correctness, not request debouncing) should always return to the original state, matching
+ * the doc's own "Like, Like, Unlike, Like" example. Generic on purpose — reads aria-pressed/
+ * aria-checked first (the ARIA-correct signal), then falls back to the button's own visible
+ * text (the extremely common Like⇄Unlike / Follow⇄Following text-swap pattern). Returns null
+ * (inconclusive, not asserted either way) when neither signal is available, rather than
+ * guessing from something fragile like a class name.
+ */
+async function readToggleState(page: Page, selector: string): Promise<string | null> {
+  const btn = page.locator(selector).first();
+  const ariaPressed = await btn.getAttribute('aria-pressed').catch(() => null);
+  if (ariaPressed !== null) return `aria-pressed:${ariaPressed}`;
+  const ariaChecked = await btn.getAttribute('aria-checked').catch(() => null);
+  if (ariaChecked !== null) return `aria-checked:${ariaChecked}`;
+  const text = (await btn.textContent().catch(() => null))?.trim();
+  return text ? `text:${text}` : null;
+}
+
+async function checkToggleIdempotency(
+  page: Page,
+  ctx: ExecutorContext,
+  selector: string,
+  label: string,
+  pageUrl: string,
+  pageTitle: string,
+): Promise<void> {
+  const originalState = await readToggleState(page, selector);
+  if (originalState === null) {
+    ctx.onLog(`[RapidClick] "${label}": no aria-pressed/aria-checked/text signal available — skipping toggle-idempotency check`);
+    return;
+  }
+
+  const btn = page.locator(selector).first();
+  await btn.click({ timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const afterFirstClick = await readToggleState(page, selector);
+
+  if (afterFirstClick === originalState) {
+    // The click may be a genuinely non-toggling action (e.g. "Subscribe" with no unsubscribe
+    // path from this button) — not evidence of a bug on its own, and nothing to toggle back.
+    ctx.onLog(`[RapidClick] "${label}": state did not change after one click ("${originalState}") — not a toggle from this button, skipping`);
+    return;
+  }
+
+  await btn.click({ timeout: 3000 }).catch(() => {});
+  await page.waitForTimeout(600);
+  const afterSecondClick = await readToggleState(page, selector);
+
+  if (afterSecondClick === originalState) {
+    ctx.onLog(`[RapidClick] "${label}" toggle idempotency correct: two clicks return to the original state ("${originalState}")`);
+    return;
+  }
+
+  const shotPath = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `toggle-idempotency-${label.replace(/\s+/g, '-')}.png`);
+  await page.screenshot({ path: shotPath }).catch(() => {});
+  ctx.onFinding({
+    severity: 'medium',
+    area: 'UI-RapidClick',
+    title: `"${label}" does not return to its original state after two clicks`,
+    steps: [`Page: ${pageUrl} ("${pageTitle}")`, `Note the state of "${label}" (${originalState})`, `Click "${label}"`, `Click "${label}" again`],
+    expected: `Two clicks on a toggle-shaped control should return to the original state ("${originalState}")`,
+    actual: `After two clicks, state is "${afterSecondClick}" — expected "${originalState}" (after one click it was "${afterFirstClick}")`,
+    evidence: [shotPath],
+    reproRate: '1/1',
+    automationCandidate: true,
+    pageUrl,
+    confidence: 'heuristic',
+    confidenceReason: 'Based on aria-pressed/aria-checked/visible-text as a proxy for toggle state — a control with more than two real states (e.g. a three-way cycle) would also trigger this without being a bug; verify the control is genuinely meant to be a binary toggle before treating as confirmed.',
+  });
+}
+
+/**
  * Fire N rapid clicks on a button using programmatic dispatch.
  * This is more reliable than calling .click() N times because it
  * doesn't wait for the browser's own event processing between calls.
@@ -103,6 +176,14 @@ export async function runDoubleClick(
     testedButtons.push(label);
 
     ctx.onLog(`[RapidClick] Testing: "${label}" (kind: ${kind})`);
+
+    // Toggle idempotency runs BEFORE the rapid-click stress test below, on a clean/known
+    // baseline — two deliberate, spaced clicks return the control to its starting state (when
+    // idempotent), so the rapid-click test that follows also starts from a consistent baseline
+    // regardless of what this check found.
+    if (kind === 'social') {
+      await checkToggleIdempotency(page, ctx, sel, label, pageUrl, pageTitle);
+    }
 
     // Snapshot before action
     const shotBefore = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `rapid-${label.replace(/\s+/g, '-')}-before.png`);

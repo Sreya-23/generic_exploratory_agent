@@ -52,9 +52,8 @@ export function ChatSetupPage() {
     setMessages(res.messages);
     setReadyToStart(res.readyToStart);
     if (res.draft.targetUrl) {
-      const prdBit = res.draft.prdFilename ? ` · PRD: ${res.draft.prdFilename}` : '';
       setDraftSummary(
-        `${res.draft.targetUrl} · ${res.draft.depth} · ${res.draft.areas.join(', ')}${prdBit}`,
+        `${res.draft.targetUrl} · ${res.draft.depth} · ${res.draft.areas.join(', ')}`,
       );
     }
   };
@@ -144,9 +143,6 @@ export function ChatSetupPage() {
           </p>
           {draftSummary && <p className="draft-summary">{draftSummary}</p>}
         </div>
-        <a href="/setup" className="form-link">
-          Prefer a form? Use classic setup →
-        </a>
       </div>
 
       <ChatPanel

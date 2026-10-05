@@ -4,14 +4,15 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
-import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
 import fastifyStatic from '@fastify/static';
 import type { SessionConfig } from '@qa/shared';
 import { EXPLORATION_AREAS, SESSION_DEPTHS } from '@qa/shared';
 import { orchestrator } from '@qa/agent-core';
 import { liveChatStore } from '@qa/chat-agent';
-import { registerChatRoutes, bridgeSessionEventToChat, registerPrdAndReportRoutes } from './routes/chat.js';
+import { registerChatRoutes, bridgeSessionEventToChat, registerReportRoutes } from './routes/chat.js';
+import { loadCredentialsForHost, saveCredential, deleteCredential, type SavedCredential } from './credentials-store.js';
+import { loadQualityPilotConfig, saveQualityPilotConfig, raiseFindingsInQualityPilot, type QualityPilotConfig } from './qualitypilot-integration.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const ROOT = resolve(__dirname, '../../..');
@@ -57,7 +58,6 @@ if (process.env.CLEAR_SESSIONS_ON_START === '1') {
 const app = Fastify({ logger: true });
 
 await app.register(cors, { origin: true });
-await app.register(multipart, { limits: { fileSize: 20 * 1024 * 1024 } });
 await app.register(websocket);
 
 await app.register(fastifyStatic, {
@@ -78,8 +78,6 @@ app.get('/', async () => ({
     sessions: 'GET /api/sessions',
     createSession: 'POST /api/sessions',
     startSession: 'POST /api/sessions/:id/start',
-    uploadPrd: 'POST /api/sessions/:id/upload-prd',
-    setupUploadPrd: 'POST /api/chat/setup/upload-prd?conversationId=',
     report: 'GET /api/sessions/:id/report?format=md|json',
     liveUpdates: 'WS /api/sessions/:id/ws',
     chatSetup: 'POST /api/chat/setup',
@@ -93,8 +91,77 @@ app.get('/api/meta', async () => ({
   depths: SESSION_DEPTHS,
 }));
 
+// Saved logins per site/role — see credentials-store.ts. Local single-user tool, so returning
+// the full saved credential (including password, when present) is fine: the exposure surface
+// is the same machine that already holds credentials.json on disk.
+app.get<{ Querystring: { hostname?: string } }>('/api/credentials', async (req, reply) => {
+  if (!req.query.hostname) return reply.status(400).send({ error: 'hostname query param is required' });
+  return loadCredentialsForHost(ROOT, req.query.hostname);
+});
+
+app.post<{ Querystring: { hostname?: string }; Body: { role: string } & SavedCredential }>(
+  '/api/credentials',
+  async (req, reply) => {
+    const { hostname } = req.query;
+    const { role, ...credential } = req.body;
+    if (!hostname || !role) return reply.status(400).send({ error: 'hostname query param and role are required' });
+    await saveCredential(ROOT, hostname, role, credential);
+    return { saved: true };
+  },
+);
+
+app.delete<{ Querystring: { hostname?: string; role?: string } }>('/api/credentials', async (req, reply) => {
+  const { hostname, role } = req.query;
+  if (!hostname || !role) return reply.status(400).send({ error: 'hostname and role query params are required' });
+  await deleteCredential(ROOT, hostname, role);
+  return { deleted: true };
+});
+
+// QualityPilot integration — one saved connection (base URL, workspace/project, auth token),
+// not per-session. See qualitypilot-integration.ts for why the token has no refresh mechanism.
+app.get('/api/integrations/qualitypilot', async () => {
+  const config = await loadQualityPilotConfig(ROOT);
+  return config ?? { configured: false };
+});
+
+app.post<{ Body: QualityPilotConfig }>('/api/integrations/qualitypilot', async (req, reply) => {
+  const { baseUrl, workspaceId, projectId, token } = req.body;
+  if (!baseUrl || !workspaceId || !projectId || !token) {
+    return reply.status(400).send({ error: 'baseUrl, workspaceId, projectId, and token are all required' });
+  }
+  await saveQualityPilotConfig(ROOT, { baseUrl, workspaceId, projectId, token });
+  return { saved: true };
+});
+
+app.post<{ Params: { id: string }; Body: { findingIds?: string[] } }>(
+  '/api/sessions/:id/raise-bugs',
+  async (req, reply) => {
+    const session = await orchestrator.getSessionOrRehydrate(req.params.id, SESSIONS_DIR);
+    if (!session) return reply.status(404).send({ error: 'Session not found' });
+
+    const config = await loadQualityPilotConfig(ROOT);
+    if (!config) return reply.status(400).send({ error: 'QualityPilot is not configured yet — set it up first.' });
+
+    const { findingIds } = req.body;
+    // Info-severity findings are never real defects (see generate-report.ts's own split) —
+    // excluded even if explicitly requested, same discipline as the report's own bug list.
+    const candidates = session.findings.filter((f) => f.severity !== 'info');
+    const findings = findingIds?.length
+      ? candidates.filter((f) => findingIds.includes(f.id))
+      : candidates;
+
+    if (findings.length === 0) {
+      return reply.status(400).send({ error: 'No eligible findings to raise (info-severity findings are excluded).' });
+    }
+
+    const result = await raiseFindingsInQualityPilot(config, session, findings);
+    if (!result.ok) return reply.status(502).send({ error: result.error });
+    return result.result;
+  },
+);
+
 await registerChatRoutes(app);
-registerPrdAndReportRoutes(app, SESSIONS_DIR);
+registerReportRoutes(app, SESSIONS_DIR);
 
 app.get('/api/sessions', async () => orchestrator.listSessions());
 
@@ -122,8 +189,6 @@ app.post<{ Body: SessionConfig }>('/api/sessions', async (req) => {
     areas: config.areas?.length ? config.areas : ['ui'],
     credentials: config.credentials ?? { type: 'none' },
     openApiUrl: config.openApiUrl,
-    prdPath: config.prdPath,
-    prdFilename: config.prdFilename,
     flowInstructions: config.flowInstructions,
     selectedFlowClasses: config.selectedFlowClasses,
   });
@@ -144,36 +209,6 @@ app.post<{ Params: { id: string } }>('/api/sessions/:id/pause', async (req, repl
   orchestrator.pauseSession(req.params.id);
   return orchestrator.getSession(req.params.id);
 });
-
-app.post<{ Params: { id: string } }>(
-  '/api/sessions/:id/upload-prd',
-  async (req, reply) => {
-    const session = orchestrator.getSession(req.params.id);
-    if (!session) return reply.status(404).send({ error: 'Session not found' });
-
-    const data = await req.file();
-    if (!data) return reply.status(400).send({ error: 'No file uploaded' });
-
-    const buffer = await data.toBuffer();
-    const filename = data.filename ?? 'prd.pdf';
-    const ext = filename.split('.').pop()?.toLowerCase() ?? 'pdf';
-    if (!['pdf', 'md', 'txt'].includes(ext)) {
-      return reply.status(400).send({
-        error: 'Unsupported file type. Upload a .pdf, .md, or .txt PRD.',
-      });
-    }
-
-    const prdPath = join(SESSIONS_DIR, req.params.id, `prd.${ext}`);
-    await mkdir(join(SESSIONS_DIR, req.params.id), { recursive: true });
-    const { writeFile } = await import('node:fs/promises');
-    await writeFile(prdPath, buffer);
-
-    session.config.prdPath = prdPath;
-    session.config.prdFilename = filename;
-    return { prdPath, filename };
-  },
-);
-
 
 app.get<{ Params: { id: string } }>('/api/sessions/:id/ws', { websocket: true }, (socket, req) => {
   const sessionId = req.params.id;

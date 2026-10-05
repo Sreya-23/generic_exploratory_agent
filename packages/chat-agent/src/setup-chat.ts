@@ -290,8 +290,6 @@ function draftToConfig(draft: SetupDraft): SessionConfig | undefined {
     credentials: draft.credentials,
     flowInstructions: draft.flowInstructions?.length ? draft.flowInstructions : undefined,
     selectedFlowClasses: draft.selectedFlowClasses?.length ? draft.selectedFlowClasses : undefined,
-    prdPath: draft.prdPath,
-    prdFilename: draft.prdFilename,
   };
 }
 
@@ -334,9 +332,6 @@ function summarizeDraft(draft: SetupDraft): string {
     `**Depth:** ${draft.depth}`,
     `**Areas:** ${areas}`,
     `**Auth:** ${creds}`,
-    draft.prdFilename || draft.prdPath
-      ? `**PRD:** ${draft.prdFilename ?? draft.prdPath} _(PRD-only testing — generic matrix skipped)_`
-      : '',
     extrasLine,
     instructionsLine,
     selectedLine,
@@ -424,17 +419,14 @@ function buildAssistantReply(
   }
 
   if (missing.length === 0) {
-    const prdHint = draft.prdPath
-      ? `A PRD is attached (${draft.prdFilename ?? 'file'}) — I'll run **PRD-only** feature QA (happy / negative / interruption) and skip the generic matrix.`
-      : draft.credentials.type !== 'none'
+    const startHint =
+      draft.credentials.type !== 'none'
         ? `I'll log in with the provided credentials, then run a full exploration.`
         : `I'll run a full exploration of the site.`;
     return (
-      `✅ All set!\n\n${prdHint}\n\n` +
+      `✅ All set!\n\n${startHint}\n\n` +
       `${summarizeDraft(draft)}\n\n` +
-      (draft.prdPath
-        ? `I'll extract features from your PRD, add them to context, and report coverage in chat + the session report.\n\n`
-        : `I'll automatically run UI flows, API probes, chaos tests, security checks, and regression snapshots. `) +
+      `I'll automatically run UI flows, API probes, chaos tests, security checks, and regression snapshots. ` +
       `Before any risky action (payment, purchase, sending a link) I'll check with you first.\n\n` +
       `Say **"start"** or click **Start Exploration** to begin.`
     );
@@ -454,9 +446,6 @@ export function createSetupConversation(): SetupConversation {
       `- Detect login requirements and ask for credentials if needed`,
       `- Identify the site type and run domain-appropriate journeys`,
       `- Run all applicable tests — UI, API, chaos, security, regression, performance`,
-      ``,
-      `**Optional:** Upload a **PRD (PDF)** using the upload control above the chat.`,
-      `If a PRD is uploaded, I test **only the features in the PRD** (happy path + negative + interruption) and skip the generic matrix.`,
       ``,
       `Before any risky action (purchase, payment, sending a link) I'll pause and check with you first.`,
       ``,
@@ -681,32 +670,3 @@ export function getOrCreateSetupConversation(conversationId?: string): SetupConv
   return conv;
 }
 
-/** Attach an uploaded PRD path to an existing setup conversation */
-export function attachPrdToSetupConversation(
-  conversationId: string,
-  prdPath: string,
-  prdFilename: string,
-): SetupChatResponse {
-  const conversation = getOrCreateSetupConversation(conversationId);
-  conversation.draft.prdPath = prdPath;
-  conversation.draft.prdFilename = prdFilename;
-  conversation.messages.push(
-    msg(
-      'assistant',
-      `📎 PRD uploaded: **${prdFilename}**\n\n` +
-        `When you start, I'll parse the PDF, add features/constraints to context, and run **PRD-only** QA ` +
-        `(happy path + negative/empty/invalid + interruption). The generic A1–H3 matrix will be skipped.\n\n` +
-        (conversation.draft.targetUrl
-          ? `Current target: ${conversation.draft.targetUrl}`
-          : `Next: paste your website URL.`),
-      { kind: 'setup' },
-    ),
-  );
-  return {
-    conversationId: conversation.id,
-    messages: conversation.messages,
-    draft: conversation.draft,
-    readyToStart: false,
-    missing: missingFields(conversation.draft),
-  };
-}

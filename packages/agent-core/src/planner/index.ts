@@ -10,6 +10,7 @@ import type {
   SiteIntelligenceSignals,
 } from '@qa/shared';
 import { FLOW_CLASSES, FLOW_TITLES, GENERIC_PHASES } from '@qa/shared';
+import { expandRequirementWithAI } from '../intelligence/requirement-expand-ai.js';
 
 const DEPTH_TASK_LIMITS: Record<SessionDepth, number> = {
   smoke: 15,     // recon + core UI + chaos basics
@@ -44,6 +45,36 @@ const ALL_AREAS: (keyof typeof FLOW_CLASSES)[] = [
   'regression',
   'accessibility',
 ];
+
+// Real risk scoring, not just insertion order. This matters for one concrete reason:
+// `limitedTasks = tasks.slice(0, limit)` below means at smoke depth (15 tasks) or even
+// standard (80), whichever flow classes happen to sit earlier in FLOW_CLASSES survive the
+// cut — a cosmetic dark-mode check could bump a real auth-bypass probe off the plan purely
+// by array position, with nothing about actual risk involved. This scores each flow class by
+// business impact (auth/security bypass), data-mutation risk, and session-integrity
+// sensitivity, and sorts by it before slicing — so budget-constrained runs spend their task
+// count on what's actually likely to matter first.
+const CRITICAL_RISK = new Set([
+  'auth-matrix', 'auth-bypass', 'idor-probe', 'horizontal-privilege', 'vertical-privilege',
+  'mass-assignment', 'xss-probe', 'security-headers', 'hidden-route-access',
+]);
+const HIGH_RISK = new Set([
+  'crud', 'journey', 'data-integrity', 'state-transition', 'business-logic-boundary', 'rate-limit',
+  'session-timeout', 'multi-tab-logout', 'deep-link', 'schema-drift', 'generic-crud',
+]);
+const LOW_RISK = new Set([
+  'dark-mode', 'reduced-motion', 'rtl-layout', 'placeholder-check', 'broken-images',
+  'element-overflow', 'zoom-reflow', 'cross-browser', 'device-matrix', 'toast-stacking',
+  'long-content', 'locale-format', 'bfcache', 'coverage-report', 'web-vitals',
+]);
+
+function riskWeight(flowClass: string): number {
+  if (flowClass === 'recon') return 100; // always first, not part of the risk ordering below
+  if (CRITICAL_RISK.has(flowClass)) return 10;
+  if (HIGH_RISK.has(flowClass)) return 8;
+  if (LOW_RISK.has(flowClass)) return 2;
+  return 5; // everything else — form validation, boundary, navigation, chaos, a11y, perf — a reasonable middle
+}
 
 /** Area lookup for a given flow class */
 function areaForFlow(fc: string): ExplorationArea {
@@ -103,6 +134,13 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
       tasks.push(...areaTasks);
       priority += areaTasks.length;
     }
+
+    // Stable sort (ties keep their original area/FLOW_CLASSES order) by descending risk —
+    // recon (weight 100) stays first automatically, everything else reorders by actual risk
+    // instead of array position. Re-numbering `priority` afterward keeps it meaningful rather
+    // than leaving stale pre-sort values on the field.
+    tasks.sort((a, b) => riskWeight(b.flowClass) - riskWeight(a.flowClass));
+    tasks.forEach((t, i) => { t.priority = i; });
   }
 
   const limit = DEPTH_TASK_LIMITS[config.depth];
@@ -116,7 +154,7 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
       .filter((t) => {
         if (phase.id === 'recon') return t.flowClass === 'recon';
         if (phase.id === 'smoke')
-          return ['navigation', 'crud', 'journey', 'user-directed', 'action-inventory', 'consent-exploration', 'visual-review'].includes(t.flowClass);
+          return ['navigation', 'crud', 'journey', 'user-directed', 'action-inventory', 'data-integrity', 'state-transition', 'consent-exploration', 'visual-review', 'agentic-explore', 'generic-crud'].includes(t.flowClass);
         if (phase.id === 'boundary')
           return [
             'form-validation',
@@ -162,6 +200,7 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
             'horizontal-privilege',
             'vertical-privilege',
             'mass-assignment',
+            'hidden-route-access',
           ].includes(t.flowClass);
         if (phase.id === 'chaos')
           return [
@@ -212,33 +251,45 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
   };
 }
 
-export function buildPlanFromContext(
+export async function buildPlanFromContext(
   sessionId: string,
   config: SessionConfig,
-): ExplorationPlan {
+): Promise<ExplorationPlan> {
   const base = buildGenericPlan(sessionId, config);
 
   if (config.context) {
-    const contextTasks: FlowTask[] = config.context
-      .split(/[.\n]/)
-      .map((s) => s.trim())
-      .filter((s) => s.length > 10)
-      .slice(0, 5)
-      .map((sentence, i) => ({
-        id: `context-${randomUUID().slice(0, 8)}`,
-        area: 'ui' as const,
-        flowClass: 'context-driven',
-        title: `Context flow: ${sentence.slice(0, 60)}...`,
-        description: sentence,
-        priority: i,
-      }));
+    // Requirement-aware exploration: try to expand the free-text context into specific
+    // boundary-condition instructions (see requirement-expand-ai.ts) before falling back to
+    // naive sentence-splitting. Both paths route to 'user-directed' — NOT 'context-driven',
+    // which is aliased to plain runNavigation in ui-executor.ts and silently ignored the
+    // actual sentence content entirely; the old fallback here was a no-op beyond a task
+    // title, fixed as part of the same change rather than left broken under the new path.
+    const aiInstructions = await expandRequirementWithAI(config.context).catch(() => null);
+    const instructions =
+      aiInstructions ??
+      config.context
+        .split(/[.\n]/)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 10)
+        .slice(0, 5);
+
+    const contextTasks: FlowTask[] = instructions.map((instruction, i) => ({
+      id: `context-${randomUUID().slice(0, 8)}`,
+      area: 'ui' as const,
+      flowClass: 'user-directed',
+      title: `Context flow: ${instruction.slice(0, 60)}${instruction.length > 60 ? '...' : ''}`,
+      description: instruction,
+      priority: i,
+    }));
 
     base.tasks = [...contextTasks, ...base.tasks];
     if (contextTasks.length > 0) {
       base.phases.unshift({
         id: 'context',
         name: 'Context-driven',
-        description: 'Flows derived from user-provided context',
+        description: aiInstructions
+          ? 'Requirement-aware boundary/edge-case instructions derived from user-provided context'
+          : 'Flows derived from user-provided context',
         taskIds: contextTasks.map((t) => t.id),
       });
     }
@@ -328,28 +379,12 @@ export function injectJourneyTasks(
   return plan;
 }
 
-export function buildPlan(
+export async function buildPlan(
   sessionId: string,
   config: SessionConfig,
-  prdFeatures?: string[],
   classification?: SiteClassification,
-  prdConstraints?: string[],
-  prdFeatureCriteria?: string[],
-): ExplorationPlan {
-  // ── PRD-only mode ──────────────────────────────────────────────────────────
-  // When a PRD was uploaded, run ONLY feature-focused QA (happy / negative /
-  // interruption). Do NOT run the generic A1–H3 matrix.
-  if (prdFeatures && prdFeatures.length > 0) {
-    return buildPrdOnlyPlan(
-      sessionId,
-      config,
-      prdFeatures,
-      prdConstraints ?? [],
-      prdFeatureCriteria ?? [],
-    );
-  }
-
-  const plan = buildPlanFromContext(sessionId, config);
+): Promise<ExplorationPlan> {
+  const plan = await buildPlanFromContext(sessionId, config);
 
   // User-directed flow instructions get highest priority
   if (config.flowInstructions && config.flowInstructions.length > 0) {
@@ -376,114 +411,5 @@ export function buildPlan(
   }
 
   return plan;
-}
-
-/**
- * Build a QA plan from PRD features only.
- * For each feature: happy path + negative/empty/invalid + interruption (back/refresh).
- */
-export function buildPrdOnlyPlan(
-  sessionId: string,
-  config: SessionConfig,
-  features: string[],
-  constraints: string[],
-  featureCriteria: string[] = [],
-): ExplorationPlan {
-  const tasks: FlowTask[] = [
-    {
-      id: 'recon-site-map',
-      area: 'ui',
-      flowClass: 'recon',
-      title: 'Site reconnaissance (PRD context)',
-      description: 'Map the site so PRD feature tests can locate UI elements',
-      priority: 0,
-    },
-    {
-      id: 'prd-auth-smoke',
-      area: 'ui',
-      flowClass: 'prd-driven',
-      title: 'PRD auth smoke gate',
-      description:
-        'Fail fast if session restore / post-login landing is broken before deep PRD feature tests',
-      priority: 1,
-      meta: {
-        prdFeature: 'Auth smoke gate',
-        prdVariant: 'happy',
-        prdRequirementId: 'SMOKE',
-        isAuthSmoke: true,
-      },
-    },
-  ];
-
-  const limited = features.slice(0, 12);
-  const variants: Array<{ variant: 'happy' | 'negative' | 'interruption'; label: string }> = [
-    { variant: 'happy', label: 'Happy path' },
-    { variant: 'negative', label: 'Negative / empty / invalid' },
-    { variant: 'interruption', label: 'Interruption (back / refresh)' },
-  ];
-
-  let priority = 2;
-  const prdTaskIds: string[] = ['prd-auth-smoke'];
-
-  for (let i = 0; i < limited.length; i++) {
-    const feature = limited[i];
-    const requirementId = `F${i + 1}`;
-    for (const { variant, label } of variants) {
-      const id = `prd-${i}-${variant}`;
-      prdTaskIds.push(id);
-      tasks.push({
-        id,
-        area: 'ui',
-        flowClass: 'prd-driven',
-        title: `PRD [${requirementId}][${label}]: ${feature.slice(0, 60)}`,
-        description: feature,
-        priority: priority++,
-        meta: {
-          prdFeature: feature,
-          prdVariant: variant,
-          prdConstraints: constraints.slice(0, 10),
-          prdRequirementId: requirementId,
-          prdCriteria: featureCriteria[i]?.slice(0, 180),
-        },
-      });
-    }
-  }
-
-  // Optional user-directed extras still allowed alongside PRD
-  if (config.flowInstructions && config.flowInstructions.length > 0) {
-    for (let i = 0; i < config.flowInstructions.length; i++) {
-      const instruction = config.flowInstructions[i];
-      tasks.push({
-        id: `user-directed-${i}-${randomUUID().slice(0, 6)}`,
-        area: 'ui',
-        flowClass: 'user-directed',
-        title: instruction.length > 60 ? `${instruction.slice(0, 57)}...` : instruction,
-        description: instruction,
-        priority: priority++,
-      });
-    }
-  }
-
-  const phases: PlanPhase[] = [
-    {
-      id: 'recon',
-      name: 'Recon',
-      description: 'Map site structure for PRD feature discovery',
-      taskIds: ['recon-site-map'],
-    },
-    {
-      id: 'prd',
-      name: 'PRD-driven QA',
-      description: `Auth smoke + ${limited.length} PRD feature(s) — happy, negative, interruption (generic matrix skipped)`,
-      taskIds: prdTaskIds,
-    },
-  ];
-
-  return {
-    sessionId,
-    phases,
-    tasks,
-    generatedAt: new Date().toISOString(),
-  };
 }
 

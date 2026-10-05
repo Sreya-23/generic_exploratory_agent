@@ -61,8 +61,25 @@ export async function runJsErrorsReport(
   }
 
   for (const e of individual.slice(0, 15)) {
+    // Not all console activity carries the same weight. An 'uncaught exception' (Playwright's
+    // pageerror — real application code threw and nothing caught it, e.g. a TypeError in a
+    // query function) is a genuine crash in logic and worth real attention. A plain
+    // 'console.error' for a failed resource load (a blocked third-party script, an analytics
+    // beacon, a 403 on something that may be intentionally gated) is a much weaker signal on
+    // its own — it might not reflect a real application bug at all. Treating both the same
+    // flattens exactly the distinction that determines whether this is worth a developer's
+    // time.
+    const isResourceLoadFailure = /failed to load resource/i.test(e.message);
+    // Confirmed against a real run (amazon.in): a Content-Security-Policy violation for a
+    // third-party ad/tracking domain is near-always either intentional CSP enforcement doing
+    // its job, or the ad network's own resource being blocked — not a defect in the site being
+    // tested. Same weak-signal reasoning as a resource-load failure, not the "medium" every
+    // other console.error gets by default.
+    const isCspViolation = /violates the following content security policy directive/i.test(e.message);
+    const severity =
+      e.source === 'uncaught exception' ? 'high' : isResourceLoadFailure || isCspViolation ? 'low' : 'medium';
     ctx.onFinding({
-      severity: 'medium',
+      severity,
       area: 'UI-JsError',
       title: `JS error: ${e.message.slice(0, 80)}`,
       steps: [`Open ${e.url}`, 'Open browser DevTools → Console'],

@@ -6,14 +6,15 @@
 // detectable DOM/CSS signal, only a visual one a human (or a vision model) can actually see.
 //
 // This is deliberately a pure ADDITION, never a replacement: every other flow in this
-// codebase runs unconditionally regardless of whether Gemini is configured or reachable.
-// If GEMINI_API_KEY is unset, or the API call fails for ANY reason (bad key, rate limit,
-// network error, malformed response), this flow logs it and returns — it never throws,
-// never blocks, and never affects any other task in the session.
+// codebase runs unconditionally regardless of whether an AI provider is configured or
+// reachable. If no LLM API key is configured, or the API call fails for ANY reason (bad key,
+// rate limit, network error, malformed response), this flow logs it and returns — it never
+// throws, never blocks, and never affects any other task in the session.
 import { join } from 'node:path';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask, Severity } from '@qa/shared';
+import { callLLMParts, hasAnyLLMKey, activeLLMProvider, type LLMPart } from '@qa/shared';
 import { waitForRealContent, isLoginWallPage } from './helpers.js';
 
 // Reads a cheap, coarse "content shape" signal — not proof the page is done loading, but
@@ -41,12 +42,11 @@ async function waitForStableContent(page: Page, maxWaitMs = 4000): Promise<void>
   }
 }
 
-const GEMINI_MODEL = 'gemini-3.6-flash';
-const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
-// Latency observed ranges from ~5-6s up to 35s+ across real calls (this model does
-// internal "thinking" before responding, with real variance) — generous enough to not
-// falsely abort a slow-but-fine response, still bounded so a genuinely hung request
-// doesn't stall the session for too long.
+// Latency observed ranges from ~5-6s up to 35s+ across real calls to Gemini specifically (it
+// does internal "thinking" before responding, with real variance) — generous enough to not
+// falsely abort a slow-but-fine response, still bounded so a genuinely hung request doesn't
+// stall the session for too long. Kept as the default timeout regardless of which provider is
+// actually configured (see llm-client.ts).
 const REQUEST_TIMEOUT_MS = 50000;
 
 const VISUAL_REVIEW_PROMPT = `You are a QA engineer reviewing a screenshot of a real web application for VISUAL bugs — issues visible in the rendered image that would not show up by inspecting HTML/CSS values. Look specifically for:
@@ -153,9 +153,8 @@ export async function runVisualReview(
   ctx: ExecutorContext,
   _task: FlowTask,
 ): Promise<void> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    ctx.onLog('[VisualReview] GEMINI_API_KEY not configured — skipping AI visual review (all other checks unaffected)');
+  if (!hasAnyLLMKey()) {
+    ctx.onLog('[VisualReview] No LLM API key configured — skipping AI visual review (all other checks unaffected)');
     return;
   }
 
@@ -252,7 +251,7 @@ export async function runVisualReview(
 
     ctx.onLog(
       `[VisualReview] Sending ${images.length} screenshot(s) (${images.map((i) => i.url).join(', ')}) ` +
-        `to Gemini for visual QA review (${tracker.callsToday + 1}/${DAILY_CALL_LIMIT} today)`,
+        `to ${activeLLMProvider() ?? 'the configured AI provider'} for visual QA review (${tracker.callsToday + 1}/${DAILY_CALL_LIMIT} today)`,
     );
     // Record usage now, right as the call is committed — this is what's actually billed,
     // so it counts against quota even if the response later fails to parse. Still exactly
@@ -261,39 +260,17 @@ export async function runVisualReview(
     tracker.lastReviewByOrigin[origin] = new Date().toISOString();
     saveUsageTracker(ctx, tracker);
 
-    const parts: Array<{ text: string } | { inline_data: { mime_type: string; data: string } }> = [
-      { text: VISUAL_REVIEW_PROMPT },
-    ];
+    const parts: LLMPart[] = [{ type: 'text', text: VISUAL_REVIEW_PROMPT }];
     images.forEach((img, i) => {
-      parts.push({ text: `--- SCREENSHOT ${i + 1} — page: ${img.url} ---` });
-      parts.push({ inline_data: { mime_type: 'image/png', data: img.base64 } });
+      parts.push({ type: 'text', text: `--- SCREENSHOT ${i + 1} — page: ${img.url} ---` });
+      parts.push({ type: 'image', mimeType: 'image/png', base64: img.base64 });
     });
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
-    let response: Response;
-    try {
-      response = await fetch(`${GEMINI_ENDPOINT}?key=${apiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({ contents: [{ parts }] }),
-      });
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    if (!response.ok) {
-      const errBody = await response.text().catch(() => '');
-      ctx.onLog(`[VisualReview] Gemini API returned ${response.status} — skipping this pass. ${errBody.slice(0, 200)}`);
+    const text = await callLLMParts(parts, REQUEST_TIMEOUT_MS);
+    if (!text) {
+      ctx.onLog('[VisualReview] AI provider call failed or returned nothing — skipping this pass');
       return;
     }
-
-    const data = (await response.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-    };
-    const text = data.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text ?? '';
     const issues = extractJsonArray(text);
 
     if (issues.length === 0) {

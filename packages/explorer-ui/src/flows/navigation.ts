@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
-import { findVisibleErrorText, explorationBreadth } from './helpers.js';
+import { findVisibleErrorText, explorationBreadth, dismissBlockingOverlay, isRiskyActionLabel } from './helpers.js';
 
 interface NavPage {
   url: string;
@@ -76,6 +76,20 @@ const REVEAL_TRIGGERS = [
   '[aria-label*="menu" i]',
   '[aria-haspopup="true"]',
   '[data-toggle="dropdown"]',
+  // Account/profile dropdown trigger (avatar + chevron, top-right corner) — a very common
+  // pattern that often hides a large chunk of real navigation (settings, billing, org admin,
+  // docs) behind it. Confirmed real gap: a real app's account menu used none of the ARIA/
+  // data-toggle markers above (no aria-haspopup, no role), just a plain clickable avatar —
+  // the same "no semantic markup" pattern this codebase has hit before (the modal-overlay
+  // fix, for the same underlying reason). Matched broadly since there's no single reliable
+  // semantic signal for this pattern the way there is for a real hamburger icon.
+  '[class*="avatar"]',
+  '[aria-label*="account" i]',
+  '[aria-label*="profile" i]',
+  '[aria-label*="user menu" i]',
+  '[data-testid*="avatar" i]',
+  '[data-testid*="user-menu" i]',
+  '[data-testid*="account-menu" i]',
 ];
 
 /**
@@ -91,6 +105,59 @@ async function revealHiddenNav(page: Page): Promise<void> {
       await el.click().catch(() => {});
       await page.waitForTimeout(400);
     }
+  }
+  await revealTopRightAccountMenu(page);
+}
+
+// Confirmed real gap: a real app's account/profile menu trigger was a plain <div
+// role="presentation"> with generic Tailwind utility classes — no aria-label, no
+// aria-haspopup, no class name containing "avatar"/"profile"/"account", nothing any CSS
+// selector above could match, because there was no semantic signal in the markup at all
+// (role="presentation" on a genuinely interactive control is itself an accessibility bug —
+// it tells assistive tech to ignore an element that isn't decorative). Rather than chase an
+// ever-growing list of naming conventions that a site is free to not use, this matches on
+// POSITION and SHAPE instead: a small, cursor-pointer element sitting in the page's top-right
+// corner with short text (often initials) is a near-universal convention for an account menu
+// across real sites, independent of whatever markup happens to implement it.
+async function revealTopRightAccountMenu(page: Page): Promise<void> {
+  const candidateHandles = await page
+    .evaluateHandle(() => {
+      const viewportWidth = window.innerWidth;
+      const found: Element[] = [];
+      const all = Array.from(document.querySelectorAll('button, [role="button"], div, span, a'));
+      for (const el of all) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        // Top-right corner, small element, roughly square-ish (avatar/icon shape) —
+        // excludes wide top bars/nav strips that also happen to be near the top.
+        if (
+          rect.top < 100 &&
+          rect.right > viewportWidth - 260 &&
+          rect.width > 10 &&
+          rect.width < 120 &&
+          rect.height > 10 &&
+          rect.height < 80
+        ) {
+          const style = window.getComputedStyle(el);
+          if (style.cursor === 'pointer') found.push(el);
+        }
+      }
+      return found.slice(0, 3);
+    })
+    .catch(() => null);
+
+  if (!candidateHandles) return;
+
+  try {
+    const properties = await candidateHandles.getProperties();
+    for (const handle of properties.values()) {
+      const el = handle.asElement();
+      if (!el) continue;
+      await el.click().catch(() => {});
+      await page.waitForTimeout(400);
+    }
+  } finally {
+    await candidateHandles.dispose().catch(() => {});
   }
 }
 
@@ -237,6 +304,7 @@ export async function runNavigation(
 
   const visitedUrls = new Set<string>([startUrl]);
   const visitedKeys = new Set<string>(); // covers click-only items too (no href to dedup by)
+  const visitedTabStates = new Set<string>(); // url+tab-label — state within a URL, not just the URL itself
   const visitedPages: NavPage[] = [];
   interface QueueItem {
     url: string | null;
@@ -332,6 +400,12 @@ export async function runNavigation(
           ctx.onLog(`[Navigation] Could not re-locate "${next.label}" (tried current page and ${next.discoveredOnUrl}) — skipping`);
           continue;
         }
+        // A modal left open by a PREVIOUS nav item's click (one this same crawl already
+        // triggered) blocks this click identically — and because the click below is
+        // swallowed with .catch(() => {}), a silent failure here doesn't just miss one page,
+        // it makes the crawl audit whatever page it's still actually on and never discover
+        // that destination's own children, quietly shrinking the whole rest of the crawl.
+        await dismissBlockingOverlay(page).catch(() => {});
         await target.click({ timeout: 4000 }).catch(() => {});
         await page.waitForTimeout(800);
       }
@@ -339,6 +413,36 @@ export async function runNavigation(
       const pageTitle = await page.title().catch(() => '');
       const finalUrl = page.url();
       visitedUrls.add(finalUrl);
+
+      // §2 — unexpected external redirect. next.url is only ever queued same-origin (the
+      // "external" links are filtered out of the BFS queue entirely at discovery time — see
+      // the `u.origin !== baseOrigin` skip above), so landing on a different origin after
+      // navigating one of these is always a genuine redirect the app itself performed, not a
+      // link that was external to begin with.
+      if (next.url) {
+        try {
+          const intendedOrigin = new URL(next.url).origin;
+          const finalOrigin = new URL(finalUrl).origin;
+          if (intendedOrigin !== finalOrigin) {
+            ctx.onFinding({
+              severity: 'low',
+              area: 'Navigation',
+              title: `Internal link redirects to a different domain`,
+              steps: [`Click/navigate "${next.label}" (${next.url})`],
+              expected: 'An internal navigation link stays on the same domain unless it is a known third-party integration (SSO/payment gateway)',
+              actual: `Navigating to ${next.url} ended up on ${finalUrl} (${finalOrigin}) instead`,
+              evidence: [],
+              reproRate: '1/1',
+              automationCandidate: true,
+              pageUrl: next.url,
+              confidence: 'heuristic',
+              confidenceReason: 'A same-origin-at-discovery-time link ending up cross-origin is common and legitimate for SSO/OAuth login and payment gateway redirects — verify this specific case isn\'t one of those before treating it as a bug.',
+            });
+          }
+        } catch {
+          /* malformed URL — nothing to compare */
+        }
+      }
 
       const shotName = `nav-${visitedPages.length}-${next.label.replace(/[^a-z0-9]/gi, '-').slice(0, 30)}`;
       const shotPath = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `${shotName}.png`);
@@ -391,6 +495,156 @@ export async function runNavigation(
 
       ctx.onLog(`[Navigation] ✓ "${pageTitle}" (${finalUrl}) — ${pageIssues.length === 0 ? 'no issues' : pageIssues.join('; ')}`);
 
+      // "Explored" should mean explored STATE, not just visited URL — a tab strip
+      // (Recent/Paid/Pending/Partially Paid on a transactions page, say) can hold several
+      // meaningfully different states behind the exact same URL, invisible to URL-based
+      // dedup entirely. Detect same-URL tab groups and treat each one as its own state to
+      // audit, keyed by url+tab-label rather than url alone.
+      const hasPasswordInputForTabs = await page.locator('input[type="password"]').count().catch(() => 0);
+      if (hasPasswordInputForTabs === 0) {
+        const tabs = await page.evaluate(() => {
+          const ariaActive = (el: Element) =>
+            el.getAttribute('aria-selected') === 'true' ||
+            el.getAttribute('aria-current') !== null ||
+            /active|selected|current/i.test(el.className?.toString() ?? '');
+          const isClickable = (el: Element) => {
+            const s = window.getComputedStyle(el);
+            return s.cursor === 'pointer' || el.tagName === 'BUTTON' || el.getAttribute('role') === 'button' || el.getAttribute('role') === 'tab';
+          };
+          // Confirmed via live repro against a real tab strip: a plain <div class="cursor-
+          // pointer"> wrapping an inner text-styled <div> (no role/aria at all — the same
+          // "no semantic markup" pattern this codebase has hit repeatedly: the modal
+          // overlay, the account-menu trigger). The color utility class lives on that INNER
+          // div, not the clickable wrapper, so descend through single-child wrapper chains
+          // to reach the element that actually carries the active/inactive text color.
+          const textStyledDescendant = (el: Element): Element => {
+            let cur = el;
+            while (cur.children.length === 1 && cur.textContent?.trim() === cur.children[0].textContent?.trim()) {
+              cur = cur.children[0];
+            }
+            return cur;
+          };
+          const textColor = (el: Element) => window.getComputedStyle(textStyledDescendant(el)).color;
+          // Background-color pills (active tab gets a filled/tinted background, inactive
+          // ones don't) are at least as common a pattern as a text-color change — checked on
+          // the OUTER clickable wrapper, since that's typically where a background utility
+          // class is applied, not the inner text node.
+          const bgColor = (el: Element) => window.getComputedStyle(el).backgroundColor;
+
+          // Given a color-extractor, find a group of siblings where exactly one has a color
+          // that differs from what the rest share — "N same-styled labels, one visually
+          // highlighted" is a reliable tab-strip signal regardless of which CSS property
+          // happens to carry it on a given site.
+          function findOutlierGroup(
+            groups: Map<Element, Element[]>,
+            colorOf: (el: Element) => string,
+          ): { siblings: Element[]; activeSet: Set<Element> } | null {
+            for (const siblings of groups.values()) {
+              if (siblings.length < 3 || siblings.length > 8) continue;
+              const texts = siblings.map((el) => (el.textContent || '').trim());
+              if (texts.some((t) => !t || t.length > 40)) continue;
+              if (new Set(texts).size !== texts.length) continue; // labels must be distinct
+              const colors = siblings.map(colorOf);
+              const counts = new Map<string, number>();
+              for (const c of colors) counts.set(c, (counts.get(c) ?? 0) + 1);
+              const majorityCount = Math.max(...counts.values());
+              const minority = [...counts.entries()].filter(([, n]) => n < majorityCount);
+              if (minority.length !== 1 || minority[0][1] !== 1) continue; // exactly one outlier = one active tab
+              return { siblings, activeSet: new Set(siblings.filter((el, i) => colors[i] === minority[0][0])) };
+            }
+            return null;
+          }
+
+          // role="tab" is the semantic fast path. Otherwise: group same-parent clickable
+          // elements, and try text-color first, then background-color as a fallback — two
+          // independent, common ways a site visually marks "this one's active."
+          let candidates = Array.from(document.querySelectorAll('[role="tab"]'));
+          let activeSet: Set<Element> | null = candidates.length >= 2 ? new Set(candidates.filter(ariaActive)) : null;
+
+          if (candidates.length < 2) {
+            const groups = new Map<Element, Element[]>();
+            for (const el of Array.from(document.querySelectorAll('div, span, button, a, li'))) {
+              if (!isClickable(el)) continue;
+              const rect = el.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue;
+              const parent = el.parentElement;
+              if (!parent) continue;
+              const list = groups.get(parent) ?? [];
+              list.push(el);
+              groups.set(parent, list);
+            }
+            const found = findOutlierGroup(groups, textColor) ?? findOutlierGroup(groups, bgColor);
+            if (found) {
+              candidates = found.siblings;
+              activeSet = found.activeSet;
+            }
+          }
+          return candidates
+            .filter((el) => el.getBoundingClientRect().width > 0)
+            .map((el) => ({ label: (el.textContent || '').trim().slice(0, 40), active: activeSet?.has(el) ?? false }))
+            .filter((t) => t.label.length > 0 && t.label.length < 40);
+        }).catch(() => [] as Array<{ label: string; active: boolean }>);
+
+        const nonActiveTabs = tabs.filter((t) => !t.active).slice(0, 5); // bounded — this is a supplementary pass, not the main budget
+        for (const tab of nonActiveTabs) {
+          // Same safety rule every other click-driven flow in this codebase follows — a
+          // "tab" is just a label the color-outlier heuristic happened to group with others;
+          // nothing guarantees it can't coincide with a risky-sounding action (Archive,
+          // Delete, etc.) on some site's actual UI. Gate it the same way, don't special-case
+          // this pass as exempt just because it usually IS just Recent/Paid/Pending.
+          if (isRiskyActionLabel(tab.label)) {
+            ctx.onLog(`[Navigation] Skipping tab "${tab.label}" — matches a risky-action pattern`);
+            continue;
+          }
+          const stateKey = `${finalUrl}::tab:${tab.label}`;
+          if (visitedTabStates.has(stateKey)) continue;
+          visitedTabStates.add(stateKey);
+
+          // Exact text match, not hasText (substring) — confirmed via live repro that
+          // hasText: 'Paid' also matches inside "Partially Paid", and .last() on that
+          // broad a substring match silently clicked the wrong tab entirely.
+          const tabTarget = page.getByText(tab.label, { exact: true }).last();
+          if ((await tabTarget.count().catch(() => 0)) === 0) continue;
+          await dismissBlockingOverlay(page).catch(() => {});
+          await tabTarget.click({ timeout: 4000 }).catch(() => {});
+          await page.waitForTimeout(1000);
+
+          const tabIssues = await auditPage(page);
+          const tabShotName = `nav-tab-${visitedPages.length}-${tab.label.replace(/[^a-z0-9]/gi, '-').slice(0, 30)}`;
+          const tabShotPath = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `${tabShotName}.png`);
+          await page.screenshot({ path: tabShotPath, fullPage: false }).catch(() => {});
+
+          for (const issue of tabIssues) {
+            ctx.onFinding({
+              severity: issue.includes('blank') || issue.includes('error message') ? 'medium' : 'low',
+              area: 'UI-Navigation',
+              title: `Tab state issue on "${pageTitle}" → "${tab.label}": ${issue}`,
+              steps: [`Open ${finalUrl}`, `Click the "${tab.label}" tab`, 'Inspect page content'],
+              expected: 'Tab content renders correctly',
+              actual: issue,
+              evidence: [tabShotPath],
+              reproRate: '1/1',
+              automationCandidate: true,
+              pageUrl: finalUrl,
+            });
+          }
+
+          // Represent this as its own visited "page" using a synthetic, distinguishable URL
+          // (real_url#tab:Label) — never a URL the app itself would navigate to, purely a
+          // reporting key so tab states show up in page coverage instead of vanishing into
+          // the parent URL's single entry.
+          visitedPages.push({
+            url: `${finalUrl}#tab:${tab.label}`,
+            title: `${pageTitle} — ${tab.label}`,
+            reachedBy: `Tab: ${tab.label}`,
+            depth: next.depth,
+            screenshot: tabShotPath,
+            issues: tabIssues,
+          });
+          ctx.onLog(`[Navigation]   ↳ tab "${tab.label}" — ${tabIssues.length === 0 ? 'no issues' : tabIssues.join('; ')}`);
+        }
+      }
+
       // Only discover deeper nav from authenticated pages (has content, no login wall)
       const hasPasswordInput = (await page.locator('input[type="password"]').count()) > 0;
       if (!hasPasswordInput && next.depth < MAX_DEPTH) {
@@ -409,7 +663,28 @@ export async function runNavigation(
       }
 
     } catch (err) {
-      ctx.onLog(`[Navigation] Failed to visit "${next.label}": ${(err as Error).message}`);
+      const message = (err as Error).message;
+      // §2 — infinite redirect loop. The browser engine itself detects and aborts this
+      // (ERR_TOO_MANY_REDIRECTS/NS_ERROR_REDIRECT_LOOP) rather than hanging — this just turns
+      // that specific failure into a distinct, actionable finding instead of a generic,
+      // easy-to-miss nav-failure log line indistinguishable from a timeout or a typo'd link.
+      if (/too many redirects|redirect_loop|ERR_TOO_MANY_REDIRECTS/i.test(message) && next.url) {
+        ctx.onFinding({
+          severity: 'high',
+          area: 'Navigation',
+          title: 'Infinite redirect loop',
+          steps: [`Navigate to "${next.label}" (${next.url})`],
+          expected: 'The page loads without redirecting indefinitely',
+          actual: `The browser aborted navigation after detecting a redirect loop: ${message}`,
+          evidence: [],
+          reproRate: '1/1',
+          automationCandidate: true,
+          pageUrl: next.url,
+          confidence: 'verified',
+          confidenceReason: 'The browser engine itself detected and reported the redirect loop — not inferred from a timeout.',
+        });
+      }
+      ctx.onLog(`[Navigation] Failed to visit "${next.label}": ${message}`);
     }
   }
 

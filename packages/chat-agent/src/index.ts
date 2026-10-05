@@ -3,7 +3,6 @@ export {
   processSetupMessage,
   applyProbeToConversation,
   getOrCreateSetupConversation,
-  attachPrdToSetupConversation,
   type SetupConversation,
 } from './setup-chat.js';
 

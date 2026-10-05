@@ -1,10 +1,9 @@
-import type { Finding, PrdCoverageSummary, Severity } from '@qa/shared';
+import type { Finding, Severity } from '@qa/shared';
 import { computeHealthScore } from '@qa/shared';
 
 export interface FindingsQaContext {
   findings: Finding[];
   targetUrl: string;
-  prdCoverage?: PrdCoverageSummary;
 }
 
 const SEVERITY_ORDER: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
@@ -31,8 +30,8 @@ function formatFinding(f: Finding, i?: number): string {
 
 /**
  * Deterministic, pattern-matched Q&A over a completed session's findings — no LLM call,
- * consistent with the rest of this codebase (prd-parser, chat-agent setup parsing, etc.)
- * being fully local with zero external API dependency.
+ * consistent with the rest of this codebase being fully local with zero external API
+ * dependency.
  */
 export function answerFindingsQuestion(question: string, ctx: FindingsQaContext): string {
   const q = question.toLowerCase().trim();
@@ -71,12 +70,6 @@ export function answerFindingsQuestion(question: string, ctx: FindingsQaContext)
         .map((f, i) => formatFinding(f, i))
         .join('\n')}`;
     }
-  }
-
-  if (/\bgaps?\b/.test(q) && ctx.prdCoverage) {
-    const gaps = ctx.prdCoverage.gaps;
-    if (gaps.length === 0) return 'No PRD coverage gaps — every feature had matching UI.';
-    return `${gaps.length} coverage gap(s):\n\n${gaps.map((g) => `- ${g}`).join('\n')}`;
   }
 
   if (/\b(list|show all|summarize|summary|everything)\b/.test(q)) {

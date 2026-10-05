@@ -8,8 +8,6 @@ import type { Finding, FindingFingerprintDiff } from '@qa/shared';
 export function normalizeFindingTitle(title: string): string {
   return title
     .toLowerCase()
-    .replace(/\[[a-z0-9_-]+\]\s*/gi, '') // strip [F1] / [SMOKE]
-    .replace(/prd feature:\s*/gi, '')
     .replace(/[^a-z0-9]+/g, ' ')
     .trim()
     .slice(0, 120);
