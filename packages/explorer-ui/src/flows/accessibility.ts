@@ -170,6 +170,123 @@ export async function runKeyboardCheck(
   });
 }
 
+// E4 — Semantic structure: heading hierarchy, button/link semantics, accessible names on
+// interactive controls beyond form fields/images (E1 only scans input/select/textarea/img).
+// Deliberately does NOT attempt "information conveyed only through color" — reliably
+// distinguishing a legitimate color-only accent from a genuine accessibility violation without
+// a prohibitive false-positive rate isn't achievable with a generic DOM heuristic.
+export async function runSemanticStructureCheck(
+  page: Page,
+  ctx: ExecutorContext,
+  _task: FlowTask,
+): Promise<void> {
+  ctx.onLog('[A11y] Checking heading hierarchy, button/link semantics, and interactive accessible names');
+
+  const headingIssues = await page.evaluate(() => {
+    const headings = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6'))
+      .filter((h) => {
+        const style = window.getComputedStyle(h);
+        return style.display !== 'none' && style.visibility !== 'hidden';
+      })
+      .map((h) => Number(h.tagName[1]));
+    const issues: string[] = [];
+    const h1Count = headings.filter((l) => l === 1).length;
+    if (h1Count > 1) issues.push(`${h1Count} <h1> elements on the page (should normally be exactly one)`);
+    if (h1Count === 0 && headings.length > 0) issues.push('No <h1> found, but lower-level headings exist');
+    for (let i = 1; i < headings.length; i++) {
+      if (headings[i] - headings[i - 1] > 1) {
+        issues.push(`Heading level skips from h${headings[i - 1]} to h${headings[i]}`);
+        break; // one example is enough signal — avoid flooding with every skip on the page
+      }
+    }
+    return issues;
+  });
+
+  for (const issue of headingIssues) {
+    ctx.onFinding({
+      severity: 'low',
+      area: 'A11y-Structure',
+      title: `Heading hierarchy issue: ${issue}`,
+      steps: [`Open ${page.url()}`, 'Inspect the document\'s heading elements (h1-h6) in DOM order'],
+      expected: 'Exactly one <h1>, with no skipped levels (h2 should not jump straight to h4, etc.)',
+      actual: issue,
+      evidence: [],
+      reproRate: '1/1',
+      automationCandidate: true,
+      confidence: 'heuristic',
+      confidenceReason: 'Heading structure conventions have legitimate exceptions (e.g. a widget embedding its own heading scope) — verify before treating as confirmed.',
+    });
+  }
+
+  const semanticIssues = await page.evaluate(() => {
+    const results: { kind: 'no-name' | 'div-as-button'; detail: string }[] = [];
+    // Interactive controls with no accessible name at all (beyond E1's input/img scope).
+    const controls = Array.from(document.querySelectorAll('button, a[href], [role="button"]'));
+    for (const el of controls.slice(0, 500)) {
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      const text = (el as HTMLElement).innerText?.trim();
+      const ariaLabel = el.getAttribute('aria-label')?.trim();
+      const ariaLabelledby = el.getAttribute('aria-labelledby');
+      const title = el.getAttribute('title')?.trim();
+      const hasImgAlt = el.querySelector('img[alt]:not([alt=""])') !== null;
+      if (!text && !ariaLabel && !ariaLabelledby && !title && !hasImgAlt) {
+        const tag = el.tagName.toLowerCase();
+        const cls = (el.getAttribute('class') ?? '').slice(0, 40);
+        results.push({ kind: 'no-name', detail: `${tag}${cls ? `.${cls.split(' ')[0]}` : ''}` });
+      }
+    }
+    // Non-native clickables (div/span with onclick) with no button role and no keyboard handler
+    // signal (no tabindex) — a real semantic-misuse pattern distinct from the "no accessible
+    // name" case above.
+    const divButtons = Array.from(document.querySelectorAll('div[onclick], span[onclick]'));
+    for (const el of divButtons.slice(0, 200)) {
+      const role = el.getAttribute('role');
+      const tabindex = el.getAttribute('tabindex');
+      if (role !== 'button' && tabindex === null) {
+        results.push({ kind: 'div-as-button', detail: `${el.tagName.toLowerCase()}[onclick] with no role="button" and no tabindex` });
+      }
+    }
+    return results;
+  });
+
+  const noName = [...new Set(semanticIssues.filter((s) => s.kind === 'no-name').map((s) => s.detail))].slice(0, 8);
+  if (noName.length > 0) {
+    ctx.onFinding({
+      severity: 'medium',
+      area: 'A11y-Structure',
+      title: `${noName.length} interactive control(s) with no accessible name`,
+      steps: [`Open ${page.url()}`, 'Tab to each control listed below — a screen reader announces nothing identifying it'],
+      expected: 'Every button/link has visible text, an aria-label, aria-labelledby, title, or a meaningfully-alt\'d image',
+      actual: `No accessible name: ${noName.join(', ')}`,
+      evidence: [],
+      reproRate: '1/1',
+      automationCandidate: true,
+    });
+  }
+
+  const divAsButton = [...new Set(semanticIssues.filter((s) => s.kind === 'div-as-button').map((s) => s.detail))].slice(0, 5);
+  if (divAsButton.length > 0) {
+    ctx.onFinding({
+      severity: 'medium',
+      area: 'A11y-Structure',
+      title: `${divAsButton.length} clickable <div>/<span> element(s) with incorrect semantics`,
+      steps: [`Open ${page.url()}`, 'Inspect elements with an onclick handler but no role="button" or tabindex'],
+      expected: 'A clickable element should be a <button>, or carry role="button" and tabindex="0" for keyboard operability',
+      actual: `Incorrect semantics: ${divAsButton.join(', ')}`,
+      evidence: [],
+      reproRate: '1/1',
+      automationCandidate: true,
+      confidence: 'verified',
+      confidenceReason: 'Directly observed: the element has an onclick handler but neither the ARIA role nor the keyboard-focusability a real button needs.',
+    });
+  }
+
+  if (headingIssues.length === 0 && noName.length === 0 && divAsButton.length === 0) {
+    ctx.onLog('[A11y] Heading hierarchy, button/link semantics, and accessible names look OK');
+  }
+}
+
 // E3 — Colour contrast (WCAG AA)
 export async function runContrastCheck(
   page: Page,

@@ -92,6 +92,16 @@ export const FLOW_CLASSES = {
     'input-boundary',
     'double-click',
     'modal-lifecycle',
+    // Native <select> dropdowns — first/last/multi selection, keyboard arrow navigation.
+    'dropdown-exploration',
+    // Popups (target="_blank"/window.open) and browser-permission-denial handling.
+    'browser-behavior',
+    // Hover/active visual-state feedback on interactive elements.
+    'interactive-states',
+    // Field-type-specific validation: email format, numeric/date bounds, confirm-password.
+    'field-validation',
+    // Table/list row selection, select-all, expand/collapse, duplicate-row detection.
+    'table-interaction',
     'empty-states',
     'keyboard-nav',
     // A6 — Scroll & Viewport
@@ -111,6 +121,14 @@ export const FLOW_CLASSES = {
     'deep-link',
     'session-timeout',
     'multi-tab-logout',
+    // Generic, site-type-agnostic logout check: click a real logout control, then Back/Refresh/
+    // direct-URL in the SAME tab — distinct from the auth-portal-journey-gated logout test,
+    // from B6's cookie-clearing (a different trigger), and from B7's second-tab check.
+    'logout-session',
+    // "Forgot password" link reachability (not the full reset flow — that needs real email access).
+    'forgot-password',
+    // Session cleared mid-request (not pre-expired like B6) — checks for a clear re-auth prompt.
+    'session-expires-mid-op',
     // Journey & user-directed
     'journey',
     'user-directed',
@@ -138,6 +156,11 @@ export const FLOW_CLASSES = {
     // verify) on any detected create-shaped form/list — distinct from journey.ts's per-site-
     // type CRUD flows, which only fire for one classified domain.
     'generic-crud',
+    // Cancel-creation, cancel-deletion (confirmation dialog), and duplicate-creation —
+    // separate tasks from the main CRUD lifecycle since each needs its own fresh page visit.
+    'cancel-creation',
+    'cancel-deletion',
+    'duplicate-creation',
     // Cross-browser compatibility spot-check (Firefox/WebKit vs the Chromium baseline)
     'cross-browser',
     // Consent & user agreement exploration (T&C, privacy, marketing, cookie, age, etc.)
@@ -217,6 +240,52 @@ export const FLOW_CLASSES = {
     'vertical-privilege',
     // F5 — Mass assignment
     'mass-assignment',
+    // Sensitive-data-exposure scan, per-user-endpoint cache-control check, and a request-
+    // tracing-header observability note — all passive, read-only inspection of responses
+    // already being fetched for other checks.
+    'response-hygiene',
+    // OPTIONS + bodyless POST against confirmed GET endpoints — never PUT/PATCH/DELETE, no
+    // residual mutation risk.
+    'http-method-validation',
+    // Request validation, data-type coercion, boundary values, and SQL/NoSQL/path-traversal
+    // payloads — all variations of "send a malformed write request, check the server
+    // degrades cleanly instead of crashing."
+    'malformed-input',
+    // Functional correctness of pagination/search, distinct from boundary.ts's testPagination
+    // (which only checks invalid params don't crash). Does page 2 actually differ from page 1,
+    // and does a declared total/count match what's actually returned — all GET, zero risk.
+    'functional-listing',
+    // Full create→get→update→get→delete→get chain on one self-created synthetic resource —
+    // status-code validation and data-consistency, not just "did the write call 2xx."
+    'crud-lifecycle',
+    // True-concurrency (Promise.all, not sequential) race-condition probes: does an
+    // Idempotency-Key actually dedupe under simultaneous requests, and do concurrent updates
+    // ever corrupt a resource rather than just "last write wins."
+    'concurrency',
+    // Raw multipart upload-endpoint probing (oversized file, path-traversal filename, dangerous
+    // extension) — only runs against an endpoint whose path looks upload-shaped.
+    'file-payload',
+    // Conditional: only activates if a 202 Accepted response is actually observed. Verifies the
+    // 202 contract itself (a trackable job reference) and that polling resolves in a bounded
+    // window — no generic webhook/callback testing is possible without site-specific knowledge.
+    'async-operations',
+    // Invalid/malformed/expired-shaped bearer tokens + JWT alg:none bypass attempt — distinct
+    // from auth-matrix, which only tests the "no token at all" case.
+    'token-validation',
+    // Conditional: only activates if a refresh-shaped endpoint is actually discovered.
+    'token-refresh',
+    // Error response shape consistency across endpoints + stack-trace-in-error-body leak check.
+    'error-consistency',
+    // Non-existent resource id should return 404, not 200/500 — a narrow, zero-risk GET-only
+    // status-code contract check, distinct from boundary.ts's invalid-pagination-param checks.
+    'status-code-validation',
+    // Two sequential (not simultaneous — that's concurrency) rapid writes to the same
+    // self-created resource: does the later request actually win, or does a slower-but-earlier
+    // one clobber it on arrival.
+    'request-ordering',
+    // Conditional: only activates if the self-created resource exposes a recognizable
+    // status/state field. Checks for unconditional terminal-state jumps and crash-on-repeat.
+    'state-transition-api',
   ],
   chaos: [
     'slow-network',
@@ -224,6 +293,10 @@ export const FLOW_CLASSES = {
     'offline-recovery',
     'back-during-post',
     'refresh-during-request',
+    // Cancel/navigate-away while a request is in flight — observational, same posture as
+    // back-during-post/refresh-during-request above.
+    'cancel-during-loading',
+    'navigate-away-during-loading',
     'double-submit',
     // C4 — Flaky network
     'flaky-network',
@@ -235,7 +308,7 @@ export const FLOW_CLASSES = {
     'cpu-throttle',
   ],
   security: ['xss-probe', 'security-headers'],  // F4, F6/F7/F8 — F1/F2/F3/F5 already run under api area
-  accessibility: ['labels', 'keyboard', 'contrast'],
+  accessibility: ['labels', 'keyboard', 'contrast', 'semantic-structure'],
   performance: ['load-time', 'large-payload', 'spike-load', 'n-plus-one'],
   regression: ['golden-path', 'visual-regression', 'schema-drift'],
 } as const;
@@ -247,6 +320,11 @@ export const FLOW_TITLES: Record<string, string> = {
   'input-boundary': 'Input Boundary',
   'double-click': 'Double Click',
   'modal-lifecycle': 'Modal Lifecycle',
+  'dropdown-exploration': 'Dropdown & Select Exploration',
+  'browser-behavior': 'Browser Behaviour (popups, permissions)',
+  'interactive-states': 'Interactive Visual States (hover, active)',
+  'field-validation': 'Field-Type Validation (email, numeric, date, confirm-password)',
+  'table-interaction': 'Table/List Interaction (selection, expand/collapse, duplicates)',
   'empty-states': 'Empty States',
   'keyboard-nav': 'Keyboard Navigation',
   'viewport': 'Scroll & Viewport (A6)',
@@ -260,6 +338,9 @@ export const FLOW_TITLES: Record<string, string> = {
   'deep-link': 'Deep Link Without Context (B5)',
   'session-timeout': 'Session Timeout Mid-Flow (B6)',
   'multi-tab-logout': 'Logout in Another Tab (B7)',
+  'logout-session': 'Logout: Back/Refresh/Direct-URL (same tab)',
+  'forgot-password': 'Forgot Password Link Reachability',
+  'session-expires-mid-op': 'Session Expires Mid-Operation',
   // Journeys
   'journey': 'Domain Journey',
   'user-directed': 'User-Directed Flow',
@@ -272,6 +353,9 @@ export const FLOW_TITLES: Record<string, string> = {
   'state-transition': 'State Transition (cancel discards changes)',
   'hidden-route-access': 'Hidden Route Access (UI hidden, URL reachable)',
   'generic-crud': 'Generic CRUD Lifecycle (create/edit/delete)',
+  'cancel-creation': 'Cancel Creation (no entity should persist)',
+  'cancel-deletion': 'Cancel Deletion (confirmation dialog)',
+  'duplicate-creation': 'Duplicate Creation Observation',
   'cross-browser': 'Cross-Browser Compatibility',
   'consent-exploration': 'Consent & User Agreement Exploration',
   'business-logic-boundary': 'Business Logic Boundary (amount/price/quantity) (I1/I2)',
@@ -304,6 +388,20 @@ export const FLOW_TITLES: Record<string, string> = {
   'pagination': 'API Pagination',
   'boundary': 'API Boundary',
   'idempotency': 'Idempotency',
+  'response-hygiene': 'Response Hygiene (sensitive data, caching, tracing)',
+  'http-method-validation': 'HTTP Method Validation',
+  'malformed-input': 'Malformed Input (validation, data-type, boundary, injection)',
+  'functional-listing': 'Functional Pagination & Search Correctness',
+  'crud-lifecycle': 'CRUD Lifecycle & Data Consistency',
+  'concurrency': 'Concurrency & Race Conditions',
+  'file-payload': 'File Upload Endpoint Probing (size, path-traversal, extension)',
+  'async-operations': 'Async/Background Job Operations (202 contract, polling)',
+  'token-validation': 'Token Validation (invalid/malformed/expired/alg-none)',
+  'token-refresh': 'Token Refresh Race',
+  'error-consistency': 'Error Response Consistency',
+  'status-code-validation': 'Status Code Validation (non-existent resource)',
+  'request-ordering': 'Request Ordering (stale write wins)',
+  'state-transition-api': 'State Transition (API)',
   'rate-limit': 'Rate Limiting',
   'idor-probe': 'IDOR Probe',
   'horizontal-privilege': 'Horizontal Privilege Escalation (F2)',
@@ -321,6 +419,8 @@ export const FLOW_TITLES: Record<string, string> = {
   'offline-recovery': 'Offline Recovery',
   'back-during-post': 'Back During POST',
   'refresh-during-request': 'Refresh During Request',
+  'cancel-during-loading': 'Cancel During Loading',
+  'navigate-away-during-loading': 'Navigate Away During Loading',
   'double-submit': 'Double Submit',
   'flaky-network': 'Flaky Network 50% Drop (C4)',
   'timeout-retry': 'Request Timeout & Retry (C5)',
@@ -330,6 +430,7 @@ export const FLOW_TITLES: Record<string, string> = {
   'security-headers': 'Security Headers, Cookie Flags & Clickjacking (F6/F7/F8)',
   // Accessibility
   'labels': 'Labels & ARIA',
+  'semantic-structure': 'Semantic Structure (headings, button/link semantics)',
   'keyboard': 'Keyboard Access',
   'contrast': 'Colour Contrast',
   // Regression

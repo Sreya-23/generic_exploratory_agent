@@ -401,12 +401,9 @@ const CHAOS_HANDLERS: Record<string, (page: Page, ctx: ExecutorContext) => Promi
   'timeout-retry': runTimeoutRetry,
   'websocket-disconnect': runWebsocketDisconnect,
   'cpu-throttle': runCpuThrottle,
-  'back-during-post': async (_page, ctx) => {
-    ctx.onLog('[Chaos] back-during-post handled by UI executor');
-  },
-  'refresh-during-request': async (_page, ctx) => {
-    ctx.onLog('[Chaos] refresh-during-request handled by UI executor');
-  },
+  // 'back-during-post'/'refresh-during-request'/'cancel-during-loading'/
+  // 'navigate-away-during-loading' are scheduled under this area but routed to UiExecutor via
+  // FLOW_CLASS_EXECUTOR_OVERRIDE in run-session.ts — no entry needed (or reachable) here.
 };
 
 export class ChaosExecutor implements BaseExecutor {

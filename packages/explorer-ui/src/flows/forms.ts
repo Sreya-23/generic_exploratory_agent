@@ -3,8 +3,6 @@ import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
 import { isLoginWallPage, findVisibleErrorText } from './helpers.js';
 
-const BOUNDARY_INPUTS = ['', ' ', 'a', 'x'.repeat(500), '<script>alert(1)</script>', '🎉测试'];
-
 /**
  * Classify whether an input field could trigger an external communication
  * (email, SMS, WhatsApp, etc.) if filled with random data.
@@ -189,6 +187,29 @@ export async function runFormValidation(
 
     if (errorText) {
       ctx.onLog(`[Forms] Field ${i}: validation message shown — "${errorText.slice(0, 80)}" — OK`);
+
+      // Checklist (UI) §4/§20 — the error text existing is necessary but not sufficient: a
+      // screen reader user needs the FIELD itself to announce that error, via aria-describedby
+      // (or aria-errormessage) pointing at the error element's id. Checked only when an error
+      // is actually showing, since there's nothing to associate otherwise.
+      const fieldId = await input.getAttribute('id');
+      const describedBy = await input.getAttribute('aria-describedby');
+      const errorMessage = await input.getAttribute('aria-errormessage');
+      if (fieldId && !describedBy && !errorMessage) {
+        ctx.onFinding({
+          severity: 'low',
+          area: 'A11y-Structure',
+          title: `Error message not associated with its field via aria-describedby: field ${i}`,
+          steps: [`Open ${page.url()}`, 'Trigger the validation error on this field', 'Inspect the field\'s aria-describedby/aria-errormessage attribute'],
+          expected: 'A field showing a validation error should reference it via aria-describedby or aria-errormessage so screen readers announce it',
+          actual: 'Field has neither attribute while an error message is visibly showing',
+          evidence: [],
+          reproRate: '1/1',
+          automationCandidate: true,
+          confidence: 'heuristic',
+          confidenceReason: 'The association could exist through a different mechanism (e.g. the error text is inside a <label> wrapping the field) — verify before treating as confirmed.',
+        });
+      }
     } else if (hasInvalidPseudo) {
       ctx.onLog(`[Forms] Field ${i}: :invalid pseudo-class active — OK`);
     } else if (isRequired) {

@@ -81,7 +81,7 @@ export async function runJsErrorsReport(
     ctx.onFinding({
       severity,
       area: 'UI-JsError',
-      title: `JS error: ${e.message.slice(0, 80)}`,
+      title: `JS error: ${e.message}`,
       steps: [`Open ${e.url}`, 'Open browser DevTools → Console'],
       expected: 'No uncaught JavaScript errors during normal use',
       actual: `${e.source}: ${e.message}`,

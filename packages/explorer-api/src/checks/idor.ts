@@ -1,5 +1,5 @@
 import type { ExecutorContext } from '@qa/shared';
-import { probe, mapWithConcurrency, resolveEndpointPaths } from '../probe-helpers.js';
+import { probe, mapWithConcurrency, resolveEndpointPaths, writeApiEvidence, formatEvidence } from '../probe-helpers.js';
 
 export async function testIdor(
   baseUrl: string,
@@ -46,7 +46,7 @@ export async function testIdor(
         actual: hasSession
           ? `The logged-in session fetched ${okResults.length} different records by ID — verify this account's role legitimately has access to all of them; re-test with a lower-privileged account for a conclusive IDOR verdict`
           : `HTTP 200 with JSON returned for ${okResults.length} IDs with no authentication at all`,
-        evidence: [],
+        evidence: writeApiEvidence(ctx, 'idor-multi-id', formatEvidence('GET', `${base}/{id}`, 200, { responseBody: okResults.map((r) => `${r.id}: ${r.body}`).join('\n---\n') })),
         reproRate: '1/1',
         automationCandidate: true,
       });
@@ -64,7 +64,7 @@ export async function testIdor(
         ],
         expected: 'Consistent authorization behaviour across resource IDs of the same type',
         actual: `${okResults.length} ID(s) returned 200, ${blockedResults.length} ID(s) returned 401/403 for the same session — inconsistent access control`,
-        evidence: [],
+        evidence: writeApiEvidence(ctx, 'idor-inconsistent-auth', formatEvidence('GET', `${base}/{id}`, 0, { responseBody: `Allowed: ${okResults.map((r) => r.id).join(',')}\nBlocked: ${blockedResults.map((r) => r.id).join(',')}` })),
         reproRate: '1/1',
         automationCandidate: true,
       });

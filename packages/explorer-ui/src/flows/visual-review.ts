@@ -286,7 +286,7 @@ export async function runVisualReview(
       ctx.onFinding({
         severity: normalizeSeverity(item.severity),
         area: 'UI-Visual',
-        title: `Visual issue: ${item.issue.slice(0, 80)}`,
+        title: `Visual issue: ${item.issue}`,
         steps: [`Open ${matched.url}`, 'Visually inspect the rendered page'],
         expected: 'No visual rendering defects',
         actual: item.issue,

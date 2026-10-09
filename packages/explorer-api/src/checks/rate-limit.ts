@@ -1,5 +1,5 @@
 import type { ExecutorContext } from '@qa/shared';
-import { probe } from '../probe-helpers.js';
+import { probe, writeApiEvidence, formatEvidence } from '../probe-helpers.js';
 
 // Rate limiting is a meaningful control on endpoints an attacker actually wants to hammer —
 // login, OTP/send-code, password reset, signup, search — not on a public homepage or a
@@ -53,7 +53,7 @@ async function probeOneRateLimitTarget(
         ? 'Sensitive endpoints (auth, OTP, password reset, search) should return HTTP 429 after a burst threshold to prevent brute-force/abuse'
         : 'HTTP 429 after burst threshold (informational — many public/read-only endpoints are not rate-limited by design)',
       actual: `No 429 observed. Statuses: ${statuses}`,
-      evidence: [],
+      evidence: writeApiEvidence(ctx, 'rate-limit-missing', formatEvidence(probeMethod, probePath, 0, { responseBody: `Statuses: ${statuses}` })),
       reproRate: '1/1',
       automationCandidate: true,
       confidence: isSensitiveTarget ? 'verified' : 'heuristic',
@@ -65,6 +65,29 @@ async function probeOneRateLimitTarget(
   }
 
   ctx.onLog(`[RateLimit] Rate limiting active on ${probePath} — OK`);
+
+  // Checklist §15 — "Check Retry-After when applicable." A 429 without any guidance on when to
+  // retry forces a client to guess/poll blindly — not a severe bug (429 itself is the important
+  // signal, per the checklist's own "429 by itself is not a bug"), but worth a low-severity note.
+  const rateLimitedResults = results.filter((r) => r.status === 429);
+  const anyRetryAfter = rateLimitedResults.some((r) => (r as { responseHeaders?: Record<string, string> }).responseHeaders?.['retry-after']);
+  if (rateLimitedResults.length > 0 && !anyRetryAfter) {
+    ctx.onFinding({
+      severity: 'low',
+      area: 'API-RateLimit',
+      title: `429 response has no Retry-After header: ${probeMethod} ${probePath}`,
+      steps: [`Send 20 concurrent ${probeMethod} ${probePath} until a 429 is returned`, 'Inspect the 429 response headers'],
+      expected: 'A 429 Too Many Requests response should include a Retry-After header so clients know when to retry',
+      actual: 'No Retry-After header found on any 429 response',
+      evidence: [],
+      reproRate: '1/1',
+      automationCandidate: true,
+      pageUrl: probePath,
+      confidence: 'heuristic',
+      confidenceReason: 'Some rate limiters communicate the retry window via a non-standard header this check does not recognize — verify before treating as a real gap.',
+    });
+    return 1;
+  }
   return 0;
 }
 

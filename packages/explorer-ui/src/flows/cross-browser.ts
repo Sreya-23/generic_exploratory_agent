@@ -33,6 +33,8 @@ interface EngineSignals {
   consoleErrors: string[];
   loadError?: string;
   screenshotPath?: string;
+  /** null = no form present to test; true/false = whether fill-and-read-back actually worked */
+  formFillWorks: boolean | null;
 }
 
 async function collectSignals(page: Page, engine: string): Promise<EngineSignals> {
@@ -51,7 +53,25 @@ async function collectSignals(page: Page, engine: string): Promise<EngineSignals
     .count()
     .catch(() => 0);
 
-  return { engine, loaded: true, title, bodyTextLength, visibleInteractiveCount, consoleErrors: [...new Set(consoleErrors)] };
+  // Checklist (UI) §26 — "Compare: Forms." Previously this check only ever collected passive
+  // page-load signals (title/text-length/interactive-count/console-errors) — no interaction was
+  // ever exercised in Firefox/WebKit, so a form that's completely non-functional there (while
+  // LOOKING identical by every passive signal above) would pass undetected. Fill-only, no
+  // submit, to keep this safe and side-effect-free across all three engines.
+  const formField = page.locator('form input[type="text"]:visible, form input[type="email"]:visible').first();
+  let formFillWorks: boolean | null = null;
+  if ((await formField.count().catch(() => 0)) > 0) {
+    try {
+      const probeValue = 'qa-cross-browser-probe';
+      await formField.fill(probeValue);
+      const readBack = await formField.inputValue();
+      formFillWorks = readBack === probeValue;
+    } catch {
+      formFillWorks = false;
+    }
+  }
+
+  return { engine, loaded: true, title, bodyTextLength, visibleInteractiveCount, consoleErrors: [...new Set(consoleErrors)], formFillWorks };
 }
 
 async function checkEngine(
@@ -86,6 +106,7 @@ async function checkEngine(
         bodyTextLength: 0,
         visibleInteractiveCount: 0,
         consoleErrors: [],
+        formFillWorks: null,
         loadError: (err as Error).message.slice(0, 200),
       };
     }
@@ -110,6 +131,7 @@ async function checkEngine(
       bodyTextLength: 0,
       visibleInteractiveCount: 0,
       consoleErrors: [],
+      formFillWorks: null,
       loadError: (err as Error).message.slice(0, 200),
     };
   } finally {
@@ -199,6 +221,9 @@ async function checkPageAcrossEngines(
     }
     if (other.consoleErrors.length > 0) {
       issues.push(`${other.consoleErrors.length} console error(s) not seen in Chromium: ${other.consoleErrors.slice(0, 3).join('; ')}`);
+    }
+    if (chromiumSignals.formFillWorks === true && other.formFillWorks === false) {
+      issues.push(`form field fill-and-read-back failed in ${other.engine} (works in Chromium)`);
     }
 
     if (issues.length > 0) {

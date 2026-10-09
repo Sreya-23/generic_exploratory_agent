@@ -524,7 +524,7 @@ export function ReportPage() {
 
       {view === 'findings' && (
         <section className="findings-panel">
-          <QualityPilotConnect sessionId={session.id} />
+          <QualityPilotConnect />
 
           <h2>Findings ({sortedFindings.length})</h2>
           {sortedFindings.length === 0 ? (

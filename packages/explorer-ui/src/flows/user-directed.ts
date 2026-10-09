@@ -215,7 +215,7 @@ export async function runUserDirectedFlow(
     ctx.onFinding({
       severity: 'medium',
       area: 'UI-UserDirected',
-      title: `Error after: "${instruction.slice(0, 60)}"`,
+      title: `Error after: "${instruction}"`,
       steps: [
         `Navigate to ${ctx.config.targetUrl}`,
         `Follow instruction: ${instruction}`,

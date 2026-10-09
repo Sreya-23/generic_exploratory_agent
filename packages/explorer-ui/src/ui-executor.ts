@@ -14,10 +14,15 @@ import { runNavigation } from './flows/navigation.js';
 import { runFormValidation } from './flows/forms.js';
 import { runInputBoundary } from './flows/boundary.js';
 import { runModalLifecycle } from './flows/modals.js';
+import { runDropdownExploration } from './flows/dropdowns.js';
+import { runBrowserBehaviorCheck } from './flows/browser-behavior.js';
+import { runInteractiveStatesCheck } from './flows/interactive-states.js';
+import { runFieldValidationCheck } from './flows/field-validation.js';
+import { runTableInteractionCheck } from './flows/tables.js';
 import { runKeyboardNav } from './flows/keyboard.js';
 import { runDoubleClick } from './flows/double-click.js';
 import { runEmptyStates } from './flows/empty-states.js';
-import { runBackDuringAction } from './flows/interruption.js';
+import { runBackDuringAction, runCancelDuringLoading, runNavigateAwayDuringLoading } from './flows/interruption.js';
 import { runJourneyFlow } from './flows/journey.js';
 import { runUserDirectedFlow } from './flows/user-directed.js';
 import { runViewport } from './flows/viewport.js';
@@ -31,16 +36,19 @@ import {
   runDeepLink,
   runSessionTimeout,
   runMultiTabLogout,
+  runLogoutSessionCheck,
+  runForgotPasswordCheck,
+  runSessionExpiresDuringOperation,
 } from './flows/session-flows.js';
 import { runGoldenPath, runVisualRegression } from './flows/regression.js';
-import { runLabelsCheck, runKeyboardCheck, runContrastCheck } from './flows/accessibility.js';
+import { runLabelsCheck, runKeyboardCheck, runContrastCheck, runSemanticStructureCheck } from './flows/accessibility.js';
 import { runElementIntegrity, runTouchTargetCheck } from './flows/element-integrity.js';
 import { runDeadLinksCheck } from './flows/dead-links.js';
 import { runActionInventory } from './flows/action-inventory.js';
 import { runDataIntegrityCheck } from './flows/data-integrity.js';
 import { runStateTransitionCheck } from './flows/state-transition.js';
 import { runHiddenRouteAccessCheck } from './flows/hidden-route-access.js';
-import { runGenericCrudCheck } from './flows/generic-crud.js';
+import { runGenericCrudCheck, runCancelCreationCheck, runCancelDeletionCheck, runDuplicateCreationCheck } from './flows/generic-crud.js';
 import { runCrossBrowserCheck } from './flows/cross-browser.js';
 import { runConsentExploration } from './flows/consent-exploration.js';
 import { runSecurityHeadersCheck } from './flows/security-headers.js';
@@ -531,11 +539,18 @@ const FLOW_HANDLERS: Record<
   'form-validation': runFormValidation,
   'input-boundary': runInputBoundary,
   'modal-lifecycle': runModalLifecycle,
+  'dropdown-exploration': runDropdownExploration,
+  'browser-behavior': runBrowserBehaviorCheck,
+  'interactive-states': runInteractiveStatesCheck,
+  'field-validation': runFieldValidationCheck,
+  'table-interaction': runTableInteractionCheck,
   'keyboard-nav': runKeyboardNav,
   'double-click': runDoubleClick,
   'empty-states': runEmptyStates,
   'back-during-post': runBackDuringAction,
   'refresh-during-request': runBackDuringAction,
+  'cancel-during-loading': runCancelDuringLoading,
+  'navigate-away-during-loading': runNavigateAwayDuringLoading,
   'context-driven': runNavigation,
   'journey': runJourneyFlow,
   'user-directed': runUserDirectedFlow,
@@ -559,12 +574,16 @@ const FLOW_HANDLERS: Record<
   'session-timeout': runSessionTimeout,
   // B7 — Multi-tab Logout
   'multi-tab-logout': runMultiTabLogout,
+  'logout-session': runLogoutSessionCheck,
+  'forgot-password': runForgotPasswordCheck,
+  'session-expires-mid-op': runSessionExpiresDuringOperation,
   // H1 — Golden Path
   'golden-path': runGoldenPath,
   // H3 — Visual Regression
   'visual-regression': runVisualRegression,
   // E1/E2/E3 — Accessibility
   'labels': runLabelsCheck,
+  'semantic-structure': runSemanticStructureCheck,
   'keyboard': runKeyboardCheck,
   'contrast': runContrastCheck,
   // Element integrity
@@ -577,6 +596,9 @@ const FLOW_HANDLERS: Record<
   'state-transition': runStateTransitionCheck,
   'hidden-route-access': runHiddenRouteAccessCheck,
   'generic-crud': runGenericCrudCheck,
+  'cancel-creation': runCancelCreationCheck,
+  'cancel-deletion': runCancelDeletionCheck,
+  'duplicate-creation': runDuplicateCreationCheck,
   'cross-browser': runCrossBrowserCheck,
   'consent-exploration': runConsentExploration,
   'security-headers': runSecurityHeadersCheck,

@@ -324,7 +324,7 @@ export async function runAgenticExplore(page: Page, ctx: ExecutorContext, _task:
       ctx.onFinding({
         severity: normalizeSeverity(decision.findingIfBug.severity),
         area: 'AI-Explore',
-        title: decision.findingIfBug.title.slice(0, 120),
+        title: decision.findingIfBug.title,
         steps: [`Navigate to ${urlBefore}`, `${target.kind} "${target.description}"`],
         expected: decision.findingIfBug.expected || 'No defect',
         actual: decision.findingIfBug.actual || outcome,

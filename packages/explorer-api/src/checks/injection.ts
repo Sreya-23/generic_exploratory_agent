@@ -1,5 +1,5 @@
 import type { ExecutorContext } from '@qa/shared';
-import { probe, mapWithConcurrency, resolveEndpointPaths } from '../probe-helpers.js';
+import { probe, mapWithConcurrency, resolveEndpointPaths, writeApiEvidence, formatEvidence } from '../probe-helpers.js';
 
 /**
  * Whether `field` actually comes back set to `value` in the response — NOT just whether
@@ -80,7 +80,7 @@ export async function testMassAssignment(
           steps: [`${method} ${path} with body: {"${sf.field}": ${JSON.stringify(sf.value)}}`],
           expected: 'Sensitive field ignored or rejected with 400',
           actual: `HTTP 200 and field value "${sf.value}" appears in response body`,
-          evidence: [],
+          evidence: writeApiEvidence(ctx, 'mass-assignment', formatEvidence(method, path, status, { requestBody: { [sf.field]: sf.value }, responseBody: body })),
           reproRate: '1/1',
           automationCandidate: true,
         });
@@ -133,7 +133,7 @@ export async function testXssProbe(
           steps: [`GET ${basePath}?search=${payload}`],
           expected: 'User input reflected in responses should be HTML/JSON-escaped',
           actual: `Raw payload "${payload}" appears unescaped in the response body`,
-          evidence: [],
+          evidence: writeApiEvidence(ctx, 'xss-reflected-get', formatEvidence('GET', path, status, { responseBody: body })),
           reproRate: '1/1',
           automationCandidate: true,
         });
@@ -161,7 +161,7 @@ export async function testXssProbe(
           steps: [`POST ${basePath} with a text field set to: ${payload}`],
           expected: 'Free-text fields should be sanitized or escaped before being echoed back',
           actual: `Raw payload "${payload}" appears unescaped in the response body`,
-          evidence: [],
+          evidence: writeApiEvidence(ctx, 'xss-reflected-post', formatEvidence('POST', basePath, status, { requestBody: { name: payload, title: payload, comment: payload, content: payload }, responseBody: body })),
           reproRate: '1/1',
           automationCandidate: true,
         });

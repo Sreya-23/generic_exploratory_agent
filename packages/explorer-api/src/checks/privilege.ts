@@ -1,5 +1,5 @@
 import type { ExecutorContext } from '@qa/shared';
-import { probe, mapWithConcurrency, resolveEndpointPaths } from '../probe-helpers.js';
+import { probe, mapWithConcurrency, resolveEndpointPaths, writeApiEvidence, formatEvidence } from '../probe-helpers.js';
 
 export async function testPrivilegeEscalation(
   baseUrl: string,
@@ -32,7 +32,7 @@ export async function testPrivilegeEscalation(
 
   const hits = await mapWithConcurrency(pathsToProbe, 5, async (path) => {
     try {
-      const { status, isJson } = await probe(baseUrl, { method: 'GET', path }, headers);
+      const { status, isJson, body } = await probe(baseUrl, { method: 'GET', path }, headers);
 
       if (status === 200 && isJson) {
         if (flowClass === 'vertical-privilege' && usernameLooksPrivileged) {
@@ -57,7 +57,7 @@ export async function testPrivilegeEscalation(
           ],
           expected: '403 Forbidden — resource restricted to authorized roles',
           actual: `HTTP 200 with JSON data for ${path} — verify role-based access control`,
-          evidence: [],
+          evidence: writeApiEvidence(ctx, 'privilege-escalation', formatEvidence('GET', path, status, { responseBody: body })),
           reproRate: '1/1',
           automationCandidate: true,
         });

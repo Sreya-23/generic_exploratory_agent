@@ -570,3 +570,265 @@ export async function runMultiTabLogout(
     await browser.close();
   }
 }
+
+const LOGOUT_SELECTOR =
+  'a:has-text("Logout"), a:has-text("Log out"), a:has-text("Sign out"), ' +
+  'button:has-text("Logout"), button:has-text("Log out"), button:has-text("Sign out"), ' +
+  '[data-testid*="logout" i], [data-test*="logout" i], [aria-label*="logout" i], [aria-label*="sign out" i], ' +
+  '[href*="logout" i], [href*="signout" i]';
+
+/**
+ * Checklist (UI) §23 — "Logout and Back button" / "Logout and refresh" / "Protected page after
+ * logout," tested as the literal same-tab sequence the checklist names. Previously, logout was
+ * only ever tested via the `auth-portal`-site-type-gated journey (never runs on ecommerce/saas/
+ * generic sites), via cookie-clearing (B6, a different trigger than an actual logout click), or
+ * from a SECOND tab (B7). This clicks a real logout control, generically, on any site type, then
+ * runs the exact Back/Refresh/direct-URL sequence against the SAME tab/session.
+ *
+ * Destructive by nature (ends the real session) — restores it afterward via
+ * `restoreAuthenticatedState` so later tasks in this run aren't left logged out, same pattern
+ * already established by B6 (`runSessionTimeout`).
+ */
+export async function runLogoutSessionCheck(
+  page: Page,
+  ctx: ExecutorContext,
+  _task: FlowTask,
+): Promise<void> {
+  if (await isLoginWallPage(page)) {
+    ctx.onLog('[Logout] Already on a login wall — nothing to log out of');
+    return;
+  }
+
+  const logoutControl = page.locator(LOGOUT_SELECTOR).first();
+  if ((await logoutControl.count()) === 0) {
+    ctx.onLog('[Logout] No logout control found on this page — skipping (may be behind a menu this check doesn\'t open)');
+    return;
+  }
+
+  const protectedUrl = page.url();
+  const shot = (name: string) => join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `logout-${name}.png`);
+
+  await logoutControl.click({ force: true, timeout: 5000 }).catch(async () => {
+    await logoutControl.evaluate((el) => (el as HTMLElement).click()).catch(() => {});
+  });
+  await page.waitForTimeout(800);
+
+  const loggedOutAfterClick = await isLoginWallPage(page);
+  if (!loggedOutAfterClick) {
+    const s = shot('no-redirect');
+    await page.screenshot({ path: s }).catch(() => {});
+    ctx.onFinding({
+      severity: 'medium',
+      area: 'UI-Session',
+      title: 'Logout does not redirect to a login page',
+      steps: ['Click the logout control'],
+      expected: 'Logging out should land on a login page or otherwise clearly logged-out state',
+      actual: `Still appears to be an authenticated page at ${page.url()}`,
+      evidence: [s],
+      reproRate: '1/1',
+      automationCandidate: true,
+    });
+  } else {
+    ctx.onLog('[Logout] Logout correctly redirects to a login/logged-out state');
+
+    // ── Back button after logout ─────────────────────────────────────────────────────────────
+    await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(500);
+    const protectedAfterBack = !(await isLoginWallPage(page));
+    if (protectedAfterBack) {
+      const s = shot('back-shows-protected');
+      await page.screenshot({ path: s }).catch(() => {});
+      ctx.onFinding({
+        severity: 'high',
+        area: 'UI-Session',
+        title: 'Pressing Back after logout reveals the previously-protected page',
+        steps: ['Log out', 'Press the browser Back button'],
+        expected: 'The protected page should not be shown again after logout (redirect to login, or a cached/stale page with no live data)',
+        actual: `Back navigation shows content at ${page.url()} without a login wall`,
+        evidence: [s],
+        reproRate: '1/1',
+        automationCandidate: true,
+        confidence: 'heuristic',
+        confidenceReason: 'Could be a bfcache-restored static snapshot rather than a live authenticated session — verify whether the data shown is current/real before treating as a security-relevant finding.',
+      });
+    } else {
+      ctx.onLog('[Logout] Back button correctly does not reveal protected content after logout');
+    }
+
+    // ── Refresh after logout ─────────────────────────────────────────────────────────────────
+    await page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(500);
+    const protectedAfterRefresh = !(await isLoginWallPage(page));
+    if (protectedAfterRefresh) {
+      const s = shot('refresh-shows-protected');
+      await page.screenshot({ path: s }).catch(() => {});
+      ctx.onFinding({
+        severity: 'high',
+        area: 'UI-Session',
+        title: 'Refreshing after logout still shows the protected page',
+        steps: ['Log out', 'Press Back', 'Refresh the page'],
+        expected: 'A refresh should never serve the authenticated page after logout',
+        actual: `Page at ${page.url()} still shows protected content after refresh`,
+        evidence: [s],
+        reproRate: '1/1',
+        automationCandidate: true,
+        confidence: 'verified',
+        confidenceReason: 'A full page reload cannot be served from bfcache — this is a genuine live request, so any protected content shown reflects a real server/session gap.',
+      });
+    } else {
+      ctx.onLog('[Logout] Refresh correctly does not restore protected content after logout');
+    }
+
+    // ── Direct URL to the original protected page ───────────────────────────────────────────
+    await page.goto(protectedUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(500);
+    const protectedByDirectUrl = !(await isLoginWallPage(page));
+    if (protectedByDirectUrl) {
+      const s = shot('direct-url-shows-protected');
+      await page.screenshot({ path: s }).catch(() => {});
+      ctx.onFinding({
+        severity: 'high',
+        area: 'UI-Session',
+        title: 'Protected page is directly reachable after logout',
+        steps: ['Log out', `Navigate directly to ${protectedUrl}`],
+        expected: 'Navigating directly to a protected URL after logout should redirect to login',
+        actual: `The protected page loaded directly without a login wall`,
+        evidence: [s],
+        reproRate: '1/1',
+        automationCandidate: true,
+        confidence: 'verified',
+        confidenceReason: 'A direct navigation is a fresh request with no history/cache ambiguity — this is a genuine authorization gap if it succeeds.',
+      });
+    } else {
+      ctx.onLog('[Logout] Protected page correctly redirects to login when accessed directly after logout');
+    }
+  }
+
+  // Restore the session for any later tasks in this run — same precedent as runSessionTimeout.
+  const restored = await restoreAuthenticatedState(page, ctx);
+  ctx.onLog(
+    restored
+      ? '[Logout] Session restored for subsequent tasks'
+      : '[Logout] Could not restore authenticated session — later tasks may see a logged-out page',
+  );
+}
+
+/**
+ * Checklist (UI) §23 — "Forgot password" reachability. Only tests that the link navigates
+ * somewhere real (a different page/content) — actually exercising the reset flow would need a
+ * real, disposable email inbox this agent doesn't have, so this deliberately stops at
+ * reachability rather than attempting the full reset.
+ */
+export async function runForgotPasswordCheck(
+  page: Page,
+  ctx: ExecutorContext,
+  _task: FlowTask,
+): Promise<void> {
+  if (!(await isLoginWallPage(page))) {
+    ctx.onLog('[ForgotPassword] Not on a login page — skipping');
+    return;
+  }
+
+  const link = page.locator(
+    'a:has-text("Forgot password"), a:has-text("Forgot Password"), a:has-text("Reset password"), button:has-text("Forgot password"), [href*="forgot" i], [href*="reset-password" i]',
+  ).first();
+  if ((await link.count()) === 0) {
+    ctx.onLog('[ForgotPassword] No "Forgot password" link found on this login page — skipping');
+    return;
+  }
+
+  const urlBefore = page.url();
+  const bodyTextBefore = await page.evaluate(() => document.body?.innerText?.trim().length ?? 0).catch(() => 0);
+
+  await link.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+
+  const urlAfter = page.url();
+  const bodyTextAfter = await page.evaluate(() => document.body?.innerText?.trim().length ?? 0).catch(() => 0);
+  const navigated = urlAfter !== urlBefore;
+  const contentChanged = Math.abs(bodyTextAfter - bodyTextBefore) > 20;
+
+  if (!navigated && !contentChanged) {
+    ctx.onFinding({
+      severity: 'medium',
+      area: 'UI-Auth',
+      title: '"Forgot password" link has no visible effect',
+      steps: ['On the login page, click "Forgot password"'],
+      expected: 'Clicking should navigate to a password-reset page or open a reset form/modal',
+      actual: 'Neither the URL nor the page content changed after clicking',
+      evidence: [],
+      reproRate: '1/1',
+      automationCandidate: true,
+    });
+  } else {
+    ctx.onLog(`[ForgotPassword] "Forgot password" link is reachable and leads somewhere (${navigated ? `navigated to ${urlAfter}` : 'content changed in place'})`);
+  }
+
+  // Return to the login page for any later tasks in this run.
+  if (navigated) {
+    await page.goto(urlBefore, { waitUntil: 'domcontentloaded' }).catch(() => {});
+  }
+}
+
+/**
+ * Checklist (UI) §28 — "Session expires during operation." Combines runSessionTimeout's
+ * cookie-clearing technique with interruption.ts's mid-request timing: clears cookies
+ * IMMEDIATELY after clicking submit (simulating the session expiring mid-flight, rather than
+ * B6's "already expired before the user does anything" scenario), then checks the resulting
+ * error is clear rather than confusing or — worse — a false success. Destructive to the current
+ * session, so restores it afterward like the other checks in this file.
+ */
+export async function runSessionExpiresDuringOperation(
+  page: Page,
+  ctx: ExecutorContext,
+  _task: FlowTask,
+): Promise<void> {
+  const submit = page.locator('form button[type="submit"], form input[type="submit"]').first();
+  if ((await submit.count()) === 0) {
+    ctx.onLog('[SessionExpire] No form submit found — skipping session-expires-during-operation check');
+    return;
+  }
+
+  const context = page.context();
+  await submit.click().catch(() => {});
+  await page.waitForTimeout(100);
+  await context.clearCookies().catch(() => {});
+  await page.waitForTimeout(1000);
+
+  const showsSuccess = await page.locator('[class*="success" i]:visible, [role="status"]:visible').count().catch(() => 0);
+  const nowLoggedOut = await isLoginWallPage(page);
+
+  if (showsSuccess > 0 && !nowLoggedOut) {
+    // Ambiguous on its own (could be a message from before the cookie clear) — logged, not
+    // flagged, unless paired with clearly stale/authenticated-looking content.
+    ctx.onLog('[SessionExpire] A success-looking element is visible after the session expired mid-submit — verify manually whether this reflects a real completed action or a stale pre-expiry message');
+  }
+
+  if (!nowLoggedOut) {
+    const s = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', 'session-expire-mid-op.png');
+    await page.screenshot({ path: s }).catch(() => {});
+    ctx.onFinding({
+      severity: 'medium',
+      area: 'UI-Session',
+      title: 'No clear re-authentication prompt after the session expires mid-operation',
+      steps: ['Submit a form', 'Immediately clear session cookies (simulating expiry)', 'Observe the result'],
+      expected: 'The UI should clearly indicate the session expired and prompt re-login, not silently continue as if authenticated',
+      actual: 'No login wall or clear session-expiry indication appeared after the session was cleared mid-request',
+      evidence: [s],
+      reproRate: '1/1',
+      automationCandidate: true,
+      pageUrl: page.url(),
+      confidence: 'heuristic',
+      confidenceReason: 'The in-flight request may have completed using the session state it already held before cookies were cleared (a legitimate race, not a bug) — verify before treating as confirmed.',
+    });
+  } else {
+    ctx.onLog('[SessionExpire] Session expiry mid-operation correctly results in a login wall');
+  }
+
+  const restored = await restoreAuthenticatedState(page, ctx);
+  ctx.onLog(
+    restored
+      ? '[SessionExpire] Session restored for subsequent tasks'
+      : '[SessionExpire] Could not restore authenticated session — later tasks may see a logged-out page',
+  );
+}
