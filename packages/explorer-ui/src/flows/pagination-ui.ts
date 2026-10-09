@@ -38,12 +38,70 @@ export async function runPaginationUi(
   // controls existing (a search-only list with no pager can still lie about its own count), so
   // these run regardless of whether pagination was found above.
   await checkSearchResultCountConsistency(page, ctx);
+  await checkExactSearchFindsRealMatch(page, ctx);
   await checkSortControl(page, ctx);
   await checkFilterControl(page, ctx);
+  await checkSearchPlusFilterCombo(page, ctx);
 
   if (!paginationFound) {
     ctx.onLog('[PaginationUI] No pagination controls found on this page');
     return;
+  }
+
+  // ── Change page size ──────────────────────────────────────────────────────────────────────
+  const pageSizeSelect = page.locator(
+    'select[name*="page-size" i], select[name*="pagesize" i], select[aria-label*="per page" i], select[aria-label*="page size" i], select[aria-label*="rows per page" i]',
+  ).first();
+  if ((await pageSizeSelect.count()) > 0) {
+    const optionsCount = await pageSizeSelect.locator('option').count();
+    if (optionsCount >= 2) {
+      const rowsBefore = await page.locator(ROW_SELECTORS).count().catch(() => 0);
+      const originalPageSize = await pageSizeSelect.inputValue().catch(() => '');
+      await pageSizeSelect.selectOption({ index: optionsCount - 1 }).catch(() => {});
+      await page.waitForTimeout(600);
+      const rowsAfter = await page.locator(ROW_SELECTORS).count().catch(() => 0);
+      if (rowsAfter <= rowsBefore && rowsBefore > 0) {
+        ctx.onLog(`[PaginationUI] Page size change: rows went from ${rowsBefore} to ${rowsAfter} — expected an increase when selecting a larger page size, but the total dataset may simply be smaller than both sizes, so not flagged as a defect`);
+      } else {
+        ctx.onLog(`[PaginationUI] Page size control works — rows changed from ${rowsBefore} to ${rowsAfter}`);
+      }
+      if (originalPageSize) await pageSizeSelect.selectOption({ value: originalPageSize }).catch(() => {});
+    }
+  } else {
+    ctx.onLog('[PaginationUI] No page-size selector found — skipping');
+  }
+
+  // ── Page number selection (click page "2" or similar directly, not just Next) ───────────────
+  const pageNumberLink = page.locator('[class*="pagination"] a, [class*="pagination"] button, nav[role="navigation"] a')
+    .filter({ hasText: /^\d+$/ })
+    .first();
+  if ((await pageNumberLink.count()) > 0) {
+    const targetPageText = (await pageNumberLink.textContent())?.trim();
+    const urlBeforePageClick = page.url();
+    const rowsBeforePageClick = await rowOrderFingerprint(page);
+    await pageNumberLink.click().catch(() => {});
+    await page.waitForTimeout(600);
+    const rowsAfterPageClick = await rowOrderFingerprint(page);
+    const navigatedOrChanged =
+      page.url() !== urlBeforePageClick || JSON.stringify(rowsAfterPageClick) !== JSON.stringify(rowsBeforePageClick);
+    if (!navigatedOrChanged) {
+      ctx.onFinding({
+        severity: 'low',
+        area: 'UI-Pagination',
+        title: `Clicking page number "${targetPageText}" has no visible effect`,
+        steps: [`Click the numbered page link "${targetPageText}"`],
+        expected: 'The page content or URL should change to reflect the selected page',
+        actual: 'Neither the URL nor the page content changed',
+        evidence: [],
+        reproRate: '1/1',
+        automationCandidate: true,
+      });
+    } else {
+      ctx.onLog(`[PaginationUI] Numbered page link "${targetPageText}" works`);
+    }
+    await page.goto(urlBeforePageClick, { waitUntil: 'domcontentloaded' }).catch(() => {});
+  } else {
+    ctx.onLog('[PaginationUI] No numbered page links found (Next/Prev/Last only) — skipping');
   }
 
   // 1. Test "Next" button
@@ -215,6 +273,64 @@ async function checkSearchResultCountConsistency(page: Page, ctx: ExecutorContex
   await page.waitForTimeout(400);
 }
 
+// Checklist (UI) §8 — "Exact search"/"Partial search": the no-match check above can't tell a
+// correctly-filtering search apart from a search that's completely broken and always returns
+// empty — both look identical against a guaranteed-no-match query. This closes that blind spot
+// by searching for a word taken from an ACTUAL row already on the page and confirming it's still
+// findable, which a totally-broken search would fail.
+async function checkExactSearchFindsRealMatch(page: Page, ctx: ExecutorContext): Promise<void> {
+  const searchInput = page.locator(SEARCH_INPUT_SELECTOR).first();
+  if ((await searchInput.count()) === 0 || !(await searchInput.isVisible().catch(() => false))) return;
+
+  const rows = page.locator(ROW_SELECTORS);
+  const rowCount = await rows.count().catch(() => 0);
+  if (rowCount === 0) return;
+
+  const firstRowText = (await rows.first().textContent().catch(() => '')) ?? '';
+  // Pull one distinctive, searchable word — skip pure numbers/short tokens which are too
+  // generic (likely to coincidentally match many/most rows regardless of whether search works).
+  const candidateWord = firstRowText
+    .split(/\s+/)
+    .map((w) => w.replace(/[^\w]/g, ''))
+    .find((w) => w.length >= 4 && !/^\d+$/.test(w));
+  if (!candidateWord) {
+    ctx.onLog('[PaginationUI] Could not extract a distinctive word from an existing row — skipping exact-search-finds-real-match check');
+    return;
+  }
+
+  const originalValue = await searchInput.inputValue().catch(() => '');
+  await searchInput.fill(candidateWord).catch(() => {});
+  await page.waitForTimeout(900);
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+
+  const matchedRows = await page.locator(ROW_SELECTORS).count().catch(() => 0);
+  const bodyText = await page.evaluate(() => document.body?.innerText ?? '').catch(() => '');
+  const wordStillPresent = bodyText.toLowerCase().includes(candidateWord.toLowerCase());
+
+  if (matchedRows === 0 && !wordStillPresent) {
+    const shotPath = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', 'search-exact-no-match.png');
+    await page.screenshot({ path: shotPath }).catch(() => {});
+    ctx.onFinding({
+      severity: 'high',
+      area: 'UI-Search',
+      title: `Search for a word taken from an existing row ("${candidateWord}") returns no results`,
+      steps: [`Note a word from a real, currently-rendered row: "${candidateWord}"`, `Search for exactly that word`],
+      expected: 'Searching for a word that genuinely exists in the data should return at least that one matching row',
+      actual: 'Zero rows rendered and the word no longer appears anywhere on the page after searching for it',
+      evidence: [shotPath],
+      reproRate: '1/1',
+      automationCandidate: true,
+      confidence: 'heuristic',
+      confidenceReason: 'The word could have come from UI chrome rather than actual searchable row data (e.g. a column header caught by the row selector) — verify before treating as confirmed.',
+    });
+  } else {
+    ctx.onLog(`[PaginationUI] Exact-search sanity check passed — searching for "${candidateWord}" (taken from a real row) returns results`);
+  }
+
+  await searchInput.fill(originalValue).catch(() => {});
+  await page.waitForTimeout(400);
+}
+
 async function rowOrderFingerprint(page: Page): Promise<string[]> {
   return page
     .locator(ROW_SELECTORS)
@@ -328,5 +444,74 @@ async function checkFilterControl(page: Page, ctx: ExecutorContext): Promise<voi
 
   // Restore original selection so later flows/tasks don't inherit a filtered view.
   await filterSelect.selectOption(originalValue).catch(() => {});
+  await page.waitForTimeout(400);
+}
+
+// Checklist (UI) §8/§9 — "Search + filter" combined. Applies a real, non-default filter option
+// AND a search query together, then checks the combined result is no WIDER than filtering alone
+// — i.e. adding a search term on top of an active filter should only narrow the list further,
+// never un-filter it back out. Doesn't know what the "correct" combined count should be, only
+// that combining two narrowing operations can't legitimately WIDEN the result set.
+async function checkSearchPlusFilterCombo(page: Page, ctx: ExecutorContext): Promise<void> {
+  const filterSelect = page.locator(FILTER_SELECT_SELECTOR).first();
+  const searchInput = page.locator(SEARCH_INPUT_SELECTOR).first();
+  if ((await filterSelect.count().catch(() => 0)) === 0 || (await searchInput.count().catch(() => 0)) === 0) return;
+  if (!(await filterSelect.isVisible().catch(() => false)) || !(await searchInput.isVisible().catch(() => false))) return;
+
+  const options = await filterSelect.locator('option').all();
+  if (options.length < 2) return;
+  const originalFilterValue = await filterSelect.inputValue().catch(() => '');
+  const originalSearchValue = await searchInput.inputValue().catch(() => '');
+  const targetFilterValue = await options[1].getAttribute('value').catch(() => null);
+  if (targetFilterValue === null || targetFilterValue === originalFilterValue) return;
+
+  ctx.onLog('[PaginationUI] Checking search + filter combined narrowing');
+
+  // Apply the filter alone first, to get a baseline row count for "filter only".
+  await filterSelect.selectOption(targetFilterValue).catch(() => {});
+  await page.waitForTimeout(700);
+  const filterOnlyCount = await page.locator(ROW_SELECTORS).count().catch(() => 0);
+  if (filterOnlyCount === 0) {
+    // Nothing to narrow further — restore and bail out cleanly.
+    await filterSelect.selectOption(originalFilterValue).catch(() => {});
+    return;
+  }
+
+  // Pull a real word from one of the still-visible (filtered) rows, so the search term is
+  // guaranteed to at least partially match the current filtered set rather than being a guess.
+  const rowText = (await page.locator(ROW_SELECTORS).first().textContent().catch(() => '')) ?? '';
+  const searchWord = rowText.split(/\s+/).map((w) => w.replace(/[^\w]/g, '')).find((w) => w.length >= 4 && !/^\d+$/.test(w));
+  if (!searchWord) {
+    await filterSelect.selectOption(originalFilterValue).catch(() => {});
+    ctx.onLog('[PaginationUI] Could not extract a search word from the filtered rows — skipping search+filter combo check');
+    return;
+  }
+
+  await searchInput.fill(searchWord).catch(() => {});
+  await page.waitForTimeout(900);
+  const combinedCount = await page.locator(ROW_SELECTORS).count().catch(() => 0);
+
+  if (combinedCount > filterOnlyCount) {
+    const shotPath = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', 'search-filter-combo-widened.png');
+    await page.screenshot({ path: shotPath }).catch(() => {});
+    ctx.onFinding({
+      severity: 'medium',
+      area: 'UI-Search',
+      title: 'Adding a search term on top of an active filter widens the result set',
+      steps: [`Apply a filter (${filterOnlyCount} row(s) shown)`, `Add a search term ("${searchWord}", taken from one of the filtered rows)`],
+      expected: 'Combining a search with an active filter should narrow results further, never show MORE rows than the filter alone',
+      actual: `Filter alone: ${filterOnlyCount} row(s); filter + search: ${combinedCount} row(s)`,
+      evidence: [shotPath],
+      reproRate: '1/1',
+      automationCandidate: true,
+      confidence: 'heuristic',
+      confidenceReason: 'Could indicate the search field clears/overrides the active filter rather than combining with it (an OR instead of an AND) — verify the actual intended behavior before treating as confirmed.',
+    });
+  } else {
+    ctx.onLog(`[PaginationUI] Search + filter combine correctly (filter only: ${filterOnlyCount}, combined: ${combinedCount})`);
+  }
+
+  await searchInput.fill(originalSearchValue).catch(() => {});
+  await filterSelect.selectOption(originalFilterValue).catch(() => {});
   await page.waitForTimeout(400);
 }

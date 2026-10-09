@@ -12,9 +12,16 @@ import type {
 import { FLOW_CLASSES, FLOW_TITLES, GENERIC_PHASES } from '@qa/shared';
 import { expandRequirementWithAI } from '../intelligence/requirement-expand-ai.js';
 
+// standard's cap must stay comfortably above the total flow-class count across ALL_AREAS
+// (94 as of 2026-10-06: ui 52 + chaos 10 + api 19 + security 2 + performance 4 + regression 3
+// + accessibility 3 + 1 recon) — otherwise it silently becomes the real constraint on coverage:
+// every new check added anywhere just displaces an existing one out of the same fixed budget,
+// so the scheduled-task count never visibly grows no matter how much real detection logic gets
+// built. Re-check this against the catalog total whenever a new flow class is added; it should
+// never be the thing deciding which checks run.
 const DEPTH_TASK_LIMITS: Record<SessionDepth, number> = {
   smoke: 15,     // recon + core UI + chaos basics
-  standard: 80,  // all matrix flows across all areas
+  standard: 130, // all matrix flows across all areas, with headroom for catalog growth
   deep: 200,     // full matrix + duplicates for extra coverage
   chaos: 20,     // all chaos + session + network flows
 };
@@ -57,10 +64,13 @@ const ALL_AREAS: (keyof typeof FLOW_CLASSES)[] = [
 const CRITICAL_RISK = new Set([
   'auth-matrix', 'auth-bypass', 'idor-probe', 'horizontal-privilege', 'vertical-privilege',
   'mass-assignment', 'xss-probe', 'security-headers', 'hidden-route-access',
+  'token-validation', // invalid/malformed/expired-token bypass + JWT alg:none — same class as auth-matrix
 ]);
 const HIGH_RISK = new Set([
   'crud', 'journey', 'data-integrity', 'state-transition', 'business-logic-boundary', 'rate-limit',
-  'session-timeout', 'multi-tab-logout', 'deep-link', 'schema-drift', 'generic-crud',
+  'session-timeout', 'multi-tab-logout', 'logout-session', 'session-expires-mid-op', 'deep-link', 'schema-drift', 'generic-crud',
+  'cancel-creation', 'cancel-deletion', 'duplicate-creation',
+  'crud-lifecycle', 'concurrency', 'malformed-input', 'state-transition-api', 'request-ordering',
 ]);
 const LOW_RISK = new Set([
   'dark-mode', 'reduced-motion', 'rtl-layout', 'placeholder-check', 'broken-images',
@@ -154,7 +164,7 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
       .filter((t) => {
         if (phase.id === 'recon') return t.flowClass === 'recon';
         if (phase.id === 'smoke')
-          return ['navigation', 'crud', 'journey', 'user-directed', 'action-inventory', 'data-integrity', 'state-transition', 'consent-exploration', 'visual-review', 'agentic-explore', 'generic-crud'].includes(t.flowClass);
+          return ['navigation', 'crud', 'journey', 'user-directed', 'action-inventory', 'data-integrity', 'state-transition', 'consent-exploration', 'visual-review', 'agentic-explore', 'generic-crud', 'cancel-creation', 'cancel-deletion', 'duplicate-creation'].includes(t.flowClass);
         if (phase.id === 'boundary')
           return [
             'form-validation',
@@ -165,8 +175,15 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
             'error-ui',
             'file-upload',
             'autofill',
+            'modal-lifecycle',
+            'dropdown-exploration',
+            'browser-behavior',
+            'interactive-states',
+            'field-validation',
+            'table-interaction',
             'viewport',
             'business-logic-boundary',
+            'functional-listing',
             'zoom-reflow',
             'dark-mode',
             'reduced-motion',
@@ -182,11 +199,16 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
           return [
             'back-during-post',
             'refresh-during-request',
+            'cancel-during-loading',
+            'navigate-away-during-loading',
             'double-click',
             'forward-after-back',
             'deep-link',
             'session-timeout',
             'multi-tab-logout',
+            'logout-session',
+            'forgot-password',
+            'session-expires-mid-op',
             'wizard',
             'focus-trap',
             'bfcache',
@@ -227,9 +249,23 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
             'security-headers',
             'rate-limit',
             'idempotency',
+            'response-hygiene',
+            'http-method-validation',
+            'malformed-input',
+            'crud-lifecycle',
+            'concurrency',
+            'file-payload',
+            'async-operations',
+            'token-validation',
+            'token-refresh',
+            'error-consistency',
+            'status-code-validation',
+            'request-ordering',
+            'state-transition-api',
             'labels',
             'keyboard',
             'contrast',
+            'semantic-structure',
             'cross-browser',
             'device-matrix',
             'download-verify',

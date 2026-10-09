@@ -74,7 +74,36 @@ function logSessionEventToConsole(event: SessionEvent): void {
 
 const executors: BaseExecutor[] = [new UiExecutor(), new ApiExecutor(), new ChaosExecutor()];
 
+// Some flow classes need routing to a SPECIFIC executor that doesn't otherwise own their
+// task.area — confirmed as real, silent dead code via a full audit: 'regression' had NO
+// executor claiming it at all (schema-drift, golden-path, AND visual-regression all
+// no-opped on every run), and 'security-headers' was being routed to ApiExecutor (which owns
+// the 'security' area for xss-probe etc.) even though its real implementation needs a live
+// Playwright page (response headers + cookie jar) and only exists in UiExecutor. Area-based
+// routing alone can't express "this one flow class in an otherwise-plain-HTTP area needs a
+// browser" or "this area is split across two executors" — this override map handles both
+// without touching the .areas arrays, which would risk misrouting every OTHER flow class
+// already working correctly through them.
+const FLOW_CLASS_EXECUTOR_OVERRIDE: Record<string, 'ui' | 'api' | 'chaos'> = {
+  'security-headers': 'ui',
+  'schema-drift': 'api',
+  'golden-path': 'ui',
+  'visual-regression': 'ui',
+  // All four are scheduled under the `chaos` area (so the planner's chaos-depth budget covers
+  // them), but their real implementation is a UI flow (packages/explorer-ui/flows/interruption.ts)
+  // — without this override they silently route to ChaosExecutor, whose own entries for the
+  // first two were a no-op stub that just logged "handled by UI executor" and never actually
+  // invoked it. Discovered the same way idempotency/security-headers were: a flow class present
+  // in FLOW_CLASSES and seemingly wired is not evidence it actually runs.
+  'back-during-post': 'ui',
+  'refresh-during-request': 'ui',
+  'cancel-during-loading': 'ui',
+  'navigate-away-during-loading': 'ui',
+};
+
 function getExecutor(task: FlowTask): BaseExecutor | undefined {
+  const override = FLOW_CLASS_EXECUTOR_OVERRIDE[task.flowClass];
+  if (override) return executors.find((e) => e.areas.includes(override));
   return executors.find((e) => e.areas.includes(task.area));
 }
 

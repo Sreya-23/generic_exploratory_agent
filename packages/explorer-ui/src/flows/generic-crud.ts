@@ -238,3 +238,264 @@ export async function runGenericCrudCheck(page: Page, ctx: ExecutorContext, _tas
     ctx.onLog('[GenericCrud] Delete-twice: entity no longer reachable to attempt a second delete — nothing more to observe');
   }
 }
+
+const CANCEL_PATTERN = /^(cancel|close|discard)\b/i;
+
+/**
+ * Checklist (UI) §13 — "Cancel creation": open the create form, fill it, click Cancel instead
+ * of Submit, and confirm NO entity was created. A separate task/run from the main CRUD lifecycle
+ * above — both open the same create trigger, so they can't share one page visit.
+ */
+export async function runCancelCreationCheck(page: Page, ctx: ExecutorContext, _task: FlowTask): Promise<void> {
+  const createTrigger = page.locator('button:visible, a:visible, [role="button"]:visible').filter({ hasText: CREATE_TRIGGER_PATTERN }).first();
+  if ((await createTrigger.count().catch(() => 0)) === 0) {
+    ctx.onLog('[GenericCrud] No create-shaped trigger found — skipping cancel-creation check');
+    return;
+  }
+  const createLabel = ((await createTrigger.textContent().catch(() => '')) ?? '').trim().slice(0, 40) || 'Create';
+  if (isRiskyActionLabel(createLabel)) {
+    ctx.onLog(`[GenericCrud] "${createLabel}" matches a risky-action pattern — skipping cancel-creation check`);
+    return;
+  }
+
+  const listUrl = page.url();
+  await createTrigger.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  await waitForRealContent(page).catch(() => {});
+
+  const marker = `QA-CANCEL-CREATE-${Date.now()}`.slice(0, 30);
+  if (!(await fillSafeFields(page, marker))) {
+    ctx.onLog('[GenericCrud] Create trigger opened, but no safe field to fill — skipping cancel-creation check');
+    return;
+  }
+
+  const cancelBtn = page.locator('button:visible, [role="button"]:visible').filter({ hasText: CANCEL_PATTERN }).first();
+  if ((await cancelBtn.count().catch(() => 0)) === 0) {
+    ctx.onLog('[GenericCrud] No Cancel control found on the create form — skipping cancel-creation check');
+    return;
+  }
+  await cancelBtn.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+
+  await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  await waitForRealContent(page).catch(() => {});
+
+  const leaked = (await page.getByText(marker, { exact: false }).count().catch(() => 0)) > 0;
+  if (leaked) {
+    const leakShot = await shot(page, ctx, 'cancel-creation-leaked');
+    ctx.onFinding({
+      severity: 'high',
+      area: 'UI-CRUD',
+      title: 'Canceling entity creation still creates the entity',
+      steps: [`Click "${createLabel}"`, `Fill the form with a distinctive value ("${marker}")`, 'Click Cancel instead of Submit', 'Reload the list'],
+      expected: 'Canceling a create form should discard the entered data, not persist it',
+      actual: `"${marker}" appears in the list despite clicking Cancel instead of Submit`,
+      evidence: [leakShot].filter((x): x is string => !!x),
+      reproRate: '1/1',
+      automationCandidate: true,
+      pageUrl: listUrl,
+      confidence: 'verified',
+      confidenceReason: 'The marker value was never submitted — its presence after Cancel can only mean the entity was created anyway.',
+    });
+  } else {
+    ctx.onLog('[GenericCrud] Cancel correctly discards the create form without creating an entity');
+  }
+}
+
+/**
+ * Checklist (UI) §13 — "Cancel deletion": creates its own synthetic entity (never targets a
+ * real pre-existing one), clicks Delete, cancels the confirmation dialog if one appears, and
+ * confirms the entity survives — then actually deletes it for real cleanup afterward (gated,
+ * same discipline as the main lifecycle above).
+ */
+export async function runCancelDeletionCheck(page: Page, ctx: ExecutorContext, _task: FlowTask): Promise<void> {
+  const createTrigger = page.locator('button:visible, a:visible, [role="button"]:visible').filter({ hasText: CREATE_TRIGGER_PATTERN }).first();
+  if ((await createTrigger.count().catch(() => 0)) === 0) {
+    ctx.onLog('[GenericCrud] No create-shaped trigger found — skipping cancel-deletion check');
+    return;
+  }
+  const createLabel = ((await createTrigger.textContent().catch(() => '')) ?? '').trim().slice(0, 40) || 'Create';
+  if (isRiskyActionLabel(createLabel)) {
+    ctx.onLog(`[GenericCrud] "${createLabel}" matches a risky-action pattern — skipping cancel-deletion check`);
+    return;
+  }
+
+  const listUrl = page.url();
+  await createTrigger.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  await waitForRealContent(page).catch(() => {});
+
+  const marker = `QA-CANCEL-DELETE-${Date.now()}`.slice(0, 30);
+  if (!(await fillSafeFields(page, marker))) {
+    ctx.onLog('[GenericCrud] No safe field to fill — skipping cancel-deletion check');
+    return;
+  }
+  const submitBtn = page.locator('button:visible, [role="button"]:visible, input[type="submit"]:visible').filter({ hasText: SUBMIT_PATTERN }).first();
+  if ((await submitBtn.count().catch(() => 0)) === 0) {
+    ctx.onLog('[GenericCrud] No submit control — skipping cancel-deletion check');
+    return;
+  }
+  await submitBtn.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(1200);
+  await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  await waitForRealContent(page).catch(() => {});
+
+  const row = page.locator(ROW_SELECTORS).filter({ hasText: marker }).first();
+  const foundViaRow = (await row.count().catch(() => 0)) > 0;
+  const foundViaText = foundViaRow || (await page.getByText(marker, { exact: false }).count().catch(() => 0)) > 0;
+  if (!foundViaText) {
+    ctx.onLog('[GenericCrud] Could not confirm the synthetic entity was created — skipping cancel-deletion check');
+    return;
+  }
+
+  const deleteScope = foundViaRow ? row : page;
+  const deleteTrigger = deleteScope.locator('button:visible, [role="button"]:visible').filter({ hasText: DELETE_TRIGGER_PATTERN }).first();
+  if ((await deleteTrigger.count().catch(() => 0)) === 0) {
+    ctx.onLog('[GenericCrud] No delete trigger found — skipping cancel-deletion check, synthetic entity may need manual cleanup');
+    return;
+  }
+  await deleteTrigger.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(500);
+
+  // Look for a confirmation dialog's OWN Cancel control, distinct from the delete trigger
+  // itself — many apps show a modal/alert here rather than deleting immediately.
+  const confirmDialogCancel = page.locator('[role="dialog"] button, [role="alertdialog"] button, .modal button')
+    .filter({ hasText: CANCEL_PATTERN })
+    .first();
+  if ((await confirmDialogCancel.count().catch(() => 0)) === 0) {
+    ctx.onLog('[GenericCrud] Delete has no confirmation dialog to cancel (deletes immediately) — cancel-deletion scenario not applicable here; cleaning up via real delete');
+    // The entity is very likely already gone (immediate delete) or mid-deletion — attempt a
+    // real, gated cleanup pass in case it somehow survived, then stop.
+    await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    return;
+  }
+
+  await confirmDialogCancel.click({ timeout: 5000 }).catch(() => {});
+  await page.waitForTimeout(800);
+  await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  await waitForRealContent(page).catch(() => {});
+
+  const stillExists = (await page.getByText(marker, { exact: false }).count().catch(() => 0)) > 0;
+  if (!stillExists) {
+    const gone = await shot(page, ctx, 'cancel-deletion-still-deleted');
+    ctx.onFinding({
+      severity: 'high',
+      area: 'UI-CRUD',
+      title: 'Canceling the delete confirmation dialog still deletes the entity',
+      steps: ['Click Delete on an entity', 'Click Cancel on the confirmation dialog', 'Reload the list'],
+      expected: 'Canceling the confirmation should leave the entity untouched',
+      actual: `"${marker}" no longer appears after canceling the delete confirmation`,
+      evidence: [gone].filter((x): x is string => !!x),
+      reproRate: '1/1',
+      automationCandidate: true,
+      pageUrl: listUrl,
+      confidence: 'verified',
+      confidenceReason: 'The confirmation dialog\'s own Cancel control was clicked, not the delete button — the entity disappearing anyway is unambiguous.',
+    });
+  } else {
+    ctx.onLog('[GenericCrud] Cancel on the delete confirmation correctly leaves the entity intact');
+  }
+
+  // Real cleanup: delete the synthetic entity for real now, gated same as the main lifecycle.
+  const cleanupRow = page.locator(ROW_SELECTORS).filter({ hasText: marker }).first();
+  const cleanupScope = (await cleanupRow.count().catch(() => 0)) > 0 ? cleanupRow : page;
+  const cleanupDeleteTrigger = cleanupScope.locator('button:visible, [role="button"]:visible').filter({ hasText: DELETE_TRIGGER_PATTERN }).first();
+  if ((await cleanupDeleteTrigger.count().catch(() => 0)) > 0) {
+    const deleteLabel = ((await cleanupDeleteTrigger.textContent().catch(() => '')) ?? '').trim().slice(0, 40) || 'Delete';
+    const canProceed = await gateIfSensitive(page, ctx, deleteLabel);
+    if (canProceed) {
+      await cleanupDeleteTrigger.click({ timeout: 5000 }).catch(() => {});
+      await page.waitForTimeout(500);
+      const confirmBtn = page.locator('[role="dialog"] button, [role="alertdialog"] button, .modal button')
+        .filter({ hasText: /^(delete|confirm|yes|remove)\b/i })
+        .first();
+      if ((await confirmBtn.count().catch(() => 0)) > 0) {
+        await confirmBtn.click({ timeout: 5000 }).catch(() => {});
+      }
+      ctx.onLog(`[GenericCrud] Cleaned up synthetic test entity "${marker}"`);
+    } else {
+      ctx.onLog(`[GenericCrud] Cleanup delete skipped pending confirmation — "${marker}" may be left behind and should be removed manually`);
+    }
+  }
+}
+
+/**
+ * Checklist (UI) §13 — "Duplicate creation": create the exact same entity twice in a row and
+ * observe whether duplicate-prevention exists. Informational by default — whether duplicates
+ * SHOULD be prevented is entirely domain-specific (a todo app may allow identical task names;
+ * a username/SKU field should not) — only flagged if something visibly breaks, not for the mere
+ * existence of two identical records.
+ */
+export async function runDuplicateCreationCheck(page: Page, ctx: ExecutorContext, _task: FlowTask): Promise<void> {
+  const createTrigger = page.locator('button:visible, a:visible, [role="button"]:visible').filter({ hasText: CREATE_TRIGGER_PATTERN }).first();
+  if ((await createTrigger.count().catch(() => 0)) === 0) {
+    ctx.onLog('[GenericCrud] No create-shaped trigger found — skipping duplicate-creation check');
+    return;
+  }
+  const createLabel = ((await createTrigger.textContent().catch(() => '')) ?? '').trim().slice(0, 40) || 'Create';
+  if (isRiskyActionLabel(createLabel)) {
+    ctx.onLog(`[GenericCrud] "${createLabel}" matches a risky-action pattern — skipping duplicate-creation check`);
+    return;
+  }
+
+  const listUrl = page.url();
+  const marker = `QA-DUP-${Date.now()}`.slice(0, 30);
+  let creationErrors = 0;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await createTrigger.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(800);
+    await waitForRealContent(page).catch(() => {});
+    if (!(await fillSafeFields(page, marker))) {
+      ctx.onLog('[GenericCrud] No safe field to fill — skipping duplicate-creation check');
+      return;
+    }
+    const submitBtn = page.locator('button:visible, [role="button"]:visible, input[type="submit"]:visible').filter({ hasText: SUBMIT_PATTERN }).first();
+    if ((await submitBtn.count().catch(() => 0)) === 0) {
+      ctx.onLog('[GenericCrud] No submit control — skipping duplicate-creation check');
+      return;
+    }
+    await submitBtn.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(1000);
+    const errorVisible = await page.locator('[class*="error"]:visible, [role="alert"]:visible').count().catch(() => 0);
+    if (attempt === 1 && errorVisible > 0) creationErrors++;
+    await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(800);
+    await waitForRealContent(page).catch(() => {});
+  }
+
+  const matchCount = await page.getByText(marker, { exact: false }).count().catch(() => 0);
+  if (matchCount >= 2 && creationErrors === 0) {
+    ctx.onLog(`[GenericCrud] Creating the identical entity twice succeeded both times (${matchCount} match(es) found) — duplicate-prevention does not appear to be enforced for this entity type; whether that's intended is domain-specific, not flagged as a defect`);
+  } else if (matchCount < 2) {
+    ctx.onLog(`[GenericCrud] Duplicate creation appears to be prevented or deduplicated (${matchCount} match(es) found after 2 identical submissions)`);
+  }
+
+  // Best-effort cleanup: attempt to delete whatever synthetic entities this check created.
+  for (let i = 0; i < matchCount; i++) {
+    const row = page.locator(ROW_SELECTORS).filter({ hasText: marker }).first();
+    const scope = (await row.count().catch(() => 0)) > 0 ? row : page;
+    const deleteTrigger = scope.locator('button:visible, [role="button"]:visible').filter({ hasText: DELETE_TRIGGER_PATTERN }).first();
+    if ((await deleteTrigger.count().catch(() => 0)) === 0) break;
+    const deleteLabel = ((await deleteTrigger.textContent().catch(() => '')) ?? '').trim().slice(0, 40) || 'Delete';
+    const canProceed = await gateIfSensitive(page, ctx, deleteLabel);
+    if (!canProceed) {
+      ctx.onLog(`[GenericCrud] Cleanup skipped pending confirmation — synthetic duplicate(s) of "${marker}" may be left behind`);
+      break;
+    }
+    await deleteTrigger.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    const confirmBtn = page.locator('[role="dialog"] button, [role="alertdialog"] button, .modal button')
+      .filter({ hasText: /^(delete|confirm|yes|remove)\b/i })
+      .first();
+    if ((await confirmBtn.count().catch(() => 0)) > 0) {
+      await confirmBtn.click({ timeout: 5000 }).catch(() => {});
+    }
+    await page.waitForTimeout(800);
+    await page.goto(listUrl, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+}

@@ -80,12 +80,16 @@ export async function runDataIntegrityCheck(
   const contentBefore = await captureContentSignature(page);
 
   const targetUrl = new URL(page.url()).origin;
-  const responses: Array<{ status: number; url: string }> = [];
-  const onResponse = (res: import('playwright').Response) => {
+  const responses: Array<{ status: number; url: string; body?: string }> = [];
+  const onResponse = async (res: import('playwright').Response) => {
     const req = res.request();
     if (!['POST', 'PUT', 'PATCH'].includes(req.method())) return;
     if (!res.url().startsWith(targetUrl)) return;
-    responses.push({ status: res.status(), url: res.url() });
+    const entry: { status: number; url: string; body?: string } = { status: res.status(), url: res.url() };
+    if (res.status() >= 200 && res.status() < 300) {
+      entry.body = await res.text().catch(() => undefined);
+    }
+    responses.push(entry);
   };
   page.on('response', onResponse);
 
@@ -183,6 +187,39 @@ export async function runDataIntegrityCheck(
         confidenceReason: 'Based on a coarse before/after content and URL diff — feedback rendered outside normal text flow (e.g. a subtle icon-only state change) would not be detected; verify manually.',
       });
       return;
+    }
+
+    // Checklist (UI) §27 — "API response → correct UI data." Distinct from the success/error
+    // text correlation above: this checks that a SPECIFIC value from the response body actually
+    // shows up on screen, not just that SOME positive feedback appeared — catching a UI that
+    // shows a generic "Saved!" toast while silently rendering stale/placeholder data instead of
+    // what the backend actually returned.
+    if (okResponse?.body) {
+      try {
+        const parsed = JSON.parse(okResponse.body);
+        const candidates = [parsed, parsed?.data, parsed?.result].filter((o) => o && typeof o === 'object');
+        let distinctiveValue: string | null = null;
+        for (const obj of candidates) {
+          for (const v of Object.values(obj as Record<string, unknown>)) {
+            if (typeof v === 'string' && v.length >= 6 && v.length <= 100 && !/^[0-9a-f-]{8,}$/i.test(v)) {
+              distinctiveValue = v;
+              break;
+            }
+          }
+          if (distinctiveValue) break;
+        }
+        if (distinctiveValue) {
+          await page.waitForTimeout(300);
+          const bodyText = await page.evaluate(() => document.body?.innerText ?? '').catch(() => '');
+          if (!bodyText.includes(distinctiveValue)) {
+            ctx.onLog(`[DataIntegrity] "${label}": response contains "${distinctiveValue.slice(0, 40)}" but it doesn't appear anywhere on the page afterward — could mean the UI isn't rendering the real response (not flagged: this field may simply not be display-relevant, e.g. an internal id or timestamp)`);
+          } else {
+            ctx.onLog(`[DataIntegrity] "${label}": response data correctly reflected in the rendered page`);
+          }
+        }
+      } catch {
+        /* response wasn't JSON, or had no suitable string field — nothing to compare */
+      }
     }
 
     ctx.onLog(`[DataIntegrity] "${label}": ${responses.length} request(s), consistent UI feedback — no mismatch detected`);

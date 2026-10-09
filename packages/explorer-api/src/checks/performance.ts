@@ -1,18 +1,24 @@
 import type { ExecutorContext } from '@qa/shared';
-import { probe } from '../probe-helpers.js';
+import { probe, resolveEndpointPaths, writeApiEvidence, formatEvidence } from '../probe-helpers.js';
 
 export async function testSpikeLoad(
   baseUrl: string,
   headers: Record<string, string>,
   ctx: ExecutorContext,
 ): Promise<number> {
+  // Checklist §14 — Rapid API Requests/Burst Testing: previously always hit '/' (the site's
+  // own homepage, not a real API), which tells you nothing about how the API itself handles a
+  // burst. Targets a real discovered/guessed API endpoint instead, falling back to '/' only if
+  // nothing else is known.
+  const target = resolveEndpointPaths(ctx, []).find(Boolean) ?? '/';
+
   const SPIKE_COUNT = 50;
-  ctx.onLog(`[SpikeLoad] Firing ${SPIKE_COUNT} concurrent requests`);
+  ctx.onLog(`[SpikeLoad] Firing ${SPIKE_COUNT} concurrent requests at ${target}`);
 
   const start = Date.now();
   const results = await Promise.all(
     Array.from({ length: SPIKE_COUNT }, () =>
-      probe(baseUrl, { method: 'GET', path: '/' }, headers).catch(() => ({
+      probe(baseUrl, { method: 'GET', path: target }, headers).catch(() => ({
         status: 0,
         body: '',
       })),
@@ -27,13 +33,14 @@ export async function testSpikeLoad(
   ctx.onFinding({
     severity: errors.length > SPIKE_COUNT * 0.1 ? 'high' : successRate < 100 ? 'medium' : 'info',
     area: 'Performance-SpikeLoad',
-    title: `Spike load (${SPIKE_COUNT} concurrent): ${successRate.toFixed(0)}% success`,
-    steps: [`Fire ${SPIKE_COUNT} concurrent GET / requests`],
+    title: `Spike load (${SPIKE_COUNT} concurrent) on ${target}: ${successRate.toFixed(0)}% success`,
+    steps: [`Fire ${SPIKE_COUNT} concurrent GET ${target} requests`],
     expected: '>95% success rate under spike load',
     actual: `Success: ${results.length - errors.length}/${SPIKE_COUNT}, Errors: ${errors.length}, Rate-limited: ${rateLimited.length}, Time: ${elapsed}ms`,
-    evidence: [],
+    evidence: writeApiEvidence(ctx, 'spike-load', formatEvidence('GET', target, 0, { responseBody: `Statuses: ${results.map((r) => r.status).join(',')}` })),
     reproRate: '1/1',
     automationCandidate: true,
+    pageUrl: target,
   });
 
   return errors.length > 0 ? 1 : 0;
@@ -50,12 +57,12 @@ export async function testNPlusOne(
 
   for (const listPath of listPaths) {
     try {
-      const { status, body } = await probe(baseUrl, { method: 'GET', path: listPath }, headers);
-      if (status !== 200) continue;
+      const res = await probe(baseUrl, { method: 'GET', path: listPath }, headers);
+      if (res.status !== 200) continue;
 
       let items: unknown[];
       try {
-        const parsed = JSON.parse(body);
+        const parsed = JSON.parse(res.body);
         items = Array.isArray(parsed) ? parsed : parsed.data ?? parsed.items ?? [];
       } catch {
         continue;
@@ -70,7 +77,7 @@ export async function testNPlusOne(
         steps: [`GET ${listPath}`, 'Count items in response', 'Check if individual item endpoints are called per item'],
         expected: 'Single query fetches all list data without per-item API calls',
         actual: `${items.length} items returned — monitor server-side query count for N+1 patterns`,
-        evidence: [],
+        evidence: writeApiEvidence(ctx, 'n-plus-one', formatEvidence('GET', listPath, res.status, { responseBody: res.body })),
         reproRate: '1/1',
         automationCandidate: false,
       });
@@ -96,7 +103,7 @@ export async function testLoadTime(baseUrl: string, ctx: ExecutorContext): Promi
         steps: [`GET ${baseUrl}`],
         expected: 'Load under 5s',
         actual: `${elapsed}ms`,
-        evidence: [],
+        evidence: writeApiEvidence(ctx, 'load-time', formatEvidence('GET', baseUrl, 0, { responseBody: `Elapsed: ${elapsed}ms` })),
         reproRate: '1/1',
         automationCandidate: true,
       });

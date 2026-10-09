@@ -125,7 +125,7 @@ After the URL is given and start is clicked, the agent runs ALL of these:
 - **UI & Interaction** (A1–A13): navigation, forms, viewport, autofill, file upload, pagination, wizard, real device matrix (iPhone/iPad/Pixel/Galaxy Tab), AI visual QA review (optional — needs `GEMINI_API_KEY` in `.env`, silently skipped otherwise)
 - **Navigation & Session** (B1–B7): back/forward, deep links, session timeout, multi-tab logout
 - **Network & Chaos** (C1–C6): slow network, offline, flaky network, WebSocket disconnect
-- **API** (D1–D7): CRUD, auth matrix, rate limiting, idempotency
+- **API** (D1–D7, D12–D35): CRUD, auth matrix, rate limiting, idempotency, response hygiene (incl. CORS/ETag/dependency-failure), HTTP method validation, functional pagination/search/sort/filter correctness, CRUD lifecycle & data consistency (incl. PUT), malformed input, concurrency/race conditions (incl. delete+update race), file/payload upload probing (incl. duplicate upload), async/background job operations, token validation (invalid/malformed/expired/alg-none), token refresh race, error response consistency, status code validation, request ordering, API state transitions, OpenAPI-driven discovery
 - **Accessibility** (E1–E3): labels/alt text, keyboard focus visibility, colour contrast (WCAG AA)
 - **Security** (F1–F5): IDOR, privilege escalation, XSS, mass assignment
 - **Performance** (G1–G3): spike load, large payload, N+1 patterns
@@ -162,11 +162,11 @@ Matrix IDs map to these flow classes:
 | UI & Interaction | A1–A16 | navigation, form-validation, input-boundary, double-click, keyboard-nav, viewport, modal-lifecycle, empty-states, error-ui, autofill, file-upload, pagination-ui (also covers search/filter result-count consistency — a declared count that disagrees with the actually-rendered rows), wizard, `device-matrix` (real iPhone/iPad/Pixel/Galaxy Tab emulation — not just resized viewport; also measures per-device horizontal overflow at each device's own real width, distinct from `viewport.ts`'s resized-Chromium widths and `zoom-reflow.ts`'s desktop zoom levels), file-upload-security 📋, i18n-rtl 📋, empty-credential login boundary (A16 — pre-login orchestrator check, not a scheduled flow class) |
 | Navigation & Session | B1–B12 | back-during-post, forward-after-back, refresh-during-request, deep-link, session-timeout, multi-tab-logout, concurrent-write 📋, unexpected-external-redirect (B10) and infinite-redirect-loop (B11) — both in `navigation.ts`'s BFS traversal, orphan-page-via-sitemap (B12) — in `coverage-report.ts` |
 | Network & Chaos | C1–C6 | slow-network, offline-mid-request, offline-recovery, flaky-network, timeout-retry, websocket-disconnect |
-| API | D1–D11 | crud, auth-matrix, idempotency, pagination, rate-limit, token-expiry 📋, csrf-probe 📋, graphql-probe 📋 |
+| API | D1–D35 | crud, auth-matrix, idempotency, pagination, rate-limit, csrf-probe 📋, graphql-probe 📋, response-hygiene (D12 — now also CORS/ETag/dependency-failure/observability-finding, D26-D28/D35), http-method-validation (D13), functional-listing (D14 + D29 sort/filter), crud-lifecycle (D15 + D30 PUT coverage), malformed-input (D16 — supersedes D5/D6), concurrency (D17 + D33 delete+update race), file-payload (D18 + D31 duplicate-upload), async-operations (D19 + webhook passive note), token-validation (D20 — invalid/malformed/expired/alg-none), token-refresh (D21 — conditional), error-consistency (D22), status-code-validation (D23), request-ordering (D24), state-transition-api (D25 — conditional), OpenAPI-driven discovery (D34, conditional on `config.openApiUrl`) |
 | Security | F1–F10 | idor-probe, horizontal-privilege, vertical-privilege, xss-probe, mass-assignment, security-headers (also covers cookie-flags + clickjacking-probe — one flow, one response's headers + cookie jar), open-redirect 📋, hidden-route-access (F10 — UI-hidden link directly reachable and renders real content; distinct from F2/F3 which probe API endpoints, this checks client-side-only route gating) |
 | Performance | G1–G3 | spike-load, large-payload, n-plus-one |
 | Regression | H1–H3 | golden-path, visual-regression, schema-drift |
-| Accessibility | E1–E3 | labels, keyboard, contrast — 📋 **planned, no handler yet; falls back to `navigation`** |
+| Accessibility | E1–E3 | labels, keyboard, contrast — ✅ real handlers in `ui-executor.ts` (`runLabelsCheck`/`runKeyboardCheck`/`runContrastCheck`) |
 | Business Logic | I1–I4 | `business-logic-boundary` covers price-tamper/negative-value (I1/I2): discovers amount/price/quantity-like fields, fills negative/zero/oversized/decimal-precision values, checks for inline validation feedback WITHOUT ever clicking submit (avoids risking a real mutation on a live system). coupon-abuse, date-boundary-logic — 📋 still planned, no handler yet |
 
 ### What the agent accepts as credentials / inputs
@@ -595,6 +595,18 @@ a single AI-vision read or a single fuzzy pattern match gets `heuristic` and sho
 spot-checked. See [non-bug-patterns.ts](../../../packages/explorer-ui/src/flows/non-bug-patterns.ts)
 for the growing library referenced below.
 
+- **`idempotency` and `security-headers` were scheduled but silently dead** — both looked fully
+  wired (present in `FLOW_CLASSES`, scheduled by the planner) but had no real executor path:
+  `idempotency` had no branch in `api-executor.ts`, and `security-headers` is a UI-only check
+  (needs a live Playwright page to read response headers) declared under the `security` area,
+  which `ApiExecutor` owns — so both silently fell back to the generic `navigation` flow every
+  run, producing no signal at all. Fixed with a real `testIdempotency` implementation and a new
+  `FLOW_CLASS_EXECUTOR_OVERRIDE` map in `run-session.ts` that routes specific flow classes to a
+  different executor than their area's default owner, without touching `.areas` arrays (the
+  `regression` area had the same orphan problem — no executor's `.areas` included it at all —
+  fixed the same way). A flow class present in `FLOW_CLASSES` is not evidence it actually runs;
+  always confirm an `api-executor.ts`/`ui-executor.ts` branch exists and resolves to the right
+  executor before trusting a ✅ in the matrix doc.
 - **App-download-gate misread as "empty/broken page"** — `device-matrix.ts`'s content-diff
   check and the Gemini visual-review prompt both flagged a real, sparse-but-intentional
   "please download our mobile app" interstitial as a rendering defect. Fixed by detecting the

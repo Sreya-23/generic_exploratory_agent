@@ -1,12 +1,108 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ExecutorContext } from '@qa/shared';
+
+let evidenceCounter = 0;
+
+/**
+ * Writes the raw request/response detail behind an API finding to a small text file under the
+ * session's screenshots dir (the one directory @fastify/static already serves, and the one
+ * FindingCard already knows how to build a URL for) and returns it as a `Finding.evidence`
+ * entry. Every API check was previously passing `evidence: []` — the finding's `steps`/`actual`
+ * text described what happened in prose, but the actual request body and full response body
+ * were never captured anywhere, unlike UI flows which always attach a screenshot. Never throws:
+ * a failed write just means this one finding has no evidence file, not a failed check.
+ */
+export function writeApiEvidence(ctx: ExecutorContext, label: string, content: string): string[] {
+  try {
+    const dir = join(ctx.sessionsDir, ctx.sessionId, 'screenshots');
+    mkdirSync(dir, { recursive: true });
+    const filename = `api-evidence-${label}-${Date.now()}-${evidenceCounter++}.txt`;
+    const filePath = join(dir, filename);
+    writeFileSync(filePath, content, 'utf-8');
+    return [filePath];
+  } catch {
+    return [];
+  }
+}
+
+export interface CrashConfirmation {
+  reproduced: boolean;
+  reproRate: string;
+  confidence: 'verified' | 'heuristic';
+  confidenceReason: string;
+}
+
+/**
+ * Checklist §35: "a single 500 without context" must be treated as an observation, not a
+ * qualified bug — yet every crash-detection check in this package was raising a high/critical
+ * finding off exactly one observed 5xx, with `reproRate: '1/1'` hardcoded and no retry anywhere.
+ * This re-sends the IDENTICAL request once more before a check escalates severity: if the same
+ * request 5xxs again, that's a deterministic bug, not noise (a GC pause, a cold Lambda, a
+ * load-balancer hiccup only fails once). Callers should downgrade severity to 'low' when
+ * `reproduced` is false, splat the returned fields into the finding, and keep the original
+ * severity only when it IS true.
+ */
+export async function confirmCrashReproduces(
+  baseUrl: string,
+  p: ApiProbe,
+  headers: Record<string, string>,
+): Promise<CrashConfirmation> {
+  let retryStatus: number;
+  try {
+    const retry = await probe(baseUrl, p, headers);
+    retryStatus = retry.status;
+  } catch {
+    retryStatus = 599; // a thrown error (timeout/connection reset) on retry is itself still a failure signal
+  }
+  const reproduced = retryStatus >= 500;
+  return {
+    reproduced,
+    reproRate: reproduced ? '2/2' : '1/2',
+    confidence: reproduced ? 'verified' : 'heuristic',
+    confidenceReason: reproduced
+      ? 'Reproduced on an immediate retry of the identical request — a deterministic server error, not transient flakiness.'
+      : 'Did NOT reproduce on an immediate retry of the identical request — the original 5xx may have been transient infrastructure flakiness (GC pause, cold start, load-balancer hiccup) rather than a deterministic bug. Downgraded to an observation per the "single 500 without context" rule; worth a manual re-check, not yet a confirmed defect.',
+  };
+}
+
+/** Compact, readable request/response summary for an evidence file — not JSON, meant to be
+ *  read directly by a human following up on the finding. */
+export function formatEvidence(
+  method: string,
+  path: string,
+  status: number,
+  opts: { requestBody?: unknown; requestHeaders?: Record<string, string>; responseBody?: string } = {},
+): string {
+  const lines = [`${method} ${path}`, `Status: ${status}`];
+  if (opts.requestHeaders && Object.keys(opts.requestHeaders).length > 0) {
+    lines.push(`Request headers: ${JSON.stringify(opts.requestHeaders)}`);
+  }
+  if (opts.requestBody !== undefined) {
+    lines.push(`Request body: ${JSON.stringify(opts.requestBody).slice(0, 2000)}`);
+  }
+  if (opts.responseBody !== undefined) {
+    lines.push(`Response body: ${opts.responseBody.slice(0, 2000)}`);
+  }
+  return lines.join('\n');
+}
 
 export interface ApiProbe {
   method: string;
   path: string;
   body?: unknown;
   headers?: Record<string, string>;
+  /** Overrides the default 15s client timeout — used by checks that deliberately want a SHORT
+   *  timeout to simulate a client giving up on a slow request (checklist §13/§19: "retry after
+   *  timeout/network failure"), where the server may still complete the write after the client
+   *  has already moved on and retried. */
+  timeoutMs?: number;
+}
+
+/** True only for an actual FormData body (multipart file uploads) — everything else is
+ *  treated as a plain JS value to be JSON-stringified, as every other check already assumes. */
+function isFormDataBody(body: unknown): body is FormData {
+  return typeof FormData !== 'undefined' && body instanceof FormData;
 }
 
 interface StoredCookie {
@@ -57,13 +153,22 @@ export async function probe(
   baseUrl: string,
   p: ApiProbe,
   headers: Record<string, string>,
-): Promise<{ status: number; body: string; isJson: boolean; contentType: string }> {
+): Promise<{ status: number; body: string; isJson: boolean; contentType: string; responseHeaders: Record<string, string> }> {
   const url = new URL(p.path, baseUrl).toString();
+  // Every write probe in this package sends a JSON-stringified body — without a Content-Type
+  // header, a server that strictly parses by content-type would never even see it as JSON,
+  // producing a false negative on checks that depend on the body actually being read (mass
+  // assignment, idempotency, etc). Set as a DEFAULT (p.headers can still override it) rather
+  // than forcing it on every caller to remember individually.
+  // A FormData body must NOT get a manual Content-Type — fetch sets its own multipart boundary,
+  // and overriding it here would break every file-upload probe's request.
+  const isFormData = isFormDataBody(p.body);
+  const contentTypeDefault: Record<string, string> = p.body && !isFormData ? { 'Content-Type': 'application/json' } : {};
   const res = await fetch(url, {
     method: p.method,
-    headers: { ...headers, ...p.headers },
-    body: p.body ? JSON.stringify(p.body) : undefined,
-    signal: AbortSignal.timeout(10000),
+    headers: { ...headers, ...contentTypeDefault, ...p.headers },
+    body: p.body === undefined ? undefined : isFormData ? (p.body as FormData) : JSON.stringify(p.body),
+    signal: AbortSignal.timeout(p.timeoutMs ?? 15000),
   });
   const contentType = res.headers.get('content-type') ?? '';
   const body = await res.text().catch(() => '');
@@ -71,7 +176,10 @@ export async function probe(
   const isJson =
     contentType.includes('application/json') ||
     (body.trimStart().startsWith('{') || body.trimStart().startsWith('['));
-  return { status: res.status, body: body.slice(0, 500), isJson, contentType };
+  const responseHeaders = Object.fromEntries(
+    [...res.headers.entries()].map(([k, v]) => [k.toLowerCase(), v]),
+  );
+  return { status: res.status, body: body.slice(0, 500), isJson, contentType, responseHeaders };
 }
 
 /**

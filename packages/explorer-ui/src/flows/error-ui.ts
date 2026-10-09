@@ -43,6 +43,71 @@ export async function runErrorUi(
     await input.fill(value).catch(() => {});
   }
 
+  // Checklist (UI) §23 — password visibility toggle and "remember me". Checked here, before
+  // submit, while a real (test) value sits in the password field and the form is still intact —
+  // submitting below may navigate away or re-render the form entirely.
+  const passwordField = form.locator('input[type="password"]').first();
+  if ((await passwordField.count()) > 0) {
+    const toggle = page.locator(
+      '[aria-label*="show password" i], [aria-label*="toggle password" i], [class*="password-toggle" i], [class*="show-password" i], button:near(input[type="password"])',
+    ).first();
+    if ((await toggle.count()) > 0 && (await toggle.isVisible().catch(() => false))) {
+      await toggle.click().catch(() => {});
+      await page.waitForTimeout(200);
+      const typeAfterToggle = await passwordField.getAttribute('type').catch(() => 'password');
+      if (typeAfterToggle === 'password') {
+        ctx.onFinding({
+          severity: 'low',
+          area: 'UI-Forms',
+          title: 'Password visibility toggle does not reveal the password',
+          steps: ['Fill the password field', 'Click the show/hide-password toggle control'],
+          expected: 'The field should switch to type="text" so the password becomes visible',
+          actual: 'Field remains type="password" after clicking the toggle',
+          evidence: [],
+          reproRate: '1/1',
+          automationCandidate: true,
+          confidence: 'heuristic',
+          confidenceReason: 'The toggle may use a different reveal mechanism (e.g. an overlay) rather than changing the input type — verify before treating as confirmed.',
+        });
+      } else {
+        ctx.onLog('[ErrorUI] Password visibility toggle correctly reveals the password');
+        await toggle.click().catch(() => {}); // toggle back for a clean submit below
+      }
+    } else {
+      ctx.onLog('[ErrorUI] No password visibility toggle control found — skipping');
+    }
+  }
+
+  const rememberMe = form.locator(
+    'input[type="checkbox"][name*="remember" i], input[type="checkbox"][id*="remember" i], label:has-text("Remember me") input[type="checkbox"]',
+  ).first();
+  if ((await rememberMe.count()) > 0) {
+    const checkedBefore = await rememberMe.isChecked().catch(() => false);
+    await rememberMe.check({ force: true }).catch(() => {});
+    const checkedAfter = await rememberMe.isChecked().catch(() => false);
+    if (!checkedAfter) {
+      ctx.onFinding({
+        severity: 'low',
+        area: 'UI-Forms',
+        title: '"Remember me" checkbox does not toggle',
+        steps: ['Click the "Remember me" checkbox'],
+        expected: 'The checkbox should become checked',
+        actual: 'Checkbox state did not change after clicking',
+        evidence: [],
+        reproRate: '1/1',
+        automationCandidate: true,
+      });
+    } else {
+      ctx.onLog(`[ErrorUI] "Remember me" checkbox toggles correctly (was ${checkedBefore}, now ${checkedAfter})`);
+    }
+    // Uncheck again — this run intentionally submits invalid credentials, and a checked
+    // "remember me" has no meaningful effect on that outcome but could affect later tasks'
+    // assumptions about a clean session state.
+    await rememberMe.uncheck({ force: true }).catch(() => {});
+  } else {
+    ctx.onLog('[ErrorUI] No "Remember me" checkbox found — skipping');
+  }
+
   await submitBtn.click().catch(() => {});
 
   // Filled credentials mean a real server round-trip now (not just client-side validation on

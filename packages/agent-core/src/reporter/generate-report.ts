@@ -10,7 +10,7 @@ import type {
   SessionState,
   Severity,
 } from '@qa/shared';
-import { computeHealthScore, FLOW_TITLES } from '@qa/shared';
+import { computeHealthScore, FLOW_TITLES, parseListLikeText } from '@qa/shared';
 import { dedupeFindingsWithAI, summarizeWithAI, validateFindingsWithAI } from './ai-report-enhance.js';
 
 const IMAGE_MIME: Record<string, string> = {
@@ -386,6 +386,16 @@ function formatSeverityInline(c: SeverityCounts): string {
     .join(', ') || 'none';
 }
 
+// Same list-detection as the HTML report's withListFormatting — renders a real Markdown list
+// when the field turns out to be a list crammed into one '; '/', '-joined sentence.
+function formatExpectedActualMarkdown(label: string, text: string): string {
+  const structured = parseListLikeText(text);
+  if (!structured) return `**${label}:** ${text}`;
+  const intro = structured.intro ? ` ${structured.intro}` : '';
+  const items = structured.items.map((item) => `  - ${item}`).join('\n');
+  return `**${label}:**${intro}\n${items}`;
+}
+
 function formatFindingMarkdown(f: Finding): string {
   const lines: string[] = [
     `#### [${f.severity.toUpperCase()}] ${f.title}`,
@@ -399,8 +409,8 @@ function formatFindingMarkdown(f: Finding): string {
     f.steps.forEach((step, i) => lines.push(`${i + 1}. ${step}`));
   }
   lines.push('');
-  lines.push(`**Expected:** ${f.expected}`);
-  lines.push(`**Actual:** ${f.actual}`);
+  lines.push(formatExpectedActualMarkdown('Expected', f.expected));
+  lines.push(formatExpectedActualMarkdown('Actual', f.actual));
   lines.push(
     `**Evidence:** ${f.evidence.length > 0 ? f.evidence.map((e) => basename(e)).join(', ') + ' (see HTML report for images)' : 'None attached'}`,
   );
@@ -432,6 +442,18 @@ function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F'): s
   // whitespace inside a plain <p> renders as a single line.
   const withLineBreaks = (s: string) => escapeHtml(s).replace(/\n/g, '<br>');
 
+  // Several check files build a single Finding.actual/expected string by joining a list with
+  // '; '/', ' (there's nowhere else in the Finding shape to put a list) — this renders that
+  // structure back out as a real <ul> instead of a wall of semicolons, matching the live
+  // session UI's FindingCard.tsx treatment of the same fields.
+  const withListFormatting = (s: string): string => {
+    const structured = parseListLikeText(s);
+    if (!structured) return withLineBreaks(s);
+    const intro = structured.intro ? `${escapeHtml(structured.intro)} ` : '';
+    const items = structured.items.map((item) => `<li>${escapeHtml(item)}</li>`).join('');
+    return `${intro}<ul class="finding-list">${items}</ul>`;
+  };
+
   const confidenceBadge = f.confidence
     ? `<span class="confidence-badge ${f.confidence}" title="${escapeHtml(f.confidenceReason ?? '')}">${f.confidence === 'verified' ? '✓ Verified' : '⚠ Heuristic'}</span>`
     : '';
@@ -455,8 +477,8 @@ function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F'): s
   ${f.preconditions ? `<p class="pre"><span class="label">Preconditions</span>${escapeHtml(f.preconditions)}</p>` : ''}
   <div class="block"><span class="label">Steps to reproduce</span>${steps}</div>
   <div class="ea-grid">
-    <div class="ea expected"><span class="label">Expected</span><p>${withLineBreaks(f.expected)}</p></div>
-    <div class="ea actual"><span class="label">Actual</span><p>${withLineBreaks(f.actual)}</p></div>
+    <div class="ea expected"><span class="label">Expected</span><div class="ea-text">${withListFormatting(f.expected)}</div></div>
+    <div class="ea actual"><span class="label">Actual</span><div class="ea-text">${withListFormatting(f.actual)}</div></div>
   </div>
   ${confidenceNote}
   <div class="block"><span class="label">Evidence</span>${evidence}</div>
@@ -1632,7 +1654,9 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
     }
     .ea.expected { border-left: 3px solid #15803d; }
     .ea.actual { border-left: 3px solid #b45309; }
-    .ea p { margin: 0; font-size: 0.9rem; color: var(--ink); }
+    .ea-text { margin: 0; font-size: 0.9rem; color: var(--ink); }
+    .finding-list { margin: 0.3rem 0 0 1.1rem; padding: 0; }
+    .finding-list li { margin: 0.1rem 0; }
     .finding-foot {
       display: flex;
       justify-content: space-between;

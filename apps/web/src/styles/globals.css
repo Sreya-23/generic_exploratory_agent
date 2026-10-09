@@ -583,8 +583,25 @@ textarea {
   margin-bottom: 0.75rem;
 }
 
-.finding-expected-actual p {
+.finding-expected-actual-row {
   margin-bottom: 0.25rem;
+}
+
+.finding-text-intro {
+  display: block;
+  margin-top: 0.15rem;
+}
+
+.finding-text-list {
+  margin: 0.25rem 0 0.25rem 1.1rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.finding-text-list li {
+  line-height: 1.4;
 }
 
 .finding-evidence {
@@ -601,6 +618,19 @@ textarea {
   border-radius: 6px;
   border: 1px solid var(--border);
   display: block;
+}
+
+.finding-evidence-raw {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.evidence-raw-link {
+  font-size: 0.85rem;
+  color: var(--accent, #4f8cff);
+  text-decoration: underline;
 }
 
 .finding-card footer {

@@ -1,5 +1,23 @@
 import { useState } from 'react';
 import { evidenceUrl, raiseBugsInQualityPilot, type Finding } from '../../api/client';
+import { parseListLikeText } from '@qa/shared';
+
+/** Renders as a bulleted list when the text turns out to be a list crammed into one sentence
+ *  (see parseListLikeText) — otherwise renders as the plain sentence it already is. */
+function FindingText({ text }: { text: string }) {
+  const structured = parseListLikeText(text);
+  if (!structured) return <>{text}</>;
+  return (
+    <>
+      {structured.intro && <span className="finding-text-intro">{structured.intro}</span>}
+      <ul className="finding-text-list">
+        {structured.items.map((item, i) => (
+          <li key={i}>{item}</li>
+        ))}
+      </ul>
+    </>
+  );
+}
 
 const SEVERITY_CLASS: Record<Finding['severity'], string> = {
   critical: 'finding-critical',
@@ -15,6 +33,7 @@ export function FindingCard({ finding, sessionId }: { finding: Finding; sessionI
   const steps =
     finding.steps.length > 0 ? finding.steps : ['(no steps recorded)'];
   const screenshots = (finding.evidence ?? []).filter((e) => IMAGE_EXT.test(e));
+  const rawEvidence = (finding.evidence ?? []).filter((e) => !IMAGE_EXT.test(e));
   const [raiseStatus, setRaiseStatus] = useState<'idle' | 'raising' | 'done' | 'error'>('idle');
   const [raiseMessage, setRaiseMessage] = useState('');
 
@@ -51,12 +70,12 @@ export function FindingCard({ finding, sessionId }: { finding: Finding; sessionI
         </ol>
       </div>
       <div className="finding-expected-actual">
-        <p>
-          <strong>Expected:</strong> {finding.expected}
-        </p>
-        <p>
-          <strong>Actual:</strong> {finding.actual}
-        </p>
+        <div className="finding-expected-actual-row">
+          <strong>Expected:</strong> <FindingText text={finding.expected} />
+        </div>
+        <div className="finding-expected-actual-row">
+          <strong>Actual:</strong> <FindingText text={finding.actual} />
+        </div>
       </div>
       {screenshots.length > 0 && (
         <div className="finding-evidence">
@@ -68,6 +87,21 @@ export function FindingCard({ finding, sessionId }: { finding: Finding; sessionI
               </a>
             );
           })}
+        </div>
+      )}
+      {rawEvidence.length > 0 && (
+        <div className="finding-evidence-raw">
+          {rawEvidence.map((path, i) => (
+            <a
+              key={i}
+              href={evidenceUrl(sessionId, path)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="evidence-raw-link"
+            >
+              View raw request/response{rawEvidence.length > 1 ? ` #${i + 1}` : ''}
+            </a>
+          ))}
         </div>
       )}
       <footer>

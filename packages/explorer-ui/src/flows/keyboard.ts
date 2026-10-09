@@ -67,6 +67,81 @@ export async function runKeyboardNav(
 
   ctx.onLog(`[KeyboardNav] Keyboard navigation OK — visited: ${[...visited].join(', ')}`);
 
+  // ── Shift+Tab — focus should move BACKWARD to the previously-visited element ──────────────
+  const beforeShiftTab = await page.evaluate(() => document.activeElement?.tagName ?? 'BODY');
+  await page.keyboard.press('Shift+Tab');
+  await page.waitForTimeout(150);
+  const afterShiftTab = await page.evaluate(() => document.activeElement?.tagName ?? 'BODY');
+  if (afterShiftTab === beforeShiftTab && interactiveTags.has(beforeShiftTab)) {
+    ctx.onFinding({
+      severity: 'low',
+      area: 'UI-Accessibility',
+      title: 'Shift+Tab does not move focus backward',
+      steps: ['Tab forward through several elements', 'Press Shift+Tab'],
+      expected: 'Focus should move to the previously-focused element',
+      actual: `Focus stayed on the same <${afterShiftTab.toLowerCase()}> element`,
+      evidence: [],
+      reproRate: '1/1',
+      automationCandidate: true,
+      confidence: 'heuristic',
+      confidenceReason: 'Could reflect a custom keydown handler intercepting Shift+Tab for a legitimate reason (e.g. a focus-trapped widget) — verify context before treating as confirmed.',
+    });
+  } else {
+    ctx.onLog('[KeyboardNav] Shift+Tab correctly moves focus backward');
+  }
+
+  // Target the common bug: a non-native clickable (`[role="button"]`/`div[onclick]`)
+  // that responds to mouse clicks but has no keydown handler for Enter/Space at all.
+  const customButton = page.locator('[role="button"]:visible, div[onclick]:visible, span[onclick]:visible').first();
+  if ((await customButton.count()) > 0) {
+    const tabIndex = await customButton.getAttribute('tabindex');
+    const isFocusable = tabIndex !== null && tabIndex !== '-1';
+    if (isFocusable) {
+      // A real keydown/keyup listener is invisible to introspection from outside without
+      // triggering a real click (which could have side effects on an arbitrary page) — logged
+      // for manual follow-up rather than asserted, since silence here isn't evidence either way.
+      ctx.onLog('[KeyboardNav] Found a custom clickable (role="button"/onclick div) that IS keyboard-focusable — manually verify Enter/Space actually activates it, which this check cannot confirm without risking a real click side effect');
+    } else {
+      ctx.onFinding({
+        severity: 'medium',
+        area: 'UI-Accessibility',
+        title: 'Custom clickable element is not keyboard-focusable',
+        steps: ['Inspect a [role="button"] or onclick-bearing element with no tabindex'],
+        expected: 'An element acting as a button should be focusable (tabindex="0" or a native <button>)',
+        actual: 'Element has role="button" or an onclick handler but no tabindex, so it is unreachable via Tab',
+        evidence: [],
+        reproRate: '1/1',
+        automationCandidate: true,
+        confidence: 'verified',
+        confidenceReason: 'Directly observed: the element has a button-like role/handler but no tabindex attribute making it focusable.',
+      });
+    }
+  }
+
+  // ── Keyboard-only form submission ─────────────────────────────────────────────────────────
+  // Tabs to a visible submit control and presses Enter rather than clicking — many forms are
+  // wired to a click handler only and silently do nothing on a pure-keyboard submit attempt.
+  const submitBtn = page.locator('button[type="submit"]:visible, input[type="submit"]:visible').first();
+  if ((await submitBtn.count()) > 0) {
+    try {
+      await submitBtn.focus();
+      const focusedIsSubmit = await page.evaluate(() => {
+        const el = document.activeElement as HTMLElement | null;
+        return el?.getAttribute('type') === 'submit';
+      });
+      if (focusedIsSubmit) {
+        const urlBefore = page.url();
+        await page.keyboard.press('Enter');
+        await page.waitForTimeout(500);
+        const urlAfter = page.url();
+        const formStillPresent = (await page.locator('form').count()) > 0;
+        ctx.onLog(`[KeyboardNav] Keyboard-only submit via Enter on the focused submit button: ${urlAfter !== urlBefore ? 'navigated' : formStillPresent ? 'form still present (likely validation or AJAX submit)' : 'page changed'}`);
+      } else {
+        ctx.onLog('[KeyboardNav] Could not confirm focus landed on the submit control — skipping keyboard-only submit check');
+      }
+    } catch { /* ignore — avoid failing the whole flow over one optional sub-check */ }
+  }
+
   // Test Escape key on modals/dialogs
   const hasModal = (await page.locator('[role="dialog"], [role="alertdialog"]').count()) > 0;
   if (hasModal) {

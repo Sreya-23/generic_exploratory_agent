@@ -1,5 +1,5 @@
 import type { ExecutorContext } from '@qa/shared';
-import { probe, mapWithConcurrency, resolveEndpointPaths } from '../probe-helpers.js';
+import { probe, mapWithConcurrency, resolveEndpointPaths, writeApiEvidence, formatEvidence, confirmCrashReproduces } from '../probe-helpers.js';
 
 export async function testPagination(
   baseUrl: string,
@@ -18,16 +18,19 @@ export async function testPagination(
         headers,
       );
       if (status >= 500) {
+        const confirm = await confirmCrashReproduces(baseUrl, { method: 'GET', path: `${basePath}${query}` }, headers);
         ctx.onFinding({
-          severity: 'medium',
+          severity: confirm.reproduced ? 'medium' : 'low',
           area: 'API-Boundary',
           title: `Server error on pagination edge case: ${basePath}${query}`,
-          steps: [`GET ${basePath}${query}`],
+          steps: [`GET ${basePath}${query}`, ...(confirm.reproduced ? ['Repeated — reproduced on an immediate retry'] : [])],
           expected: '4xx client error for invalid pagination',
           actual: `HTTP ${status}: ${body.slice(0, 100)}`,
-          evidence: [],
-          reproRate: '1/1',
+          evidence: writeApiEvidence(ctx, 'boundary-pagination', formatEvidence('GET', `${basePath}${query}`, status, { responseBody: body })),
+          reproRate: confirm.reproRate,
           automationCandidate: true,
+          confidence: confirm.confidence,
+          confidenceReason: confirm.confidenceReason,
         });
         return true;
       }

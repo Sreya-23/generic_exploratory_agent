@@ -284,7 +284,7 @@ export function LiveSessionPage() {
         </section>
 
         <section className="findings-panel">
-          <QualityPilotConnect sessionId={session.id} />
+          <QualityPilotConnect />
           <h2>Findings ({findings.length})</h2>
           {findings.length === 0 ? (
             <p className="empty-state">
