@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type {
   ChatMessage,
   ExplorationArea,
+  ScopeSection,
   SessionConfig,
   SessionCredentials,
   SessionDepth,
@@ -39,6 +40,11 @@ export const MATRIX_ID_MAP: Record<string, string> = {
   A11: 'file-upload',
   A12: 'pagination-ui',
   A13: 'wizard',
+  A17: 'sort-verification',
+  A18: 'link-target-consistency',
+  A19: 'input-retention',
+  A20: 'duplicate-images',
+  A21: 'cart-integrity',
   // Navigation & Session
   B1: 'back-during-post',
   B2: 'forward-after-back',
@@ -98,6 +104,11 @@ export function matrixTestList(): string {
       { id: 'A11', label: 'File upload edge cases' },
       { id: 'A12', label: 'Pagination UI' },
       { id: 'A13', label: 'Multi-step wizard' },
+      { id: 'A17', label: 'Sort order matches its label' },
+      { id: 'A18', label: 'List item opens the matching page' },
+      { id: 'A19', label: 'Fields keep typed values' },
+      { id: 'A20', label: 'Duplicate item images' },
+      { id: 'A21', label: 'Cart & checkout consistency' },
     ],
     'Navigation & Session': [
       { id: 'B1', label: 'Back during API call' },
@@ -271,6 +282,39 @@ function extractExtras(text: string, existingExtras?: Record<string, string>): R
   return added ? extras : null;
 }
 
+const SCOPE_DECLINE_RE =
+  /^(no|none|nope|skip|everything|every\s?section|all sections?|no restriction|not needed|don't need|dont need)\b/i;
+
+function isScopeDecline(text: string): boolean {
+  return SCOPE_DECLINE_RE.test(text.trim());
+}
+
+/**
+ * Parse a scope-restriction answer like "Dashboard > Overview, Summary", "Dashboard: Overview,
+ * Summary", "Dashboard, Settings" (no sub-tabs), or several sections separated by ";".
+ * Deliberately only called while `awaitingScopeAnswer` is true (see processSetupMessage) —
+ * the bare-comma-list branch below would misfire constantly on ordinary free text otherwise.
+ */
+function extractScopeSections(text: string): ScopeSection[] | null {
+  const trimmed = text.trim();
+  if (!trimmed || /https?:\/\//i.test(trimmed)) return null;
+
+  const groups = trimmed.split(/;\s*/).map((g) => g.trim()).filter(Boolean);
+  const sections: ScopeSection[] = [];
+  for (const g of groups) {
+    const withSub = g.match(/^(.+?)\s*(?:>|:)\s*(.+)$/);
+    if (withSub) {
+      const section = withSub[1].trim();
+      const subSections = withSub[2].split(',').map((s) => s.trim()).filter(Boolean);
+      if (section) sections.push({ section, subSections: subSections.length ? subSections : undefined });
+    } else {
+      const names = g.split(',').map((s) => s.trim()).filter(Boolean);
+      for (const n of names) if (n) sections.push({ section: n });
+    }
+  }
+  return sections.length ? sections : null;
+}
+
 function missingFields(draft: SetupDraft): string[] {
   const missing: string[] = [];
   if (!draft.targetUrl) missing.push('target URL');
@@ -290,6 +334,7 @@ function draftToConfig(draft: SetupDraft): SessionConfig | undefined {
     credentials: draft.credentials,
     flowInstructions: draft.flowInstructions?.length ? draft.flowInstructions : undefined,
     selectedFlowClasses: draft.selectedFlowClasses?.length ? draft.selectedFlowClasses : undefined,
+    allowedSections: draft.allowedSections?.length ? draft.allowedSections : undefined,
   };
 }
 
@@ -327,6 +372,14 @@ function summarizeDraft(draft: SetupDraft): string {
       ? `**Selected tests:** ${draft.selectedFlowClasses.map((fc) => reverseMap[fc] ?? fc).join(', ')}`
       : '';
 
+  const scopeLine = draft.allowedSections?.length
+    ? `**Scope:** ${draft.allowedSections
+        .map((s) => (s.subSections?.length ? `${s.section} (${s.subSections.join(', ')})` : s.section))
+        .join('; ')}`
+    : draft.scopeAsked
+      ? `**Scope:** All sections (no restriction)`
+      : '';
+
   return [
     `**Target:** ${draft.targetUrl ?? '(not set)'}`,
     `**Depth:** ${draft.depth}`,
@@ -335,6 +388,7 @@ function summarizeDraft(draft: SetupDraft): string {
     extrasLine,
     instructionsLine,
     selectedLine,
+    scopeLine,
     draft.context ? `**Context:** ${draft.context.slice(0, 120)}` : '',
   ]
     .filter(Boolean)
@@ -476,6 +530,15 @@ export function processSetupMessage(
   const text = userText.trim();
   conversation.messages.push(msg('user', text));
 
+  // Computed from the draft's state BEFORE this message's own mutations — true exactly when
+  // the previous turn just asked the scope question and this message is its answer. Gates the
+  // credentials yes/no parsing below so a "no" meant to decline the scope restriction can't be
+  // misread as "no credentials" and wipe out credentials entered earlier in the conversation.
+  const awaitingScopeAnswer =
+    !!conversation.draft.scopeAsked &&
+    !conversation.draft.allowedSections?.length &&
+    !conversation.draft.scopeDeclined;
+
   const url = extractUrl(text);
   if (url) conversation.draft.targetUrl = url;
 
@@ -500,7 +563,7 @@ export function processSetupMessage(
   // moment a user needs to say "skip login, explore anonymously" to override that guess
   // (e.g. an e-commerce catalog where almost everything is browsable without an account,
   // even if some page the probe happened to check was gated). The explicit "no" always wins.
-  if (isNoCredentials(text)) {
+  if (isNoCredentials(text) && !awaitingScopeAnswer) {
     conversation.draft.credentials = { type: 'none', authMethod: 'none' };
     conversation.draft.needsLogin = false;
     conversation.draft.authState = 'ready';
@@ -508,7 +571,7 @@ export function processSetupMessage(
 
   // Handle "yes, I have credentials" — default to password auth so the flow goes
   // URL → username → password (user can correct the method inline if needed)
-  if (isYesCredentials(text) && !conversation.draft.needsLogin && !url) {
+  if (isYesCredentials(text) && !conversation.draft.needsLogin && !url && !awaitingScopeAnswer) {
     conversation.draft.needsLogin = true;
     conversation.draft.credentials = {
       ...conversation.draft.credentials,
@@ -519,7 +582,7 @@ export function processSetupMessage(
   }
 
   // User wants to re-enter a mistaken username/password/otp
-  const correction = detectAuthCorrection(text);
+  const correction = awaitingScopeAnswer ? null : detectAuthCorrection(text);
   let justCorrected: 'username' | 'password' | 'otp' | null = null;
   if (correction && conversation.draft.needsLogin) {
     conversation.draft.credentials = clearAuthField(conversation.draft.credentials, correction);
@@ -527,20 +590,39 @@ export function processSetupMessage(
     justCorrected = correction;
   }
 
-  // Parse standard auth fields (skip if this was a yes/no answer to the credentials question)
+  // Parse standard auth fields (skip if this was a yes/no answer to the credentials question,
+  // or an answer to the scope question — a field-shaped scope answer like "key: value" should
+  // never be mistaken for a credential).
   const isYesNoReply = isNoCredentials(text) || isYesCredentials(text) || !!justCorrected;
-  const authPatch = isYesNoReply ? {} : parseAuthFields(text, conversation.draft);
+  const authPatch = isYesNoReply || awaitingScopeAnswer ? {} : parseAuthFields(text, conversation.draft);
   if (Object.keys(authPatch).length > 0) {
     conversation.draft.credentials = mergeCredentials(conversation.draft.credentials, authPatch);
   }
 
-  // Parse extra inputs (phone, card, custom fields)
-  const extrasPatch = extractExtras(text, conversation.draft.credentials.extras);
+  // Parse extra inputs (phone, card, custom fields) — not while a scope answer is expected,
+  // since a scope answer like "Dashboard: Overview, Summary" is itself colon-shaped and would
+  // otherwise get misread as a "dashboard: Overview" extra field.
+  const extrasPatch = awaitingScopeAnswer ? null : extractExtras(text, conversation.draft.credentials.extras);
   if (extrasPatch) {
     conversation.draft.credentials = {
       ...conversation.draft.credentials,
       extras: extrasPatch,
     };
+  }
+
+  // Parse the answer to the scope-restriction question — only while we're actually waiting on
+  // one (i.e. the question was asked on a prior turn and hasn't been resolved yet). Gating this
+  // way keeps extractScopeSections' bare-comma-list branch from misfiring on ordinary free text
+  // sent at any other point in the conversation.
+  if (awaitingScopeAnswer) {
+    if (isScopeDecline(text) || isStartCommand(text)) {
+      // A bare "start" here means "skip the scope question, run unrestricted" — not an
+      // attempt to name a section literally called "start".
+      conversation.draft.scopeDeclined = true;
+    } else {
+      const sections = extractScopeSections(text);
+      if (sections) conversation.draft.allowedSections = sections;
+    }
   }
 
   // Detect matrix test IDs (e.g. "A6, B2, F2" or "run all")
@@ -567,9 +649,10 @@ export function processSetupMessage(
     ];
   }
 
-  // Fallback context
+  // Fallback context — never while a scope answer is expected, so a long section list like
+  // "Dashboard > Overview, Summary; Settings" doesn't also get dumped into free-text context.
   const isAuthOrExtras = Object.keys(authPatch).length > 0 || extrasPatch !== null;
-  if (text.length > 20 && !url && !isStartCommand(text) && !isAuthOrExtras && !instruction && !isNoCredentials(text) && !isYesCredentials(text)) {
+  if (!awaitingScopeAnswer && text.length > 20 && !url && !isStartCommand(text) && !isAuthOrExtras && !instruction && !isNoCredentials(text) && !isYesCredentials(text)) {
     conversation.draft.context = conversation.draft.context
       ? `${conversation.draft.context}\n${text}`
       : text;
@@ -578,6 +661,20 @@ export function processSetupMessage(
   conversation.draft.authState = nextAuthState(conversation.draft);
 
   const missing = missingFields(conversation.draft);
+
+  // Ask the (optional) scope-restriction question exactly once, right after credentials are
+  // resolved and before the "all set, say start" message — but let an explicit "start" bypass
+  // it (the restriction is optional; a user in a hurry can skip straight to an unrestricted run).
+  // `credentialsAsked` is required too, not just `missing.length === 0` — right after the URL
+  // message itself, missing can read as empty for a beat before the real auth probe has run
+  // (authProbe/needsLogin aren't set yet), which would otherwise fire this a full step early,
+  // on the URL turn instead of after credentials are actually resolved.
+  const needsScopeQuestion =
+    missing.length === 0 &&
+    !!conversation.draft.credentialsAsked &&
+    !conversation.draft.scopeAsked &&
+    !isStartCommand(text);
+
   const readyToStart = missing.length === 0 && isStartCommand(text);
 
   const replyPatch: Partial<SessionCredentials> = {
@@ -606,6 +703,18 @@ export function processSetupMessage(
     reply =
       `No problem — cleared the previous ${fieldLabel}. Enter it again.\n\n` +
       authPromptForState(conversation.draft);
+  } else if (needsScopeQuestion) {
+    conversation.draft.scopeAsked = true;
+    reply =
+      `✅ Auth is set.\n\n` +
+      `One more thing — should I **restrict testing to specific sections/tabs**? Anything outside the allowed sections (including their sub-tabs) is skipped entirely, so I never touch areas with confidential data.\n\n` +
+      `**Type just the section name(s) — exactly as they appear in the sidebar, nothing else.** ` +
+      `This is matched literally against the sidebar text, not read as a sentence, so a full-sentence reply like "only check the members section please" won't be understood as a restriction. Use one of these exact forms:\n\n` +
+      `- One section: \`Members\`\n` +
+      `- Several sections, comma-separated: \`Members, Groups\`\n` +
+      `- A section restricted to specific sub-tabs: \`Dashboard > Overview, Summary\`\n` +
+      `- Several sections, some with sub-tabs, separated by \`;\`: \`Dashboard > Overview, Summary; Settings\`\n` +
+      `- Or say **"no"** / **"everything"** to skip this and explore the full site\n`;
   } else {
     reply = buildAssistantReply(conversation.draft, text, replyPatch);
   }

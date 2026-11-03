@@ -224,6 +224,17 @@ export const FLOW_CLASSES = {
     // Service worker registration + real offline-cache behavior (genuine network cutoff, not
     // per-request interception like chaos/flaky-network.ts)
     'offline-pwa',
+    // A17–A21 — outcome checks: verify an action did the RIGHT thing, not just "something".
+    // A17 sort option's stated order (A→Z, price low→high) matches the visible list
+    'sort-verification',
+    // A18 an item's link opens the matching detail page (name/price), across spread-out items
+    'link-target-consistency',
+    // A19 typed values survive leaving the field, and typing never changes another field
+    'input-retention',
+    // A20 different items in one list showing the identical image (no AI key needed)
+    'duplicate-images',
+    // A21 cart count / remove / cart page / checkout fields / summary totals agree
+    'cart-integrity',
   ],
   // H1/H3 live only in regression — not duplicated in ui
   api: [
@@ -360,8 +371,8 @@ export const FLOW_TITLES: Record<string, string> = {
   'consent-exploration': 'Consent & User Agreement Exploration',
   'business-logic-boundary': 'Business Logic Boundary (amount/price/quantity) (I1/I2)',
   'device-matrix': 'Real Device Matrix (iPhone/iPad/Pixel/Galaxy Tab)',
-  'visual-review': 'AI Visual QA Review (Gemini vision, optional)',
-  'agentic-explore': 'AI Agentic Exploration (Gemini, optional)',
+  'visual-review': 'AI Visual QA Review (optional, needs an LLM key)',
+  'agentic-explore': 'AI Agentic Exploration (optional, needs an LLM key)',
   'zoom-reflow': 'Zoom & Reflow (WCAG 1.4.10)',
   'dark-mode': 'Dark Mode (prefers-color-scheme)',
   'reduced-motion': 'Reduced Motion (prefers-reduced-motion)',
@@ -381,6 +392,11 @@ export const FLOW_TITLES: Record<string, string> = {
   'concurrent-edit': 'Form Autosave & Concurrent Edit',
   'locale-format': 'Locale & Formatting',
   'offline-pwa': 'Service Worker & Offline',
+  'sort-verification': 'Sort Order Matches Label (A17)',
+  'link-target-consistency': 'List Item Opens Matching Page (A18)',
+  'input-retention': 'Fields Keep Typed Values (A19)',
+  'duplicate-images': 'Duplicate Item Images (A20)',
+  'cart-integrity': 'Cart & Checkout Consistency (A21)',
   // API
   'crud': 'CRUD Endpoints',
   'auth-matrix': 'Auth Matrix',

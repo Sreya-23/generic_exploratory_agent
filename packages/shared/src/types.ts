@@ -80,6 +80,17 @@ export type AuthState =
   | 'awaiting_otp'
   | 'ready';
 
+/**
+ * One allowed sidebar/nav section the agent may explore, e.g. { section: "Dashboard",
+ * subSections: ["Overview", "Summary"] }. A section with no subSections means the whole
+ * section is allowed (including any sub-tabs it has); subSections (if present) further
+ * narrows which of that section's own tabs may be visited.
+ */
+export interface ScopeSection {
+  section: string;
+  subSections?: string[];
+}
+
 export interface SessionConfig {
   targetUrl: string;
   context?: string;
@@ -91,6 +102,13 @@ export interface SessionConfig {
   flowInstructions?: string[];
   /** Explicit list of flowClass strings to run (pinned from matrix IDs) */
   selectedFlowClasses?: string[];
+  /**
+   * Optional allowlist of sidebar/nav sections (and their sub-tabs) the agent is permitted to
+   * explore — everything else is skipped during crawling, so pages/tabs holding confidential
+   * data never get visited in the first place. Undefined/empty means no restriction (explore
+   * everything, the default/prior behavior).
+   */
+  allowedSections?: ScopeSection[];
 }
 
 export interface FindingFingerprintDiff {
@@ -256,9 +274,47 @@ export interface SessionState {
    * knowledge-base/<siteType>.md so it survives independently of any one session.
    */
   siteKnowledge?: string;
+  /**
+   * Per-HOSTNAME memory of this exact site's nav structure from a previous crawl (distinct from
+   * `siteKnowledge` above, which is per-category and never used to skip work) — lets navigation.ts
+   * skip re-discovering a page's sub-links when it already knows them from last time, instead of
+   * walking the whole site again on every repeat run. See CachedNavPageEntry.
+   */
+  siteCacheHit?: SiteCacheEntry;
   createdAt: string;
   updatedAt: string;
   error?: string;
+}
+
+/** One nav link as recorded in a SiteCacheEntry — enough to reconstruct a queueable nav item
+ * without re-scanning the page: `selector` is one of the fixed, page-independent CSS selector
+ * strings navigation.ts's NAV_CLICK_SELECTORS already uses, not a one-off computed path. */
+export interface CachedNavChild {
+  label: string;
+  href: string | null;
+  selector: string;
+}
+
+/** The sub-links known for one specific page, keyed by that page's own URL (or `label:<label>`
+ * for a click-only destination with no real URL). */
+export interface CachedNavPageEntry {
+  key: string;
+  children: CachedNavChild[];
+}
+
+/**
+ * Persistent per-HOSTNAME memory of a site's structure from a previous crawl — written after
+ * every navigation run, read at the start of the next one against the same hostname. Unlike
+ * `siteKnowledge` (per-category, report-only), this directly changes exploration behavior: a
+ * page whose sub-links are already known here gets replayed instead of re-discovered live.
+ */
+export interface SiteCacheEntry {
+  hostname: string;
+  lastCrawledAt: string;
+  classification?: SiteClassification;
+  discoveredRoutes: string[];
+  discoveredApiEndpoints: string[];
+  pages: CachedNavPageEntry[];
 }
 
 export interface SessionProgress {
@@ -399,6 +455,12 @@ export interface ExecutorContext {
   environmentChecks?: EnvironmentCheck[];
   /** Every UI-hidden link checked for direct reachability this session — see AccessMapEntry. */
   accessMap?: AccessMapEntry[];
+  /**
+   * Per-hostname nav-structure memory from a previous crawl of this exact site, if any —
+   * read-only input, set once by the orchestrator at session start. navigation.ts uses it to
+   * skip re-discovering a page's sub-links it already knows about. See SiteCacheEntry.
+   */
+  siteCacheHit?: SiteCacheEntry;
 }
 
 export interface ExecutorResult {
@@ -443,6 +505,12 @@ export interface SetupDraft {
   flowInstructions?: string[];
   /** Explicitly selected matrix flow IDs (e.g. "A6", "B2", "C4") mapped to flowClass strings */
   selectedFlowClasses?: string[];
+  /** Whether the agent has asked "should I restrict testing to specific sections?" */
+  scopeAsked?: boolean;
+  /** Set once the user explicitly declines a scope restriction (explore everything) */
+  scopeDeclined?: boolean;
+  /** Sections/sub-tabs the user restricted exploration to, if any */
+  allowedSections?: ScopeSection[];
 }
 
 export interface SetupChatResponse {

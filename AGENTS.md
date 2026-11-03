@@ -32,20 +32,15 @@ packages/
 ## Build rules — ALWAYS follow these
 
 ```bash
-# After ANY code change to packages/ or apps/:
-npm run build
-
-# THEN start the dev server:
 npm run dev
 # UI → http://localhost:5173   API → http://localhost:3001
 ```
 
-**Critical:** `npm run dev` does NOT watch `packages/` (explorer-ui, explorer-api, agent-core, shared). Changes to those packages require a manual `npm run build` before they take effect. Forgetting this is the #1 cause of "my change isn't working".
+`npm run dev` first runs `npm run build:packages` (a `predev` script), which builds the libraries in dependency order: shared → chat-agent / explorer-api / explorer-ui / chaos-engine → agent-core.
 
-When adding a new type to `packages/shared/src/types.ts`, always build `shared` first before the full build:
-```bash
-npm run build -w packages/shared && npm run build
-```
+**Critical:** while dev is running it does NOT watch `packages/` — the API imports their compiled `dist/`. After changing package code, run `npm run build:packages` and restart dev. Forgetting this is the #1 cause of "my change isn't working".
+
+`npm run build` builds everything (packages, then the API and web app) in the right order and works on a fresh clone in one pass, so no manual "build shared first" step is needed.
 
 ---
 
@@ -63,7 +58,7 @@ performSessionLogin() ONE-TIME login per session, saves auth-state.json
   ↓
 recon.ts              Collect page signals + capture XHR/fetch network calls
   ↓
-classifySite()        Score signals against site-type rules
+classifySite()        Score signals against 8 site-type rules (else generic)
   ↓
 navigation.ts         BFS traversal + API harvest
   ↓
@@ -124,7 +119,7 @@ When adding new cross-task shared data, add the field to both `SessionState` (ty
 4. Add flow class string to the right area in `packages/shared/src/constants.ts` `FLOW_CLASSES`
 5. Add display title to `FLOW_TITLES` in `constants.ts`
 6. Add to phase categorization in `planner/index.ts`
-7. **Only add the area to `ALL_AREAS` once every flow class in it has a real `FLOW_HANDLERS` entry.** A flow class with no handler falls back to the generic `navigation` flow — scheduling it by default just duplicates A1 for no new signal. New/candidate IDs proposed but not yet built (A14–A15, B9, D9–D11, F6–F9, I1–I4 — see [exploration-matrix.md](.claude/skills/generic-exploratory-qa/exploration-matrix.md)) must stay out of `ALL_AREAS` until handlers exist.
+7. **Only add the area to `ALL_AREAS` once every flow class in it has a real `FLOW_HANDLERS` entry.** A flow class with no handler falls back to the generic `navigation` flow — scheduling it by default just duplicates A1 for no new signal. New/candidate IDs proposed but not yet built (A14, B9, D9–D11, F9, I3–I4 — see [exploration-matrix.md](.claude/skills/generic-exploratory-qa/exploration-matrix.md)) must stay out of `ALL_AREAS` until handlers exist.
 8. Run `npm run build` and verify
 
 ---
@@ -136,13 +131,13 @@ When adding new cross-task shared data, add the field to both `SessionState` (ty
 3. Add login handler in `packages/explorer-ui/src/ui-executor.ts` (`performSessionLogin`)
 4. Add chat prompt in `packages/chat-agent/src/auth-chat.ts` (`authPromptFromProbe`)
 5. Add input parsing in `parseAuthFields` in `auth-chat.ts` if user provides data via chat
-6. Build `shared` first: `npm run build -w packages/shared && npm run build`
+6. Run `npm run build` (it builds `shared` first)
 
 ---
 
 ## Skill and matrix documentation
 
-- **`.claude/skills/generic-exploratory-qa/SKILL.md`** — generic baseline: auth, matrix A1–H3 (+ candidate A14–A15, B9, D9–D11, F6–F9, I1–I4), false-positive rules. Update when adding capabilities or detection rules.
+- **`.claude/skills/generic-exploratory-qa/SKILL.md`** — generic baseline: auth, scope restriction, matrix A1–I4 (+ unbuilt candidates A14, B9, D9–D11, F9, I3–I4), false-positive rules, report format. Update when adding capabilities or detection rules.
 - **`.claude/skills/generic-exploratory-qa/exploration-matrix.md`** — catalog of all test IDs, including a "Not Implemented (📋 Planned)" table. Update the status column (📋 → 🔄 → ✅) as flows get built, never mark ✅ before a real `FLOW_HANDLERS` entry exists and is wired into `ALL_AREAS`.
 - **`.claude/skills/site-nature-exploratory-qa/SKILL.md`** — **site-nature / complete exploration**: map every relevant tab/field, explore each surface, consent before crucial actions. Use when the user wants nature-specific (e.g. fintech-careful) coverage, not only the generic matrix. Currently a design spec, not live behaviour — see its own "Implementation status" section. Policies: `site-policies.md`.
 
@@ -161,7 +156,7 @@ Keep these accurate — coding agents read them at runtime. Status markers (✅/
 | Filling email/phone fields with random test data | Call `classifyInputRisk()` first |
 | Clicking Send/Share without user confirmation | Call `gateIfSensitive()` before clicking |
 | Running same auth check in two flow classes | Use `reportedAuthPaths` Set for deduplication |
-| Forgetting to rebuild after package changes | Always `npm run build` before `npm run dev` |
+| Forgetting to rebuild after package changes | `npm run dev` rebuilds on start; if dev is already running, `npm run build:packages` and restart |
 | Adding a new area to `FLOW_CLASSES` but not `ALL_AREAS` | Both must be updated in `planner/index.ts` |
 | Adding a new area/flow class to `FLOW_CLASSES` and also to `ALL_AREAS` before it has a `FLOW_HANDLERS` entry | Build the handler first. Unhandled flow classes silently fall back to `navigation` — scheduling them by default wastes task budget re-running A1 |
 | Marking a matrix ID ✅ in `exploration-matrix.md` before the handler is registered and scheduled | Only mark ✅ once `FLOW_HANDLERS` has a real implementation AND the area is in `ALL_AREAS` (or explicitly documented as opt-in) |

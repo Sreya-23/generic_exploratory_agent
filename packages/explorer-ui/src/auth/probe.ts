@@ -86,12 +86,19 @@ export async function probeAuth(targetUrl: string): Promise<AuthProbeResult> {
           'a:has-text("magic link"), [class*="magic-link"]',
       ).count()) > 0;
 
-    // SAML / Enterprise SSO (redirect to company IdP)
+    // SAML / Enterprise SSO (redirect to company IdP). Deliberately text-only — the earlier
+    // version also matched `a[href*="saml"]`/`a[href*="sso"]`, which falsely flagged ordinary
+    // public sites (e.g. amazon.in) as SAML-gated just because some unrelated link's address
+    // happened to contain those 3-4 letters as a substring (a tracking param, an internal
+    // auth-redirect path for an optional "Sign in" header link, etc.) — a link merely EXISTING
+    // somewhere on the page is not evidence the page itself requires login to use. The explicit
+    // button-text matches below don't have that problem: a button literally labeled "Enterprise
+    // SSO" or "SAML" is a much more deliberate, load-bearing signal than a substring in an href.
     const hasSaml =
       (await page.locator(
         'button:has-text("Sign in with SSO"), button:has-text("Enterprise SSO"), ' +
           'button:has-text("SAML"), button:has-text("Sign in with your organization"), ' +
-          'button:has-text("Company login"), a[href*="saml"], a[href*="sso"]',
+          'button:has-text("Company login")',
       ).count()) > 0;
 
     // Determine auth requirement

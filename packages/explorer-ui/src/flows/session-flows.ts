@@ -334,7 +334,14 @@ export async function runSessionTimeout(
   // meaningful question (there was nothing to clear that the app was ever using), and it's
   // misleading to report it as if the app failed to honor a cookie-based expiry it never had.
   const cookiesBeforeClear = await page.context().cookies();
-  const hadAnyCookies = cookiesBeforeClear.length > 0;
+  // Only cookies that could plausibly BE a session count — analytics/CDN/bot-check cookies
+  // (Mixpanel mp_*, Google _ga, Cloudflare cf_clearance/__cf_bm, Hotjar, Segment…) are on almost
+  // every site and say nothing about how login works. Counting them reported "a session cookie
+  // exists but is ignored" on token-based apps that never had a session cookie.
+  const ANALYTICS_COOKIE = /^(mp_|_ga|_gid|_gat|_gcl|_fbp|_fbc|_hj|ajs_|amplitude|__cf|cf_|_cfuvid|intercom|_clck|_clsk|__stripe|_uetsid|_uetvid|optimizely)/i;
+  const SESSION_COOKIE = /(sess|sid\b|auth|token|jwt|login|remember|connect\.sid|access|refresh)/i;
+  const sessionCookies = cookiesBeforeClear.filter((c) => !ANALYTICS_COOKIE.test(c.name) && SESSION_COOKIE.test(c.name));
+  const hadAnyCookies = sessionCookies.length > 0;
 
   // ── Phase 1: Clear ONLY cookies ────────────────────────────────────────────
   // This simulates real-world server-side session expiry: the server marks the
@@ -361,37 +368,6 @@ export async function runSessionTimeout(
     urlAfterCookieClear !== urlBeforeClear;
 
   if (!cookieClearLoggedOut) {
-    // Reframed around the actual risk (an XSS-readable token) rather than assuming every app
-    // is supposed to be cookie-session-based — plenty of real SPAs deliberately use bearer
-    // tokens in localStorage and were never relying on a cookie to begin with, which isn't a
-    // defect on its own. Severity/framing branches on whether a session cookie even existed:
-    // one that was set but silently ignored is a genuine inconsistency worth a "medium" look;
-    // an app that never set one at all is just informing a security review, not reporting a
-    // broken expiry mechanism it never claimed to have.
-    ctx.onFinding({
-      severity: hadAnyCookies ? 'medium' : 'low',
-      area: 'UI-Session',
-      title: hadAnyCookies
-        ? 'A session cookie exists but is not what actually gates access — auth token readable from localStorage/sessionStorage'
-        : 'Auth token stored in localStorage/sessionStorage, not an httpOnly cookie',
-      steps: [
-        'Log in and reach an authenticated page',
-        'Clear all browser cookies only (localStorage/sessionStorage untouched)',
-        'Reload the page',
-      ],
-      expected: hadAnyCookies
-        ? 'If a session cookie is being set, it should be the thing that actually gates access — an ignored cookie alongside a separately-trusted localStorage token is confusing session-management surface, not a coherent single mechanism'
-        : 'No specific behavior expected here by default — bearer-token/localStorage auth is a common, valid architecture. Flagged only because a token readable by any injected script carries materially higher exposure than an httpOnly cookie if this app has (or ever gets) an XSS issue elsewhere',
-      actual: `Still showing authenticated content at ${urlAfterCookieClear} after clearing cookies — auth is not cookie-bound. ${hadAnyCookies ? `A cookie WAS present before clearing (${cookiesBeforeClear.length} cookie(s)) but evidently isn't what's actually checked.` : 'No cookies were set on this domain at all before clearing — this app appears to be bearer-token/localStorage-based by design.'}`,
-      evidence: [s1, s2],
-      reproRate: '1/1',
-      automationCandidate: true,
-      confidence: hadAnyCookies ? undefined : 'heuristic',
-      confidenceReason: hadAnyCookies
-        ? undefined
-        : 'This is a common, often deliberate architecture choice, not inherently a bug — worth a security-review conversation about XSS exposure, not necessarily a fix.',
-    });
-
     // ── Phase 2: Now also clear localStorage + sessionStorage ──────────────
     // Test whether wiping client-side storage finally logs the user out.
     await page.evaluate(() => {
@@ -410,21 +386,31 @@ export async function runSessionTimeout(
       hasPasswordAfterFull || urlHintsLogin(urlAfterFull) || urlAfterFull !== urlAfterCookieClear;
 
     if (fullClearLoggedOut) {
+      // ONE finding for the whole observation (it used to be two — "cookie isn't what gates
+      // access" and "only a full storage wipe logs you out" — describing the same fact).
+      // Token-in-browser-storage is a common, deliberate SPA design, so it's a low-severity
+      // security note, not a broken feature — unless the app ALSO sets a session-looking cookie
+      // that turns out to be ignored, which is a genuine inconsistency.
       ctx.onFinding({
-        severity: 'medium',
-        area: 'UI-Session',
-        title: 'Auth state stored in localStorage/sessionStorage — logged out only after full storage wipe',
+        severity: hadAnyCookies ? 'medium' : 'low',
+        area: 'Security-Session',
+        title: hadAnyCookies
+          ? `Login is kept in browser storage; the session cookie (${sessionCookies.map((c) => c.name).slice(0, 3).join(', ')}) is ignored`
+          : 'Login token is kept in browser storage (localStorage/sessionStorage), not a protected cookie',
         steps: [
-          'Log in',
-          'Clear cookies only → still logged in (finding above)',
-          'Also clear localStorage and sessionStorage',
-          'Reload',
+          'Log in and reach an authenticated page',
+          'Clear cookies only and reload → still logged in',
+          'Also clear localStorage and sessionStorage and reload → logged out',
         ],
-        expected: 'Clearing cookies alone should invalidate the session',
-        actual: 'Only a full wipe of cookies + localStorage + sessionStorage logs the user out. Session is not cookie-bound.',
-        evidence: [s2, s3],
+        expected: hadAnyCookies
+          ? `The session cookie that is set (${sessionCookies.map((c) => c.name).slice(0, 3).join(', ')}) should be what keeps the user logged in`
+          : 'Nothing is broken — token-based login is a common design. Noted because a token in browser storage can be read by any script on the page if the site ever has a script-injection (XSS) flaw, unlike an httpOnly cookie',
+        actual: `Clearing cookies did not log out (still on ${urlAfterCookieClear}); clearing localStorage/sessionStorage did. The login lives in browser storage.`,
+        evidence: [s1, s2, s3],
         reproRate: '1/1',
-        automationCandidate: true,
+        automationCandidate: false,
+        confidence: 'verified',
+        confidenceReason: 'Observed directly: logged in after clearing cookies, logged out after clearing browser storage.',
       });
       ctx.onLog('[B6] Confirmed: auth is in localStorage/sessionStorage, not cookies');
     } else {
@@ -439,17 +425,27 @@ export async function runSessionTimeout(
 
     // ── Phase 2 (pass case): also verify localStorage/sessionStorage is cleaned ──
     // Even if cookies log you out, leftover localStorage data can be a privacy issue
+    // Only keys that look like they hold USER data count. Analytics/error-reporting SDK ids
+    // (backtrace-guid, _ga, amplitude_*, …), consent flags and UI preferences are expected to
+    // outlive a session and are not personal data — reporting them was a false positive
+    // (observed: SauceDemo's backtrace-guid / backtrace-last-active).
     const leftoverStorage = await page.evaluate(() => {
-      const lsKeys = Object.keys(localStorage ?? {});
-      const ssKeys = Object.keys(sessionStorage ?? {});
-      return { lsKeys, ssKeys };
-    }).catch(() => ({ lsKeys: [], ssKeys: [] }));
+      const USER_DATA = /token|auth|session|user|account|profile|email|phone|cart|basket|order|address|jwt|credential|customer|member/i;
+      const BENIGN = /^(_ga|_gid|_gcl|_fbp|amplitude|mixpanel|mp_|ajs_|segment|backtrace|sentry|bugsnag|datadog|dd_|newrelic|nr_|hotjar|_hj|intercom|optimizely|ld:|launchdarkly|cookie[-_]?consent|consent|gdpr|theme|lang|locale|i18n|debug|loglevel|vite|webpack)/i;
+      const pick = (keys: string[]) => keys.filter((k) => !BENIGN.test(k) && USER_DATA.test(k));
+      const lsAll = Object.keys(localStorage ?? {});
+      const ssAll = Object.keys(sessionStorage ?? {});
+      return { lsKeys: pick(lsAll), ssKeys: pick(ssAll), ignored: [...lsAll, ...ssAll].filter((k) => !pick([k]).length) };
+    }).catch(() => ({ lsKeys: [] as string[], ssKeys: [] as string[], ignored: [] as string[] }));
+    if (leftoverStorage.ignored.length > 0) {
+      ctx.onLog(`[B6] Remaining storage keys not treated as user data: ${leftoverStorage.ignored.slice(0, 8).join(', ')}`);
+    }
 
     if (leftoverStorage.lsKeys.length > 0 || leftoverStorage.ssKeys.length > 0) {
       ctx.onFinding({
         severity: 'low',
         area: 'UI-Session',
-        title: 'Leftover data in localStorage/sessionStorage after session cookie cleared',
+        title: 'User data left in localStorage/sessionStorage after session cookie cleared',
         steps: [
           `Open ${urlBeforeClear} and log in`,
           'Open DevTools → Application (Chrome) / Storage (Firefox) tab → delete all Cookies for this site',

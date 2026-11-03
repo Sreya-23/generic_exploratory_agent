@@ -7,6 +7,27 @@ export async function runRtlLayoutCheck(
   ctx: ExecutorContext,
   _task: FlowTask,
 ): Promise<void> {
+  // Only meaningful for sites that actually offer a right-to-left language. Forcing dir="rtl"
+  // on an English/Hindi-only app and reporting what breaks is testing a mode the site never
+  // claimed to support — those findings were pure noise.
+  const supportsRtl = await page
+    .evaluate(() => {
+      const RTL_LANG = /^(ar|he|iw|fa|ur|ps|sd|ug|yi|dv|ckb)(-|$)/i;
+      if (RTL_LANG.test(document.documentElement.lang || '')) return true;
+      if (document.querySelector('[dir="rtl"]')) return true;
+      for (const el of Array.from(document.querySelectorAll('[hreflang], option[value], [lang]')).slice(0, 500)) {
+        const v = el.getAttribute('hreflang') || el.getAttribute('lang') || (el as HTMLOptionElement).value || '';
+        if (RTL_LANG.test(v)) return true;
+      }
+      // Language switchers that name the language in its own script.
+      return /(العربية|عربي|עברית|فارسی|اردو)/.test(document.body?.innerText ?? '');
+    })
+    .catch(() => false);
+  if (!supportsRtl) {
+    ctx.onLog('[RTL] Site offers no right-to-left language (Arabic, Hebrew, Urdu…) — skipping the RTL layout check');
+    return;
+  }
+
   ctx.onLog('[RTL] Forcing dir="rtl" to check for hardcoded LTR layout assumptions');
   const originalUrl = page.url();
 

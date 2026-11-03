@@ -1,6 +1,6 @@
 import { Link, useParams } from 'react-router-dom';
 import { useEffect, useMemo, useState } from 'react';
-import type { Finding, Severity } from '@qa/shared';
+import type { Severity } from '@qa/shared';
 import {
   getSession,
   getSessionReport,
@@ -8,12 +8,15 @@ import {
   type SessionReportPayload,
   type SessionState,
 } from '../api/client';
-import { FindingCard } from '../components/session/FindingCard';
+import { GroupedFindingList, listedFindingCount } from '../components/session/GroupedFindingList';
 import { QualityPilotConnect } from '../components/session/QualityPilotConnect';
 import { FindingsChatPanel } from '../components/chat/FindingsChatPanel';
 import { SETUP_CONV_KEY } from './ChatSetupPage';
 
-const SEVERITIES: Severity[] = ['critical', 'high', 'medium', 'low', 'info'];
+// Chips show the severity breakdown of actual defects only — 'info' is deliberately excluded
+// here: report.bySeverity is now built from confirmed+potential defects alone (see
+// generate-report.ts), so an 'info' chip would always read 0 and just add noise.
+const SEVERITY_CHIPS: Severity[] = ['critical', 'high', 'medium', 'low'];
 
 export function ReportPage() {
   const { id } = useParams<{ id: string }>();
@@ -42,12 +45,12 @@ export function ReportPage() {
     };
   }, [id]);
 
-  const sortedFindings = useMemo(() => {
-    const findings = report?.findings ?? session?.findings ?? [];
-    return [...findings].sort(
-      (a, b) => SEVERITIES.indexOf(a.severity) - SEVERITIES.indexOf(b.severity),
-    );
-  }, [report, session]);
+  // The report's de-duplicated defects plus its info notes (the raw session list only as a
+  // fallback). Ordering/grouping happens in GroupedFindingList — same order as the download.
+  const listedFindings = useMemo(
+    () => (report ? [...report.findings, ...(report.infoFindings ?? [])] : (session?.findings ?? [])),
+    [report, session],
+  );
 
   const flowsByArea = useMemo(() => {
     const flows = report?.flowsCovered ?? [];
@@ -124,8 +127,12 @@ export function ReportPage() {
           <p className="target-url">{session.config.targetUrl}</p>
           <p className="session-meta">
             {session.config.depth} · {session.config.areas.join(', ')} ·{' '}
-            {report.flowsCovered?.length ?? session.plan?.tasks.length ?? 0} flows · {report.total}{' '}
-            findings
+            {report.flowsCovered?.length ?? session.plan?.tasks.length ?? 0} flows ·{' '}
+            {report.confirmedDefects} confirmed, {report.potentialDefects} potential finding
+            {report.total === 1 ? '' : 's'}
+            {report.executionErrors > 0
+              ? ` · ${report.executionErrors} agent execution issue${report.executionErrors === 1 ? '' : 's'} (excluded)`
+              : ''}
             {session.classification
               ? ` · ${session.classification.siteType} (${Math.round(session.classification.confidence * 100)}%)`
               : ''}
@@ -169,11 +176,16 @@ export function ReportPage() {
         <span className="severity-chip info">
           flows: {report.flowsCovered?.length ?? session.plan?.tasks.length ?? 0}
         </span>
-        {SEVERITIES.map((sev) => (
+        {SEVERITY_CHIPS.map((sev) => (
           <span key={sev} className={`severity-chip ${sev}`}>
             {sev}: {bySeverity[sev]}
           </span>
         ))}
+        {report.executionErrors > 0 && (
+          <span className="severity-chip info" title="Agent/infra failures — not application defects, excluded from the health score">
+            agent issues: {report.executionErrors}
+          </span>
+        )}
       </section>
 
       <FindingsChatPanel sessionId={session.id} />
@@ -489,6 +501,22 @@ export function ReportPage() {
             </section>
           )}
 
+          {report.executionErrorFindings && report.executionErrorFindings.length > 0 && (
+            <section style={{ marginBottom: '1.5rem' }}>
+              <h2>Agent Execution Issues ({report.executionErrorFindings.length})</h2>
+              <p className="session-meta">
+                Not application defects — checks the agent itself could not finish (a timeout, a
+                crashed step, the target being briefly unreachable). Excluded from Findings and the
+                health score. See the full report for details.
+              </p>
+              <ul>
+                {report.executionErrorFindings.slice(0, 10).map((f) => (
+                  <li key={f.id}>{f.title}</li>
+                ))}
+              </ul>
+            </section>
+          )}
+
           {findingsByArea.length > 0 && (
             <section style={{ marginBottom: '1.5rem' }}>
               <h2>Findings by area</h2>
@@ -526,15 +554,11 @@ export function ReportPage() {
         <section className="findings-panel">
           <QualityPilotConnect />
 
-          <h2>Findings ({sortedFindings.length})</h2>
-          {sortedFindings.length === 0 ? (
+          <h2>Findings ({listedFindingCount(listedFindings)})</h2>
+          {listedFindings.length === 0 ? (
             <p className="empty-state">No findings were recorded during this exploration.</p>
           ) : (
-            <div className="findings-list">
-              {sortedFindings.map((f: Finding) => (
-                <FindingCard key={f.id} finding={f} sessionId={session.id} />
-              ))}
-            </div>
+            <GroupedFindingList findings={listedFindings} sessionId={session.id} />
           )}
         </section>
       )}

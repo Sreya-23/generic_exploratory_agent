@@ -50,7 +50,46 @@ export function readPostLoginUrl(ctx: ExecutorContext): string | null {
   return url || null;
 }
 
+function normalizeForMatch(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+/**
+ * When a scope restriction is active, prefer a discovered route that plausibly belongs to one
+ * of the allowed sections over the generic post-login landing page. Without this, EVERY ui-area
+ * task (visual review, accessibility, action-inventory, journeys, RTL/placeholder checks, ...) —
+ * not just navigation.ts's own crawl — starts fresh from the landing page via this one shared
+ * function and audits/tests it regardless of scope, since none of those flows individually know
+ * about `allowedSections`. This is what makes the restriction apply everywhere a task starts,
+ * not only to navigation.ts's own BFS. Checks `ctx.siteCacheHit` first (available immediately at
+ * session start on a repeat run against an already-known site) and `ctx.discoveredRoutes`
+ * (populated by the always-first `recon` task) — so only the very first-ever scoped crawl of a
+ * brand-new site still has recon itself touch the landing page once, before any route is known.
+ */
+function findInScopeStartUrl(ctx: ExecutorContext): string | null {
+  const allowed = ctx.config.allowedSections;
+  if (!allowed?.length) return null;
+  const keywords = allowed
+    .flatMap((s) => [s.section, ...(s.subSections ?? [])])
+    .map(normalizeForMatch)
+    .filter(Boolean);
+  if (keywords.length === 0) return null;
+
+  const routes = [...(ctx.discoveredRoutes ?? []), ...(ctx.siteCacheHit?.discoveredRoutes ?? [])];
+  for (const route of routes) {
+    try {
+      const normalizedPath = normalizeForMatch(new URL(route).pathname);
+      if (keywords.some((kw) => normalizedPath.includes(kw))) return route;
+    } catch {
+      continue; // malformed route string — skip rather than let it throw
+    }
+  }
+  return null;
+}
+
 export function resolveExplorationStartUrl(ctx: ExecutorContext): string {
+  const inScope = findInScopeStartUrl(ctx);
+  if (inScope) return inScope;
   if (hasSavedAuthState(ctx)) {
     const saved = readPostLoginUrl(ctx);
     if (saved) return saved;
@@ -160,10 +199,4 @@ export async function finalizePostLoginLanding(
 
   savePostLoginUrl(sessionDir, url);
   return url;
-}
-
-export function isLoginRelatedFeature(feature: string): boolean {
-  return /\b(login|log[\s-]?in|sign[\s-]?in|signin|auth(entication)?|credentials?|password|username)\b/i.test(
-    feature,
-  );
 }

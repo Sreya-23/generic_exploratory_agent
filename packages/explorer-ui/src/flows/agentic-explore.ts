@@ -265,7 +265,7 @@ export async function runAgenticExplore(page: Page, ctx: ExecutorContext, _task:
     const decision = await askLLMForNextStep(prompt);
 
     if (!decision || !decision.action) {
-      ctx.onLog(`[AgenticExplore] Step ${step}: no usable response from Gemini — stopping loop`);
+      ctx.onLog(`[AgenticExplore] Step ${step}: no usable response from the AI model — stopping loop`);
       break;
     }
 

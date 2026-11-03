@@ -22,6 +22,19 @@ export async function runReducedMotionCheck(
       return document
         .getAnimations()
         .filter((a) => a.playState === 'running')
+        // Loading indicators (spinners, skeleton "shimmer" placeholders, progress bars) are
+        // allowed to keep moving — they tell the user something is happening, and WCAG treats
+        // that motion as essential. Only decorative animation should stop.
+        .filter((a) => {
+          const t = (a.effect as KeyframeEffect | null)?.target as Element | null;
+          if (!t) return true;
+          const LOADER = /(skeleton|spinner|loader|loading|shimmer|progress|circular|pulse|placeholder)/i;
+          for (let el: Element | null = t, d = 0; el && d < 3; el = el.parentElement, d++) {
+            const cls = typeof el.className === 'string' ? el.className : el.getAttribute('class') ?? '';
+            if (LOADER.test(cls) || el.getAttribute('role') === 'progressbar' || el.getAttribute('aria-busy') === 'true') return false;
+          }
+          return true;
+        })
         .map((a) => {
           const effect = a.effect as KeyframeEffect | null;
           const target = effect?.target as Element | null;

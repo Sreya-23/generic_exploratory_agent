@@ -1,4 +1,4 @@
-export { buildPlan, buildGenericPlan, buildPlanFromContext } from './planner/index.js';
+export { buildPlan, buildGenericPlan, buildPlanFromContext, ALL_AREAS } from './planner/index.js';
 export {
   saveSessionState,
   generateSessionReportMarkdown,
@@ -12,4 +12,4 @@ export {
   diffFindingFingerprints,
   loadPreviousSessionFindings,
 } from './reporter/finding-diff.js';
-export { SessionOrchestrator, orchestrator } from './orchestrator/run-session.js';
+export { SessionOrchestrator, orchestrator, FLOW_CLASS_EXECUTOR_OVERRIDE } from './orchestrator/run-session.js';

@@ -42,11 +42,21 @@ export async function runElementIntegrity(
     for (const el of interactive) {
       const style = window.getComputedStyle(el);
       if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+      // Content inside aria-hidden/inert containers (closed drawers, off-canvas menus) is
+      // deliberately out of reach — not a defect of the element itself.
+      if (el.closest('[aria-hidden="true"], [inert]')) continue;
 
       const rect = el.getBoundingClientRect();
       const isZeroSize = rect.width === 0 || rect.height === 0;
+      // "Off-screen" means outside the DOCUMENT, not outside the current viewport. Measuring
+      // against the viewport flagged every footer link and below-the-fold button as
+      // unreachable, when the user simply scrolls to them.
+      const docLeft = rect.left + window.scrollX;
+      const docTop = rect.top + window.scrollY;
+      const docWidth = Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth ?? 0);
+      const docHeight = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0);
       const isOffscreen =
-        rect.bottom < 0 || rect.right < 0 || rect.top > window.innerHeight || rect.left > window.innerWidth;
+        docLeft + rect.width <= 0 || docTop + rect.height <= 0 || docLeft >= docWidth || docTop >= docHeight;
 
       if (isZeroSize || isOffscreen) {
         if (el.getAttribute('tabindex') !== '-1') {
@@ -66,8 +76,28 @@ export async function runElementIntegrity(
 
       const isActuallyDisabled =
         (el as HTMLButtonElement).disabled === true || el.getAttribute('aria-disabled') === 'true';
+      // A nearly-invisible native control laid over a styled box (the common custom-select
+      // pattern — e.g. SauceDemo's sort dropdown) is transparent on purpose; the user sees the
+      // styled box, not a faded control. Only moderate fading (0.2–0.6) reads as "disabled".
+      const opacity = Number(style.opacity);
+      const fadedLikeDisabled = opacity >= 0.2 && opacity < 0.6;
+      // Class check is per class TOKEN: Tailwind-style variant classes ("disabled:opacity-50",
+      // "disabled:cursor-not-allowed") only apply WHEN disabled — matching the bare word inside
+      // them flagged every enabled Tailwind button as "looks disabled".
+      const classTokens = (typeof el.className === 'string' ? el.className : el.getAttribute('class') ?? '').split(/\s+/);
+      const disabledClass = classTokens.some(
+        (c) => !c.includes(':') && /^(disabled|is-disabled|[\w-]*[-_]disabled|[\w-]*--disabled)$/i.test(c),
+      );
+      // Carousel / slider / pager indicators ("Go to slide 2", "Banner 3") are drawn faded when
+      // they're not the current one — that's "inactive", not "disabled".
+      const label = `${el.getAttribute('aria-label') ?? ''} ${el.getAttribute('title') ?? ''}`;
+      const isIndicator =
+        /\b(slide|banner|page|item|image|dot)\s*\d+\b/i.test(label) ||
+        ['tab', 'option'].includes(el.getAttribute('role') ?? '') ||
+        el.hasAttribute('aria-selected') ||
+        el.hasAttribute('aria-current');
       const looksDisabled =
-        Number(style.opacity) < 0.6 || /\bdisabled\b/i.test(el.className) || style.cursor === 'not-allowed';
+        !isIndicator && (fadedLikeDisabled || disabledClass || style.cursor === 'not-allowed');
 
       if (looksDisabled && !isActuallyDisabled) {
         disabledMismatch.push(`${describeEl(el)} looks disabled but is clickable`);
@@ -150,7 +180,10 @@ export async function runElementIntegrity(
 }
 
 const MOBILE_VIEWPORT = { width: 375, height: 812 };
-const MIN_TOUCH_TARGET = 44;
+// WCAG 2.2 SC 2.5.8 (AA) sets 24×24px as the minimum target size; 44×44px is the stricter AAA /
+// platform-guideline recommendation. Below 24 is a finding; 24–43 is only logged as advice.
+const MIN_TOUCH_TARGET = 24;
+const RECOMMENDED_TOUCH_TARGET = 44;
 
 export async function runTouchTargetCheck(
   page: Page,
@@ -173,9 +206,17 @@ export async function runTouchTargetCheck(
     const results: string[] = [];
     for (const el of interactive) {
       const style = window.getComputedStyle(el);
-      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+      // Closed drawers / off-canvas menus: not tappable until opened, so not measured.
+      if (el.closest('[aria-hidden="true"], [inert]')) continue;
       const rect = el.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) continue;
+      if (rect.right <= 0 || rect.left >= window.innerWidth) continue;
+      // WCAG exception: a link inside a sentence is sized by the text around it.
+      if (style.display === 'inline' && el.tagName === 'A') {
+        const parentText = (el.parentElement?.textContent ?? '').trim().length;
+        if (parentText > (el.textContent ?? '').trim().length + 20) continue;
+      }
       if (rect.width < min || rect.height < min) {
         const text =
           (el.textContent ?? '').trim().slice(0, 25) ||
@@ -200,9 +241,9 @@ export async function runTouchTargetCheck(
       steps: [
         `Open ${page.url()}`,
         `In DevTools, toggle device toolbar and set viewport to ${MOBILE_VIEWPORT.width}×${MOBILE_VIEWPORT.height} (or resize the browser window to that size), then reload`,
-        'For each element listed below (with its current size in px), try tapping it with a finger-sized pointer — the listed size is below the 44×44px minimum tap target',
+        `For each element listed below (with its current size in px), try tapping it with a finger-sized pointer — the listed size is below the ${MIN_TOUCH_TARGET}×${MIN_TOUCH_TARGET}px minimum tap target`,
       ],
-      expected: `Touch targets should be at least ${MIN_TOUCH_TARGET}×${MIN_TOUCH_TARGET}px per mobile UX guidelines`,
+      expected: `Touch targets should be at least ${MIN_TOUCH_TARGET}×${MIN_TOUCH_TARGET}px (WCAG 2.2 AA); ${RECOMMENDED_TOUCH_TARGET}×${RECOMMENDED_TOUCH_TARGET}px recommended`,
       actual: tooSmall.join(', '),
       evidence: [shot],
       reproRate: '1/1',

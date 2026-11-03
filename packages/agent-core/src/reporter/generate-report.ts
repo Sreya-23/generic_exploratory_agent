@@ -10,7 +10,17 @@ import type {
   SessionState,
   Severity,
 } from '@qa/shared';
-import { computeHealthScore, FLOW_TITLES, parseListLikeText } from '@qa/shared';
+import {
+  sortFindingsForDisplay as sortSharedOrder,
+  collapseDuplicateNotes,
+  explainFinding,
+  computeHealthScore,
+  FLOW_TITLES,
+  parseListLikeText,
+  resultTypeOf,
+  isLikelyFalsePositive,
+  type FindingResultType,
+} from '@qa/shared';
 import { dedupeFindingsWithAI, summarizeWithAI, validateFindingsWithAI } from './ai-report-enhance.js';
 
 const IMAGE_MIME: Record<string, string> = {
@@ -110,20 +120,37 @@ export interface SessionReport {
   markdown: string;
   html: string;
   summary: {
-    /** Count of actual bugs — excludes info-severity items, which aren't defects */
+    /** Defects needing review = confirmedDefects + potentialDefects. Excludes observations
+     *  (info-severity/quarantined) AND execution-errors (agent/infra failures) — see
+     *  FindingResultType. This is the ONE number every section (overview, KPIs, severity
+     *  breakdown) is built from, so they can never drift apart the way they used to. */
     total: number;
+    /** Backed by an objective signal, or a check that doesn't tag confidence at all. */
+    confirmedDefects: number;
+    /** Backed by only a single heuristic signal — needs human/validator confirmation. */
+    potentialDefects: number;
+    /** Checks the agent itself couldn't finish (timeout, crash, target unreachable) — not a
+     *  fact about the application, never counted as a defect. */
+    executionErrors: number;
+    /** Severity breakdown over confirmed+potential defects ONLY — never observations or
+     *  execution-errors, so this always sums to `total`. */
     bySeverity: SeverityCounts;
     healthScore: HealthScore;
     executiveSummary: string;
     recommendedNextSteps: string[];
     flowsCovered: FlowCoverageRow[];
     findingsByArea: AreaFindingGroup[];
-    /** Bug findings only (severity !== 'info'), steps-to-reproduce always populated */
+    /** Confirmed + potential defects only, steps-to-reproduce always populated */
     findings: Finding[];
-    /** Info-severity items — not defects, kept separate: discovered endpoints, coverage
-     *  summaries, confirmation checks that may be useful context for future exploration */
+    /** Info-severity / quarantined items — not defects, kept separate: discovered endpoints,
+     *  coverage summaries, confirmation checks that may be useful context for future exploration */
     infoFindings: Finding[];
     infoByArea: AreaFindingGroup[];
+    /** Agent/infra failures — kept separate from both findings and observations so they're
+     *  visible (a run with many of these needs a re-run, not a bug triage) without polluting
+     *  either the defect list or the health score. */
+    executionErrorFindings: Finding[];
+    executionErrorsByArea: AreaFindingGroup[];
   };
 }
 
@@ -139,6 +166,12 @@ function countBySeverity(findings: Finding[]): SeverityCounts {
   return counts;
 }
 
+/** Listing order: UI → API → JS errors → resilience/performance → security, then severity. */
+function sortFindingsForDisplay(findings: Finding[]): Finding[] {
+  return sortSharedOrder(findings);
+}
+
+/** Pure severity order — used to pick the single most urgent issue (next steps), not for listing. */
 function sortFindings(findings: Finding[]): Finding[] {
   return [...findings].sort((a, b) => {
     const si = SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity);
@@ -277,24 +310,21 @@ function buildFlowCoverage(
 }
 
 function groupFindingsByArea(findings: Finding[]): AreaFindingGroup[] {
+  // Same order as the web report page: sortFindingsForDisplay clusters each check area and
+  // orders the areas (category, then most severe finding), so grouping keeps that order.
   const map = new Map<string, Finding[]>();
-  for (const f of findings) {
+  for (const f of sortSharedOrder(findings)) {
     const key = f.area || 'general';
     const list = map.get(key) ?? [];
     list.push(f);
     map.set(key, list);
   }
-  return [...map.entries()]
-    .map(([area, list]) => {
-      const sorted = sortFindings(list);
-      return {
-        area,
-        count: sorted.length,
-        bySeverity: countBySeverity(sorted),
-        findings: sorted,
-      };
-    })
-    .sort((a, b) => b.count - a.count || a.area.localeCompare(b.area));
+  return [...map.entries()].map(([area, list]) => ({
+    area,
+    count: list.length,
+    bySeverity: countBySeverity(list),
+    findings: list,
+  }));
 }
 
 function groupFlowsByArea(flows: FlowCoverageRow[]): Map<string, FlowCoverageRow[]> {
@@ -310,10 +340,13 @@ function groupFlowsByArea(flows: FlowCoverageRow[]): Map<string, FlowCoverageRow
 function buildExecutiveSummary(
   state: SessionState,
   counts: SeverityCounts,
-  total: number,
+  confirmedCount: number,
+  potentialCount: number,
+  executionErrorCount: number,
   flowCount: number,
   health: HealthScore,
 ): string {
+  const total = confirmedCount + potentialCount;
   const healthClause = `**Health Score: ${health.grade} (${health.score}/100).** `;
   const site = state.classification?.siteType;
   const siteClause = site && site !== 'generic' ? ` Classified as ${site}.` : '';
@@ -326,12 +359,20 @@ function buildExecutiveSummary(
           ? 'No critical/high blockers; medium issues should be triaged into the backlog.'
           : total === 0
             ? 'No issues recorded during this pass — consider a deeper depth or more areas.'
-            : 'Only low/info observations; overall risk appears limited.';
+            : 'Only low-severity items; overall risk appears limited.';
 
   const depth = state.config.depth;
   const tasks = `${state.progress.completedTasks}/${state.progress.totalTasks} tasks`;
   const flows = flowCount > 0 ? ` Covered ${flowCount} exploration flow${flowCount === 1 ? '' : 's'}.` : '';
-  return `${healthClause}Explored ${state.config.targetUrl} at ${depth} depth (${tasks}).${siteClause}${flows} Recorded ${total} finding${total === 1 ? '' : 's'} (${counts.critical} critical, ${counts.high} high, ${counts.medium} medium). ${risk}`;
+  const validationClause =
+    potentialCount > 0
+      ? ` Of these, ${confirmedCount} are confirmed and ${potentialCount} are potential defects pending validation.`
+      : '';
+  const executionErrorClause =
+    executionErrorCount > 0
+      ? ` ${executionErrorCount} additional check${executionErrorCount === 1 ? '' : 's'} could not complete due to agent/environment issues and are reported separately, not counted as defects.`
+      : '';
+  return `${healthClause}Explored ${state.config.targetUrl} at ${depth} depth (${tasks}).${siteClause}${flows} Recorded ${total} finding${total === 1 ? '' : 's'} (${counts.critical} critical, ${counts.high} high, ${counts.medium} medium).${validationClause}${executionErrorClause} ${risk}`;
 }
 
 function buildRecommendedNextSteps(
@@ -396,18 +437,47 @@ function formatExpectedActualMarkdown(label: string, text: string): string {
   return `**${label}:**${intro}\n${items}`;
 }
 
-function formatFindingMarkdown(f: Finding): string {
+/** Validation-status label — literally "confirmed / requires validation / possible false
+ *  positive" rather than the internal 'verified'/'heuristic' field names, since this is read by
+ *  whoever is deciding what to triage, not by someone reading the code. */
+function validationStatusLabel(f: Finding): string | null {
+  if (!f.confidence) return null;
+  if (isLikelyFalsePositive(f)) return 'Possible false positive (flagged by automated second-pass check)';
+  return f.confidence === 'verified' ? 'Confirmed (objective signal)' : 'Requires validation (single heuristic signal)';
+}
+
+/** "Shopping cart (UI-Cart)" — readable name first, the check's own area code kept for reference. */
+function areaHeading(g: AreaFindingGroup): string {
+  const label = g.findings[0] ? explainFinding(g.findings[0]).areaLabel : g.area;
+  return label.toLowerCase() === g.area.toLowerCase() ? label : `${label} (${g.area})`;
+}
+
+function formatFindingMarkdown(f: Finding, resultType: FindingResultType = resultTypeOf(f)): string {
+  // Plain-English first (headline, what's wrong, why it matters) so anyone can follow the
+  // report; the check's own technical wording follows under "Technical details".
+  const plain = explainFinding(f);
   const lines: string[] = [
-    `#### [${f.severity.toUpperCase()}] ${f.title}`,
+    `#### [${f.severity.toUpperCase()}] ${plain.headline}`,
+    '',
+    `**What's wrong:** ${plain.summary}`,
+    '',
+    `**Why it matters:** ${plain.whyItMatters}` +
+      (resultType === 'potential-defect' ? ' (Not yet confirmed — check the evidence before acting.)' : ''),
     '',
   ];
-  if (f.preconditions) lines.push(`**Preconditions:** ${f.preconditions}`);
-  lines.push('**Steps to reproduce:**');
+  lines.push('**How to see it yourself:**');
   if (f.steps.length === 0) {
     lines.push('1. (no steps recorded)');
   } else {
     f.steps.forEach((step, i) => lines.push(`${i + 1}. ${step}`));
   }
+  lines.push('');
+  lines.push('**Technical details**');
+  lines.push('');
+  lines.push(`- **Check result:** ${f.title}`);
+  lines.push(`- **Check area:** ${f.area}`);
+  if (f.pageUrl) lines.push(`- **Page:** ${f.pageUrl}`);
+  if (f.preconditions) lines.push(`- **Preconditions:** ${f.preconditions}`);
   lines.push('');
   lines.push(formatExpectedActualMarkdown('Expected', f.expected));
   lines.push(formatExpectedActualMarkdown('Actual', f.actual));
@@ -416,17 +486,15 @@ function formatFindingMarkdown(f: Finding): string {
   );
   lines.push(`**Repro rate:** ${f.reproRate}`);
   lines.push(`**Automation candidate:** ${f.automationCandidate ? 'Yes' : 'No'}`);
-  if (f.confidence) {
-    lines.push(
-      `**Confidence:** ${f.confidence === 'verified' ? 'Verified (multiple independent signals)' : 'Heuristic (spot-check recommended)'}` +
-        (f.confidenceReason ? ` — ${f.confidenceReason}` : ''),
-    );
+  const statusLabel = validationStatusLabel(f);
+  if (statusLabel) {
+    lines.push(`**Validation status:** ${statusLabel}` + (f.confidenceReason ? ` — ${f.confidenceReason}` : ''));
   }
   lines.push('');
   return lines.join('\n');
 }
 
-function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F'): string {
+function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F', resultType: FindingResultType = resultTypeOf(f)): string {
   const id = `${idPrefix}-${String(index + 1).padStart(3, '0')}`;
   const steps =
     f.steps.length > 0
@@ -454,34 +522,46 @@ function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F'): s
     return `${intro}<ul class="finding-list">${items}</ul>`;
   };
 
+  const flaggedFalsePositive = isLikelyFalsePositive(f);
   const confidenceBadge = f.confidence
-    ? `<span class="confidence-badge ${f.confidence}" title="${escapeHtml(f.confidenceReason ?? '')}">${f.confidence === 'verified' ? '✓ Verified' : '⚠ Heuristic'}</span>`
+    ? flaggedFalsePositive
+      ? `<span class="confidence-badge flagged" title="${escapeHtml(f.confidenceReason ?? '')}">🚩 Possible false positive</span>`
+      : `<span class="confidence-badge ${f.confidence}" title="${escapeHtml(f.confidenceReason ?? '')}">${f.confidence === 'verified' ? '✓ Confirmed' : '⚠ Requires validation'}</span>`
     : '';
   // The badge's title= tooltip is easy to miss entirely (no hover on touch, and invisible in
   // any copy-pasted or printed version of the report) — confidenceReason is exactly the kind
   // of context ("verified" doesn't mean "always reproduces") that shouldn't depend on a reader
   // thinking to hover over a small badge, so it's also shown as plain, always-visible text.
   const confidenceNote = f.confidenceReason
-    ? `<p class="confidence-note"><span class="label">Confidence note</span>${escapeHtml(f.confidenceReason)}</p>`
+    ? `<p class="confidence-note"><span class="label">Validation note</span>${escapeHtml(f.confidenceReason)}</p>`
     : '';
+  const plain = explainFinding(f);
+  const unconfirmed = resultType === 'potential-defect' ? ' <em>(Not yet confirmed — check the evidence before acting.)</em>' : '';
 
   return `
 <article class="finding" data-severity="${escapeHtml(f.severity)}">
   <header class="finding-head">
     <span class="finding-id">${id}</span>
     <span class="sev-badge ${escapeHtml(f.severity)}">${escapeHtml(f.severity)}</span>
-    <span class="area-chip">${escapeHtml(f.area)}</span>
+    <span class="area-chip" title="Check area: ${escapeHtml(f.area)}">${escapeHtml(plain.areaLabel)}</span>
     ${confidenceBadge}
   </header>
-  <h4>${escapeHtml(f.title)}</h4>
-  ${f.preconditions ? `<p class="pre"><span class="label">Preconditions</span>${escapeHtml(f.preconditions)}</p>` : ''}
-  <div class="block"><span class="label">Steps to reproduce</span>${steps}</div>
-  <div class="ea-grid">
-    <div class="ea expected"><span class="label">Expected</span><div class="ea-text">${withListFormatting(f.expected)}</div></div>
-    <div class="ea actual"><span class="label">Actual</span><div class="ea-text">${withListFormatting(f.actual)}</div></div>
-  </div>
-  ${confidenceNote}
+  <h4>${escapeHtml(plain.headline)}</h4>
+  <p class="pre"><span class="label">What's wrong</span>${escapeHtml(plain.summary)}</p>
+  <p class="pre"><span class="label">Why it matters</span>${escapeHtml(plain.whyItMatters)}${unconfirmed}</p>
+  <div class="block"><span class="label">How to see it yourself</span>${steps}</div>
   <div class="block"><span class="label">Evidence</span>${evidence}</div>
+  <details class="tech">
+    <summary>Technical details</summary>
+    <p class="pre"><span class="label">Check result</span>${escapeHtml(f.title)}</p>
+    ${f.pageUrl ? `<p class="pre"><span class="label">Page</span>${escapeHtml(f.pageUrl)}</p>` : ''}
+    ${f.preconditions ? `<p class="pre"><span class="label">Preconditions</span>${escapeHtml(f.preconditions)}</p>` : ''}
+    <div class="ea-grid">
+      <div class="ea expected"><span class="label">Expected</span><div class="ea-text">${withListFormatting(f.expected)}</div></div>
+      <div class="ea actual"><span class="label">Actual</span><div class="ea-text">${withListFormatting(f.actual)}</div></div>
+    </div>
+    ${confidenceNote}
+  </details>
   <footer class="finding-foot">
     <span>Repro rate: <strong>${escapeHtml(f.reproRate)}</strong></span>
     <span>${f.automationCandidate ? 'Automation candidate: Yes' : 'Automation candidate: No'}</span>
@@ -497,7 +577,14 @@ function overallRisk(counts: SeverityCounts, total: number): { label: string; cl
   return { label: 'Clear', className: 'risk-clear' };
 }
 
-function buildOverviewMarkdown(state: SessionState, flows: FlowCoverageRow[], findings: Finding[]): string {
+function buildOverviewMarkdown(
+  state: SessionState,
+  flows: FlowCoverageRow[],
+  findings: Finding[],
+  confirmedCount: number,
+  potentialCount: number,
+  executionErrorCount: number,
+): string {
   const journeys = state.classification?.inferredJourneys?.slice(0, 5).join(', ') || '—';
   const endpoints = state.discoveredApiEndpoints?.length ?? 0;
   const auth =
@@ -520,7 +607,10 @@ function buildOverviewMarkdown(state: SessionState, flows: FlowCoverageRow[], fi
     `| **Areas selected** | ${state.config.areas.join(', ') || 'n/a'} |`,
     `| **Tasks completed** | ${state.progress.completedTasks} / ${state.progress.totalTasks} |`,
     `| **Flows exercised** | ${flows.length} |`,
-    `| **Findings** | ${findings.length} |`,
+    `| **Findings (total)** | ${findings.length} |`,
+    `| **— Confirmed defects** | ${confirmedCount} |`,
+    `| **— Potential defects (unvalidated)** | ${potentialCount} |`,
+    `| **Agent execution issues** | ${executionErrorCount} (excluded from findings and health score — see "Agent Execution Issues") |`,
     `| **Site type** | ${state.classification ? `${state.classification.siteType} (${Math.round(state.classification.confidence * 100)}%)` : 'not classified'} |`,
     `| **Inferred journeys** | ${journeys} |`,
     `| **Authentication** | ${auth} |`,
@@ -529,6 +619,36 @@ function buildOverviewMarkdown(state: SessionState, flows: FlowCoverageRow[], fi
     `| **Date** | ${state.updatedAt || state.createdAt} |`,
     '',
   ].join('\n');
+}
+
+/**
+ * Agent/infra failures (page-load timeouts, crashed steps, a target that briefly went
+ * unreachable) — kept in their own section rather than mixed into Findings (where they'd read as
+ * application defects, A8-style) or silently dropped (a run with a lot of these needs a re-run,
+ * not a bug triage, and that's only visible if they're shown somewhere).
+ */
+function buildExecutionErrorsMarkdown(groups: AreaFindingGroup[]): string {
+  if (groups.length === 0) return '';
+  const total = groups.reduce((n, g) => n + g.count, 0);
+  const lines: string[] = [
+    `## Agent Execution Issues (${total})`,
+    '',
+    '_Not application defects — checks that the agent itself could not finish (a timeout, a ' +
+      'crashed step, the target being briefly unreachable). Excluded from the Findings section ' +
+      'and the health score. A handful here is normal; a large number suggests re-running ' +
+      'against a healthier target rather than treating these as bugs to fix._',
+    '',
+  ];
+  for (const g of groups) {
+    lines.push(`### ${areaHeading(g)} (${g.count})`, '');
+    let idx = 0;
+    for (const f of g.findings) {
+      idx += 1;
+      lines.push(`#### ${idx}. ${explainFinding(f).headline}`, '');
+      lines.push(formatFindingMarkdown(f).split('\n').slice(2).join('\n'));
+    }
+  }
+  return lines.join('\n');
 }
 
 function buildFlowsMarkdown(flows: FlowCoverageRow[]): string {
@@ -765,16 +885,16 @@ function buildFindingsMarkdown(groups: AreaFindingGroup[], bySeverity: SeverityC
 
   lines.push('### By area', '', '| Area | Findings |', '|------|----------|');
   for (const g of groups) {
-    lines.push(`| ${g.area} | ${g.count} (${formatSeverityInline(g.bySeverity)}) |`);
+    lines.push(`| ${areaHeading(g)} | ${g.count} (${formatSeverityInline(g.bySeverity)}) |`);
   }
 
   lines.push('', '### Detailed findings', '');
   let idx = 0;
   for (const g of groups) {
-    lines.push(`### Area: ${g.area} (${g.count})`, '');
+    lines.push(`### ${areaHeading(g)} (${g.count})`, '');
     for (const f of g.findings) {
       idx += 1;
-      lines.push(`#### ${idx}. [${f.severity.toUpperCase()}] ${f.title}`, '');
+      lines.push(`#### ${idx}. [${f.severity.toUpperCase()}] ${explainFinding(f).headline}`, '');
       const body = formatFindingMarkdown(f).split('\n').slice(2).join('\n');
       lines.push(body);
     }
@@ -799,11 +919,11 @@ function buildInfoNotesMarkdown(groups: AreaFindingGroup[]): string {
     '',
   ];
   for (const g of groups) {
-    lines.push(`### ${g.area} (${g.count})`, '');
+    lines.push(`### ${areaHeading(g)} (${g.count})`, '');
     let idx = 0;
     for (const f of g.findings) {
       idx += 1;
-      lines.push(`#### ${idx}. ${f.title}`, '');
+      lines.push(`#### ${idx}. ${explainFinding(f).headline}`, '');
       const body = formatFindingMarkdown(f).split('\n').slice(2).join('\n');
       lines.push(body);
     }
@@ -819,7 +939,7 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
   // from an unset API key to a malformed response, never blocking report generation.
   const deterministicallyDeduped = dedupeFindings(state.findings);
   const aiDeduped = await dedupeFindingsWithAI(deterministicallyDeduped).catch(() => null);
-  let findings = sortFindings(aiDeduped ?? deterministicallyDeduped).map((f) =>
+  let findings = sortFindingsForDisplay(collapseDuplicateNotes(aiDeduped ?? deterministicallyDeduped)).map((f) =>
     withReproSteps(f, targetUrl),
   );
 
@@ -838,24 +958,40 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
       };
     });
   }
-  // "info" severity is structurally not a defect — computeHealthScore already gives it zero
-  // penalty and excludes it from the issue count — so it doesn't belong mixed into a
-  // "Findings" list that's otherwise exclusively real bugs (a QA discovering "GET /api/x
-  // returned 200 JSON" listed the same way as an actual defect reads as noise/confusion, not
-  // a bug report). Split it out into its own section instead of dropping it: these are still
-  // useful notes (discovered endpoints, coverage summaries, confirmation checks) worth keeping
-  // for future exploration, just not co-mingled with things that need fixing.
-  const bugFindings = findings.filter((f) => f.severity !== 'info');
-  const infoFindings = findings.filter((f) => f.severity === 'info');
-  const bySeverity = countBySeverity(findings);
+  // Every count/section below is built from ONE classification (resultTypeOf — see
+  // finding-classification.ts), not each re-deriving its own notion of "is this a defect":
+  // that's what let a report show two different totals for the same run (one section's number
+  // included info-severity/execution-error items, another's didn't, and they drifted).
+  //
+  // - observation       — info-severity by construction, or explicitly quarantined: not a
+  //   defect (discovered endpoints, coverage notes, confirmed-correct checks).
+  // - execution-error    — the agent itself failed to finish a check (timeout, crash, target
+  //   unreachable): a fact about this run, not about the application. Never a defect, never
+  //   scored, kept in its own section instead of silently inflating the bug list.
+  // - confirmed-defect / potential-defect — real candidate defects; potential-defect is
+  //   backed by only a single heuristic signal and still needs validation.
+  const bugFindings = findings.filter((f) => {
+    const t = resultTypeOf(f);
+    return t === 'confirmed-defect' || t === 'potential-defect';
+  });
+  const infoFindings = findings.filter((f) => resultTypeOf(f) === 'observation');
+  const executionErrorFindings = findings.filter((f) => resultTypeOf(f) === 'execution-error');
+  const confirmedCount = findings.filter((f) => resultTypeOf(f) === 'confirmed-defect').length;
+  const potentialCount = bugFindings.length - confirmedCount;
+  // Severity breakdown over confirmed+potential defects ONLY — this is the single number every
+  // KPI tile, severity chip, and distribution bar must read from, so they can't drift apart.
+  const bySeverity = countBySeverity(bugFindings);
   const healthScore = computeHealthScore(findings);
   const flowsCovered = buildFlowCoverage(state.plan, findings, targetUrl);
   const findingsByArea = groupFindingsByArea(bugFindings);
   const infoByArea = groupFindingsByArea(infoFindings);
+  const executionErrorsByArea = groupFindingsByArea(executionErrorFindings);
   const templatedSummary = buildExecutiveSummary(
     state,
     bySeverity,
-    bugFindings.length,
+    confirmedCount,
+    potentialCount,
+    executionErrorFindings.length,
     flowsCovered.length,
     healthScore,
   );
@@ -878,8 +1014,9 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
     '',
     executiveSummary,
     '',
-    buildOverviewMarkdown(state, flowsCovered, bugFindings),
+    buildOverviewMarkdown(state, flowsCovered, bugFindings, confirmedCount, potentialCount, executionErrorFindings.length),
     buildFlowsMarkdown(flowsCovered),
+    buildExecutionErrorsMarkdown(executionErrorsByArea),
     buildSiteKnowledgeMarkdown(state),
     buildApplicationMapMarkdown(state),
     buildPageCoverageMarkdown(state),
@@ -924,7 +1061,13 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
     ['Areas selected', areas],
     ['Tasks completed', `${state.progress.completedTasks} / ${state.progress.totalTasks}`],
     ['Flows exercised', String(flowsCovered.length)],
-    ['Findings', String(bugFindings.length)],
+    ['Findings (total)', String(bugFindings.length)],
+    ['— Confirmed defects', String(confirmedCount)],
+    ['— Potential defects (unvalidated)', String(potentialCount)],
+    [
+      'Agent execution issues',
+      `${executionErrorFindings.length} (excluded from findings and health score)`,
+    ],
     [
       'Site type',
       state.classification
@@ -946,7 +1089,11 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
     ? `${state.classification.siteType} (${Math.round(state.classification.confidence * 100)}%)`
     : 'Not classified';
 
-  const risk = overallRisk(bySeverity, bugFindings.length);
+  // Risk badge reflects CONFIRMED defects only — an unvalidated heuristic critical shouldn't be
+  // able to paint the whole report "Critical" before a human/validator has looked at it. The
+  // severity distribution below still shows potential defects too, just not what drives this badge.
+  const confirmedSeverity = countBySeverity(findings.filter((f) => resultTypeOf(f) === 'confirmed-defect'));
+  const risk = overallRisk(confirmedSeverity, confirmedCount);
 
   const flowsByArea = groupFlowsByArea(flowsCovered);
   let flowsHtml = '<p class="empty">No plan tasks were recorded for this session.</p>';
@@ -993,7 +1140,7 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
           ${findingsByArea
             .map(
               (g) => `<tr>
-              <td>${escapeHtml(g.area)}</td>
+              <td>${escapeHtml(areaHeading(g))}</td>
               <td class="num">${g.count}</td>
               <td>${escapeHtml(formatSeverityInline(g.bySeverity))}</td>
             </tr>`,
@@ -1018,7 +1165,7 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
             return `
             <div class="area-group">
               <div class="area-group-head">
-                <h3>${escapeHtml(g.area)}</h3>
+                <h3>${escapeHtml(areaHeading(g))}</h3>
                 <span class="count-chip">${g.count}</span>
                 <span class="muted small">${escapeHtml(formatSeverityInline(g.bySeverity))}</span>
               </div>
@@ -1038,7 +1185,7 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
         <thead><tr><th>Area</th><th style="width:12%">Count</th></tr></thead>
         <tbody>
           ${infoByArea
-            .map((g) => `<tr><td>${escapeHtml(g.area)}</td><td class="num">${g.count}</td></tr>`)
+            .map((g) => `<tr><td>${escapeHtml(areaHeading(g))}</td><td class="num">${g.count}</td></tr>`)
             .join('\n')}
         </tbody>
       </table>`;
@@ -1059,7 +1206,45 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
             return `
             <div class="area-group">
               <div class="area-group-head">
-                <h3>${escapeHtml(g.area)}</h3>
+                <h3>${escapeHtml(areaHeading(g))}</h3>
+                <span class="count-chip">${g.count}</span>
+              </div>
+              ${cards}
+            </div>`;
+          })
+          .join('\n');
+
+  // Agent/infra failures get the same two-part treatment as observations above, with their own
+  // E- prefixed ids — kept out of the Findings section entirely (see buildExecutionErrorsMarkdown).
+  const executionErrorsAreaSummaryHtml =
+    executionErrorsByArea.length === 0
+      ? ''
+      : `<table class="data-table">
+        <thead><tr><th>Area</th><th style="width:12%">Count</th></tr></thead>
+        <tbody>
+          ${executionErrorsByArea
+            .map((g) => `<tr><td>${escapeHtml(areaHeading(g))}</td><td class="num">${g.count}</td></tr>`)
+            .join('\n')}
+        </tbody>
+      </table>`;
+
+  let executionErrorIdx = 0;
+  const executionErrorsHtml =
+    executionErrorsByArea.length === 0
+      ? ''
+      : executionErrorsByArea
+          .map((g) => {
+            const cards = g.findings
+              .map((f) => {
+                const html = formatFindingHtml(f, executionErrorIdx, 'E');
+                executionErrorIdx += 1;
+                return html;
+              })
+              .join('\n');
+            return `
+            <div class="area-group">
+              <div class="area-group-head">
+                <h3>${escapeHtml(areaHeading(g))}</h3>
                 <span class="count-chip">${g.count}</span>
               </div>
               ${cards}
@@ -1215,15 +1400,21 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
       <p class="muted small" style="margin-top:0.5rem">A true multi-role (Admin vs. Manager vs. User) access matrix would require multiple real credential sets and multiple real logins, which this session's single-login architecture doesn't support without added risk to a live account.</p>`;
   })();
 
-  const severityBars = SEVERITY_ORDER.map((sev) => {
-    const n = bySeverity[sev];
-    const pct = findings.length ? Math.round((n / findings.length) * 100) : 0;
-    return `<div class="sev-row">
+  // 'info' deliberately excluded — bySeverity (and bugFindings.length as the denominator) now
+  // covers confirmed+potential defects only, so these bars always sum to 100% of the SAME
+  // number shown in the "Findings" KPI tile above instead of silently including observations
+  // the KPI tile doesn't count (the exact "55 vs 60" drift this report used to have).
+  const severityBars = SEVERITY_ORDER.filter((sev) => sev !== 'info')
+    .map((sev) => {
+      const n = bySeverity[sev];
+      const pct = bugFindings.length ? Math.round((n / bugFindings.length) * 100) : 0;
+      return `<div class="sev-row">
       <span class="sev-name">${sev}</span>
       <div class="sev-track"><div class="sev-fill ${sev}" style="width:${pct}%"></div></div>
       <span class="sev-count">${n}</span>
     </div>`;
-  }).join('');
+    })
+    .join('');
 
   const html = `<!DOCTYPE html>
 <html lang="en">
@@ -1598,6 +1789,11 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
       background: #fff8e6;
       border-color: #f0dca0;
     }
+    .confidence-badge.flagged {
+      color: #b91c1c;
+      background: #fef2f2;
+      border-color: #fecaca;
+    }
     .confidence-note {
       margin: 0 0 0.75rem;
       font-size: 0.82rem;
@@ -1647,6 +1843,8 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
       margin-bottom: 0.75rem;
     }
     @media (max-width: 640px) { .ea-grid { grid-template-columns: 1fr; } }
+    details.tech { margin-top: 0.75rem; border-top: 1px dashed rgba(127,127,127,0.35); padding-top: 0.5rem; }
+    details.tech > summary { cursor: pointer; font-weight: 600; opacity: 0.8; margin-bottom: 0.5rem; }
     .ea {
       padding: 0.65rem 0.75rem;
       border: 1px solid var(--line);
@@ -1715,13 +1913,14 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
       <div class="kpi-grid">
         <div class="kpi"><div class="v">${flowsCovered.length}</div><div class="l">Flows tested</div></div>
         <div class="kpi"><div class="v">${state.progress.completedTasks}/${state.progress.totalTasks}</div><div class="l">Tasks completed</div></div>
-        <div class="kpi"><div class="v">${bugFindings.length}</div><div class="l">Findings</div></div>
-        <div class="kpi"><div class="v">${bySeverity.critical + bySeverity.high}</div><div class="l">Critical + High</div></div>
+        <div class="kpi"><div class="v">${confirmedCount}</div><div class="l">Confirmed defects</div></div>
+        <div class="kpi"><div class="v">${potentialCount}</div><div class="l">Potential (unvalidated)</div></div>
       </div>
 
       <ul class="toc">
         <li><a href="#overview">1. Overview</a></li>
         <li><a href="#flows">2. Flows tested</a></li>
+        ${executionErrorsHtml ? `<li><a href="#execution-errors">Agent Execution Issues (${executionErrorFindings.length})</a></li>` : ''}
         ${siteKnowledgeHtml ? '<li><a href="#site-knowledge">Application Knowledge Base</a></li>' : ''}
         ${applicationMapHtml ? '<li><a href="#application-map">Application Map</a></li>' : ''}
         ${pageCoverageHtml ? '<li><a href="#page-coverage">Page Coverage</a></li>' : ''}
@@ -1751,6 +1950,13 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
         <p class="muted" style="margin:0 0 0.75rem">Functional journeys and UI checks exercised in this session, grouped by exploration area.</p>
         ${flowsHtml}
       </section>
+
+      ${executionErrorsHtml ? `<section class="sec" id="execution-errors">
+        <h2>Agent Execution Issues <span class="muted small">(${executionErrorFindings.length})</span></h2>
+        <p class="muted" style="margin:0 0 0.75rem">Not application defects — checks the agent itself could not finish (a timeout, a crashed step, the target being briefly unreachable). Excluded from Findings and the health score.</p>
+        ${executionErrorsAreaSummaryHtml ? `<div style="margin:0.75rem 0 1.25rem">${executionErrorsAreaSummaryHtml}</div>` : ''}
+        ${executionErrorsHtml}
+      </section>` : ''}
 
       ${siteKnowledgeHtml ? `<section class="sec" id="site-knowledge">
         <h2>Application Knowledge Base</h2>
@@ -1820,6 +2026,9 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
     html,
     summary: {
       total: bugFindings.length,
+      confirmedDefects: confirmedCount,
+      potentialDefects: potentialCount,
+      executionErrors: executionErrorFindings.length,
       bySeverity,
       healthScore,
       executiveSummary,
@@ -1829,6 +2038,8 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
       findings: bugFindings,
       infoFindings,
       infoByArea,
+      executionErrorFindings,
+      executionErrorsByArea,
     },
   };
 }

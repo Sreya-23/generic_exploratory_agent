@@ -312,7 +312,13 @@ export async function askAboutFindings(sessionId: string, question: string): Pro
 export interface SessionReportPayload {
   sessionId: string;
   status: string;
+  /** Confirmed + potential defects. Excludes observations and agent execution issues — the
+   *  same classification used everywhere else in the report, so this always agrees with
+   *  `bySeverity`'s sum and with `confirmedDefects + potentialDefects`. */
   total: number;
+  confirmedDefects: number;
+  potentialDefects: number;
+  executionErrors: number;
   bySeverity: Record<'critical' | 'high' | 'medium' | 'low' | 'info', number>;
   healthScore: HealthScore;
   executiveSummary: string;
@@ -320,6 +326,8 @@ export interface SessionReportPayload {
   markdown: string;
   html: string;
   findings: Finding[];
+  infoFindings?: Finding[];
+  executionErrorFindings?: Finding[];
   flowsCovered?: {
     area: string;
     flowClass: string;

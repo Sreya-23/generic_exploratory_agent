@@ -550,6 +550,32 @@ textarea {
   color: var(--text-muted);
 }
 
+.confidence-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid;
+}
+
+.confidence-badge.verified {
+  color: #1a7f37;
+  background: rgba(26, 127, 55, 0.12);
+  border-color: rgba(26, 127, 55, 0.35);
+}
+
+.confidence-badge.heuristic {
+  color: #9a6700;
+  background: rgba(154, 103, 0, 0.12);
+  border-color: rgba(154, 103, 0, 0.35);
+}
+
+.confidence-badge.flagged {
+  color: #b91c1c;
+  background: rgba(185, 28, 28, 0.12);
+  border-color: rgba(185, 28, 28, 0.35);
+}
+
 .finding-card h3 {
   font-size: 0.95rem;
   margin-bottom: 0.75rem;
@@ -1114,3 +1140,32 @@ textarea {
   max-height: 70vh;
 }
 
+
+/* Category headings in the report's findings list (UI → API → JS errors → resilience → security) */
+.findings-category {
+  margin: 1.5rem 0 0.5rem;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.75;
+}
+.findings-category:first-child {
+  margin-top: 0;
+}
+
+/* Plain-English explanation block and collapsible technical details on each finding */
+.finding-plain p {
+  margin: 0.35rem 0;
+  line-height: 1.5;
+}
+.finding-technical {
+  margin-top: 0.75rem;
+  padding-top: 0.5rem;
+  border-top: 1px dashed rgba(127, 127, 127, 0.35);
+}
+.finding-technical > summary {
+  cursor: pointer;
+  font-weight: 600;
+  opacity: 0.8;
+  margin-bottom: 0.5rem;
+}

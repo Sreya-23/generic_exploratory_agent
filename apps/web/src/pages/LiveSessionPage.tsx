@@ -5,12 +5,13 @@ import {
   connectSessionWs,
   getSession,
   getSessionChat,
+  getSessionReport,
   pauseSession,
   sendSessionChat,
   type Finding,
   type SessionState,
 } from '../api/client';
-import { FindingCard } from '../components/session/FindingCard';
+import { GroupedFindingList, listedFindingCount } from '../components/session/GroupedFindingList';
 import { QualityPilotConnect } from '../components/session/QualityPilotConnect';
 import { SessionProgress } from '../components/session/SessionProgress';
 import { ChatPanel } from '../components/chat/ChatPanel';
@@ -111,6 +112,26 @@ export function LiveSessionPage() {
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'error' | 'closed'>('connecting');
   const [loadError, setLoadError] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  // Once the run has finished, show the report's de-duplicated list (merged repeats, e.g. the
+  // same broken add-to-cart on two products) instead of every raw finding as it arrived.
+  const [reportFindings, setReportFindings] = useState<Finding[] | null>(null);
+  const finished = session?.status === 'completed' || session?.status === 'failed';
+  useEffect(() => {
+    if (!id || !finished || reportFindings) return;
+    let active = true;
+    const load = () =>
+      getSessionReport(id)
+        .then((r) => {
+          if (active) setReportFindings([...r.findings, ...(r.infoFindings ?? []), ...(r.executionErrorFindings ?? [])]);
+        })
+        .catch(() => {
+          if (active) setTimeout(load, 3000); // report may still be generating
+        });
+    load();
+    return () => {
+      active = false;
+    };
+  }, [id, finished, reportFindings]);
 
   useEffect(() => {
     if (!id) return;
@@ -285,17 +306,19 @@ export function LiveSessionPage() {
 
         <section className="findings-panel">
           <QualityPilotConnect />
-          <h2>Findings ({findings.length})</h2>
-          {findings.length === 0 ? (
+          <h2>Findings ({listedFindingCount(reportFindings ?? findings)})</h2>
+          {reportFindings && reportFindings.length < findings.length && (
+            <p className="empty-state" style={{ marginTop: 0 }}>
+              {findings.length} raw results were merged into {listedFindingCount(reportFindings)} — repeats of the same
+              problem are listed once.
+            </p>
+          )}
+          {findings.length === 0 && !reportFindings?.length ? (
             <p className="empty-state">
               {isActive ? 'Exploring... findings will appear here.' : 'No findings recorded.'}
             </p>
           ) : (
-            <div className="findings-list">
-              {findings.map((f) => (
-                <FindingCard key={f.id} finding={f} sessionId={session.id} />
-              ))}
-            </div>
+            <GroupedFindingList findings={reportFindings ?? findings} sessionId={session.id} />
           )}
         </section>
       </div>

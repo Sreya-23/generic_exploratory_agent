@@ -10,6 +10,7 @@ import {
 } from '@qa/chat-agent';
 import { probeAuth } from '@qa/explorer-ui';
 import type { SessionCredentials, SessionEvent } from '@qa/shared';
+import { resultTypeOf } from '@qa/shared';
 import { orchestrator, generateSessionReportMarkdown, generateSessionReport, writeSessionReport } from '@qa/agent-core';
 
 function extractUrlFromMessage(text: string): string | undefined {
@@ -243,8 +244,15 @@ export function registerReportRoutes(app: FastifyInstance, sessionsDir: string):
       const question = req.body?.question?.trim();
       if (!question) return reply.status(400).send({ error: 'question is required' });
 
+      // Same classification the final report uses (resultTypeOf) — answers here must agree with
+      // the report's counts, so agent/infra failures and observations don't get counted as
+      // app defects here while being correctly excluded there.
+      const reportableFindings = session.findings.filter((f) => {
+        const t = resultTypeOf(f);
+        return t === 'confirmed-defect' || t === 'potential-defect';
+      });
       const answer = answerFindingsQuestion(question, {
-        findings: session.findings,
+        findings: reportableFindings,
         targetUrl: session.config.targetUrl,
       });
       return { answer };

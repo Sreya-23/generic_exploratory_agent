@@ -45,6 +45,15 @@ const CANDIDATE_SELECTOR =
   'a[href]:not([href^="mailto:"]):not([href^="tel:"]):not([tabindex="-1"]), [onclick]:not([tabindex="-1"]), [tabindex="0"]';
 const MAX_CANDIDATES_PER_PAGE = 40;
 
+// The UI executor aborts any task after 90s (30s when the target is flagged degraded). Clicking
+// dozens of elements — each with a settle wait and new-tab/mutation detection — can exceed that,
+// and the abort then closed the browser mid-click, which surfaced as a bogus "Clicking X threw an
+// error" finding plus a "Task error" (observed on SauceDemo). Stop starting new clicks once this
+// budget is spent and report what was covered; the summary says the inventory is partial.
+let scanDeadline = Number.POSITIVE_INFINITY;
+let budgetHit = false;
+const CLOSED_TARGET = /target page, context or browser has been closed|page has been closed|browser has disconnected/i;
+
 interface PageState {
   url: string;
   dialogCount: number;
@@ -104,32 +113,67 @@ async function clickWithStickyRetry(el: Locator, ctx: ExecutorContext, label: st
 const SPINNER_SELECTOR = '[class*="spinner" i], [class*="loading" i]:not(input):not(textarea), [role="progressbar"], [aria-busy="true"]';
 const STUCK_LOADING_TIMEOUT_MS = 8000;
 
+/** Marks every loading indicator already on the page, so only ones the click creates count. */
+async function markExistingSpinners(page: Page): Promise<void> {
+  await page
+    .evaluate((sel) => {
+      for (const el of Array.from(document.querySelectorAll(sel))) el.setAttribute('data-qa-preexisting-spinner', '1');
+    }, SPINNER_SELECTOR)
+    .catch(() => {});
+}
+
+/**
+ * Visible loading indicators that were NOT on the page before the click, ignoring big
+ * containers whose class merely contains "loading" (a "loading-wrapper" around the whole
+ * page is not a spinner). Returns a short description of each.
+ */
+async function newVisibleSpinners(page: Page): Promise<string[]> {
+  return page
+    .evaluate((sel) => {
+      const out: string[] = [];
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      for (const el of Array.from(document.querySelectorAll(sel))) {
+        if (el.hasAttribute('data-qa-preexisting-spinner')) continue;
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        if (r.width < 8 || r.height < 8 || st.visibility === 'hidden' || st.display === 'none' || Number(st.opacity) === 0) continue;
+        if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) continue;
+        if (r.width * r.height > vw * vh * 0.4) continue;
+        const cls = (typeof el.className === 'string' ? el.className : el.getAttribute('class') ?? '').split(/\s+/)[0];
+        out.push(el.getAttribute('aria-label') || `${el.tagName.toLowerCase()}${cls ? `.${cls}` : ''}`);
+      }
+      return out;
+    }, SPINNER_SELECTOR)
+    .catch(() => [] as string[]);
+}
+
 async function checkStuckLoadingState(page: Page, ctx: ExecutorContext, label: string, pageUrl: string): Promise<void> {
-  const spinner = page.locator(SPINNER_SELECTOR).first();
-  if (!(await spinner.isVisible().catch(() => false))) return;
+  if ((await newVisibleSpinners(page)).length === 0) return;
 
   const deadline = Date.now() + STUCK_LOADING_TIMEOUT_MS;
-  let stillVisible = true;
+  let still: string[] = [];
   while (Date.now() < deadline) {
     await page.waitForTimeout(500);
-    stillVisible = await spinner.isVisible().catch(() => false);
-    if (!stillVisible) break;
+    still = await newVisibleSpinners(page);
+    if (still.length === 0) break;
   }
 
-  if (stillVisible) {
+  if (still.length > 0) {
+    const evidence = await shot(page, ctx, `stuck-loading-${Date.now()}`);
     ctx.onFinding({
       severity: 'medium',
       area: 'UI-Performance',
       title: `Loading indicator never resolves after clicking "${label}"`,
       steps: [`Open ${pageUrl}`, `Click "${label}"`, `Wait ${STUCK_LOADING_TIMEOUT_MS / 1000}s`],
       expected: 'A loading/spinner state should resolve within a reasonable time',
-      actual: `A loading indicator was still visible ${STUCK_LOADING_TIMEOUT_MS / 1000}s after clicking "${label}"`,
-      evidence: [],
+      actual: `${still.length} loading indicator(s) that appeared after clicking "${label}" were still showing ${STUCK_LOADING_TIMEOUT_MS / 1000}s later (${[...new Set(still)].slice(0, 3).join(', ')}) — part of the page never finished loading`,
+      evidence: evidence ? [evidence] : [],
       reproRate: '1/1',
       automationCandidate: true,
       pageUrl,
       confidence: 'heuristic',
-      confidenceReason: 'A performance observation, not a confirmed hang — the underlying request may simply be slow rather than truly stuck, and a longer wait might still resolve it.',
+      confidenceReason: 'Only counts spinners created by this click (not ones already on the page) — but a very slow server could still look like this; a longer wait might resolve it.',
     });
   }
 }
@@ -145,6 +189,40 @@ async function shot(page: Page, ctx: ExecutorContext, name: string): Promise<str
     // actually written to disk.
     return undefined;
   }
+}
+
+// Counts DOM mutations that a user would see as "something happened": nodes added/removed,
+// text changed, or a class/style/aria/hidden/open attribute flipped (a menu sliding open, a
+// button switching "Add to cart" → "Remove"). Comparing innerText length alone missed exactly
+// those, so working buttons were reported as "no visible effect".
+async function startMutationCount(page: Page): Promise<void> {
+  await page
+    .evaluate(() => {
+      const w = window as unknown as { __qaMut: number; __qaObs?: MutationObserver };
+      w.__qaObs?.disconnect();
+      w.__qaMut = 0;
+      w.__qaObs = new MutationObserver((records) => {
+        for (const r of records) {
+          if (r.type === 'attributes' && !/^(class|style|hidden|open|aria-|data-state|value|src)/.test(r.attributeName ?? '')) continue;
+          w.__qaMut++;
+        }
+      });
+      if (document.body) {
+        w.__qaObs.observe(document.body, { subtree: true, childList: true, attributes: true, characterData: true });
+      }
+    })
+    .catch(() => {});
+}
+
+async function readMutationCount(page: Page, reset = false): Promise<number> {
+  return page
+    .evaluate((reset) => {
+      const w = window as unknown as { __qaMut?: number };
+      const n = w.__qaMut ?? 0;
+      if (reset) w.__qaMut = 0;
+      return n;
+    }, reset)
+    .catch(() => 0);
 }
 
 async function captureState(page: Page): Promise<PageState> {
@@ -198,6 +276,10 @@ async function scanCurrentPage(
   let staleRounds = 0;
 
   while (tested + skippedRisky < MAX_CANDIDATES_PER_PAGE && staleRounds < 3) {
+    if (Date.now() >= scanDeadline) {
+      budgetHit = true;
+      break;
+    }
     const candidates = page.locator(CANDIDATE_SELECTOR);
     const count = await candidates.count().catch(() => 0);
     totalFound = Math.max(totalFound, count);
@@ -234,6 +316,22 @@ async function scanCurrentPage(
 
     const el = candidates.nth(picked);
 
+    // Controls inside a closed drawer/off-canvas menu (aria-hidden/inert), or parked outside
+    // the document, can't be clicked by a user until something reveals them. Clicking them
+    // anyway produced "Element is outside of the viewport" errors reported as app defects.
+    const unreachable = await el
+      .evaluate((node) => {
+        if (node.closest('[aria-hidden="true"], [inert]')) return true;
+        const r = node.getBoundingClientRect();
+        const docW = Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth ?? 0);
+        return r.right + window.scrollX <= 0 || r.bottom + window.scrollY <= 0 || r.left + window.scrollX >= docW;
+      })
+      .catch(() => false);
+    if (unreachable) {
+      testedKeys.add(`${kind}:${label}`);
+      continue;
+    }
+
     if (isRiskyActionLabel(label)) {
       entries.push({ label, kind, pageUrl: page.url(), result: 'skipped-risky' });
       skippedRisky++;
@@ -269,13 +367,40 @@ async function scanCurrentPage(
     let detail: string | undefined;
     let evidence: string | undefined;
 
+    // Links that open a new tab/window (target=_blank social/footer links) change nothing on
+    // THIS page by design — watch the browser context for the new tab instead.
+    let openedTab: Page | null = null;
+    const onNewPage = (p: Page) => {
+      openedTab = p;
+    };
+    page.context().on('page', onNewPage);
+    // Baseline the page's own background churn (carousels, timers) for a moment, so only
+    // mutations above that rate count as the click's effect.
+    await startMutationCount(page);
+    await page.waitForTimeout(200);
+    const idleMutations = await readMutationCount(page, true);
+
+    const opensNewTab = (await el.getAttribute('target').catch(() => null)) === '_blank';
+    await markExistingSpinners(page);
     try {
       await clickWithStickyRetry(el, ctx, label);
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(700);
+      // New tabs can take longer to be created than an in-page change — give a target=_blank
+      // link up to 2s more before deciding it did nothing.
+      for (let waited = 0; opensNewTab && !openedTab && waited < 2000; waited += 250) {
+        await page.waitForTimeout(250);
+      }
       await checkStuckLoadingState(page, ctx, label, before.url);
       const after = await captureState(page);
+      const clickMutations = await readMutationCount(page);
+      page.context().off('page', onNewPage);
+      const tab = openedTab as Page | null;
 
-      if (after.url !== before.url) {
+      if (tab) {
+        result = 'navigation';
+        detail = `opened a new tab → ${tab.url()}`;
+        await tab.close().catch(() => {});
+      } else if (after.url !== before.url) {
         result = 'navigation';
         detail = `→ ${after.url}`;
         // Return to the starting page so remaining candidates are tested from a known state.
@@ -291,7 +416,7 @@ async function scanCurrentPage(
         // the pre-click check a few candidates later will catch the leftover overlay instead
         // of letting it silently cascade into a run of misreported "threw an error" findings.
         await dismissBlockingOverlay(page);
-      } else if (Math.abs(after.bodyLength - before.bodyLength) > 20) {
+      } else if (Math.abs(after.bodyLength - before.bodyLength) > 20 || clickMutations > idleMutations * 3) {
         result = 'dom-change';
       } else {
         // A nav item for the page you're already ON producing "no effect" is expected
@@ -301,8 +426,20 @@ async function scanCurrentPage(
         // covers the common case where a site doesn't bother with aria-current at all.
         const ariaCurrent = await el.getAttribute('aria-current').catch(() => null);
         const labelSlug = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+        const href = await el.getAttribute('href').catch(() => null);
+        let pointsHere = false;
+        if (href !== null) {
+          try {
+            const target = new URL(href, before.url);
+            const here = new URL(before.url);
+            pointsHere = href === '#' || (target.origin === here.origin && target.pathname === here.pathname && target.search === here.search);
+          } catch {
+            /* malformed href — leave as false */
+          }
+        }
         const isCurrentPageLink =
           ariaCurrent === 'page' ||
+          pointsHere ||
           (labelSlug.length > 2 && new URL(before.url).pathname.toLowerCase().includes(labelSlug));
 
         if (isCurrentPageLink) {
@@ -315,6 +452,13 @@ async function scanCurrentPage(
         }
       }
     } catch (err) {
+      page.context().off('page', onNewPage);
+      // The page/browser was closed underneath us (the task-level timeout, or our own cleanup)
+      // — that's the agent stopping, not the element misbehaving. Stop quietly, report nothing.
+      if (CLOSED_TARGET.test((err as Error).message) || page.isClosed()) {
+        budgetHit = true;
+        break;
+      }
       result = 'error';
       detail = summarizeClickError((err as Error).message);
       evidence = await shot(page, ctx, `p${pageIndex}-error-${tested}`);
@@ -378,6 +522,9 @@ export async function runActionInventory(
   _task: FlowTask,
 ): Promise<void> {
   const landingUrl = page.url();
+  // Leave ~20s of the task's 90s (or ~8s of 30s) for navigation back and reporting.
+  scanDeadline = Date.now() + (ctx.envDegraded ? 22_000 : 68_000);
+  budgetHit = false;
   // How many pages to inventory, scaled by session depth — a smoke run samples just the
   // landing page, a deep run sweeps several of the app's real navigable sections.
   const maxPages = explorationBreadth(ctx, { smoke: 1, standard: 2, deep: 4, chaos: 1 });
@@ -399,6 +546,10 @@ export async function runActionInventory(
   if (maxPages > 1) {
     const morePages = await collectMorePageUrls(page, visited, maxPages - 1);
     for (let i = 0; i < morePages.length; i++) {
+      if (Date.now() >= scanDeadline) {
+        budgetHit = true;
+        break;
+      }
       const url = morePages[i];
       visited.add(url);
       try {
@@ -462,7 +613,8 @@ export async function runActionInventory(
       `Found ${totalFound} candidates across ${visited.size} page(s) (tested ${totalTested}, skipped ${totalSkippedRisky} as risky). ` +
       Object.entries(byResult)
         .map(([k, v]) => `${k}: ${v}`)
-        .join(', '),
+        .join(', ') +
+      (budgetHit ? ' — stopped early at the time budget, so this inventory is partial (remaining elements were not clicked, not failed)' : ''),
     evidence: [],
     reproRate: 'N/A',
     automationCandidate: false,

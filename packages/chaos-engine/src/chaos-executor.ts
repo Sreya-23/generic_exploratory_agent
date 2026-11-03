@@ -174,14 +174,54 @@ export async function runDoubleSubmit(
 }
 
 // C4 — Flaky network: 50% request failure rate
+// Only the APPLICATION's own requests are failed and judged. Aborting third-party analytics,
+// fonts or ad beacons and then demanding a "retry" message on screen was a false positive: the
+// page legitimately looks the same without them. A finding is raised only when failing the
+// app's own requests visibly breaks the page (content or controls go missing) AND nothing tells
+// the user what happened.
 async function runFlakyNetwork(page: Page, ctx: ExecutorContext): Promise<void> {
+  let site = '';
+  try {
+    site = new URL(page.url()).hostname.split('.').slice(-2).join('.');
+  } catch {
+    /* keep empty — every request then counts as first-party */
+  }
+  const measure = () =>
+    page
+      .evaluate(() => ({
+        text: (document.body?.innerText ?? '').replace(/\s+/g, ' ').trim().length,
+        controls: document.querySelectorAll('a[href], button, input, select').length,
+      }))
+      .catch(() => ({ text: 0, controls: 0 }));
+  // Let the page finish its own data loading first, so the baseline includes it.
+  await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+  const baseline = await measure();
+
   let interceptCount = 0;
   let failedCount = 0;
+  const failedUrls: string[] = [];
 
   await page.route('**/*', async (route) => {
+    const req = route.request();
+    let host = '';
+    try {
+      host = new URL(req.url()).hostname;
+    } catch {
+      /* ignore */
+    }
+    const firstParty = !site || host.endsWith(site);
+    // Only the app's own DATA calls (XHR/fetch) are failed. Failing the document tests "site
+    // down", and failing the JS/CSS bundle tests "site half-deployed" — neither is something an
+    // app is expected to show a friendly retry message for. A data call failing is.
+    const isDataCall = req.resourceType() === 'xhr' || req.resourceType() === 'fetch';
+    if (!firstParty || !isDataCall) {
+      await route.continue();
+      return;
+    }
     interceptCount++;
     if (interceptCount % 2 === 0) {
       failedCount++;
+      if (failedUrls.length < 5) failedUrls.push(req.url().replace(/^https?:\/\//, '').slice(0, 80));
       await route.abort('failed');
     } else {
       await route.continue();
@@ -189,35 +229,56 @@ async function runFlakyNetwork(page: Page, ctx: ExecutorContext): Promise<void> 
   });
 
   await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-  await page.waitForTimeout(2000);
+  await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(1000);
+  const after = await measure();
 
-  const bodyText = await page.locator('body').textContent().catch(() => '');
-  const hasErrorHandling =
-    bodyText?.toLowerCase().includes('retry') ||
-    bodyText?.toLowerCase().includes('try again') ||
-    bodyText?.toLowerCase().includes('error') ||
-    bodyText?.toLowerCase().includes('failed');
+  const bodyText = (await page.locator('body').textContent().catch(() => ''))?.toLowerCase() ?? '';
+  const hasErrorHandling = /retry|try again|error|failed|offline|connection|something went wrong|reload/.test(bodyText);
 
   await page.unroute('**/*');
 
-  if (!hasErrorHandling) {
-    const shot = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', 'flaky-network.png');
-    await page.screenshot({ path: shot }).catch(() => {});
-
-    ctx.onFinding({
-      severity: 'medium',
-      area: 'Chaos-Network',
-      title: 'No retry/error UI under 50% flaky network conditions',
-      steps: ['Intercept 50% of requests and abort them', 'Reload page', 'Observe error handling'],
-      expected: 'App shows retry prompt or graceful degradation message',
-      actual: `${failedCount}/${interceptCount} requests aborted with no visible error recovery UI`,
-      evidence: [shot],
-      reproRate: '1/1',
-      automationCandidate: true,
-    });
-  } else {
-    ctx.onLog(`[FlakyNetwork] Error handling present (${failedCount}/${interceptCount} requests failed)`);
+  if (failedCount === 0) {
+    ctx.onLog('[FlakyNetwork] The page made no first-party data (XHR/fetch) requests on load — nothing to fail');
+    return;
   }
+  const textLoss = baseline.text > 0 ? 1 - after.text / baseline.text : 0;
+  const controlLoss = baseline.controls > 0 ? 1 - after.controls / baseline.controls : 0;
+  const broken = textLoss > 0.3 || controlLoss > 0.3;
+
+  if (!broken) {
+    ctx.onLog(
+      `[FlakyNetwork] Page stayed usable with ${failedCount}/${interceptCount} first-party requests failed ` +
+        `(text ${Math.round(textLoss * 100)}% / controls ${Math.round(controlLoss * 100)}% lost) — resilient, not reported`,
+    );
+    return;
+  }
+  if (hasErrorHandling) {
+    ctx.onLog(`[FlakyNetwork] Page degraded but shows an error/retry message (${failedCount}/${interceptCount} failed)`);
+    return;
+  }
+
+  const shot = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', 'flaky-network.png');
+  await page.screenshot({ path: shot }).catch(() => {});
+  ctx.onFinding({
+    severity: 'medium',
+    area: 'Chaos-Network',
+    title: 'Page silently breaks when some of its own requests fail',
+    steps: [
+      'Fail every second XHR/fetch request the page makes to its own servers (DevTools → Network request blocking, or a proxy)',
+      'Reload the page',
+      'Compare with a normal load',
+    ],
+    expected: 'App retries, or shows an error/retry message when content fails to load',
+    actual:
+      `${failedCount}/${interceptCount} first-party requests failed (e.g. ${failedUrls.join(', ')}); ` +
+      `the page lost ${Math.round(textLoss * 100)}% of its text and ${Math.round(controlLoss * 100)}% of its controls with no message to the user`,
+    evidence: [shot],
+    reproRate: '1/1',
+    automationCandidate: true,
+    confidence: 'verified',
+    confidenceReason: 'Measured page content before and after failing only the site\'s own requests, and checked for any error/retry wording.',
+  });
 }
 
 // C5 — Request timeout + retry

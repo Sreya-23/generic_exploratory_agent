@@ -40,6 +40,23 @@ export async function runLocaleFormatCheck(
     }))
     .catch(() => ({ scrollWidth: 0, clientWidth: 0 }));
   const baselineTokens = await extractFormattedTokens(page);
+  // Does the site claim to serve more than one locale at all? Without that, "formatting did
+  // not change under German" just describes a single-market site (SauceDemo is US-only) and is
+  // not worth a finding.
+  const baselineLang = await page.evaluate(() => document.documentElement.lang || '').catch(() => '');
+  const multiLocaleSignal = await page
+    .evaluate(() => {
+      const alternates = document.querySelectorAll('link[rel="alternate"][hreflang]').length;
+      const switcher = document.querySelector(
+        '[class*="lang" i] select, select[name*="lang" i], select[id*="lang" i], [class*="language" i], [aria-label*="language" i], [class*="locale" i]',
+      );
+      const LANG_NAMES = /^(english|deutsch|français|francais|español|espanol|italiano|português|portugues|nederlands|polski|türkçe|русский|日本語|中文|한국어|العربية|हिन्दी)$/i;
+      const langLinks = Array.from(document.querySelectorAll('a, option, button')).filter((e) =>
+        LANG_NAMES.test((e.textContent ?? '').trim()),
+      ).length;
+      return alternates > 1 || !!switcher || langLinks >= 2;
+    })
+    .catch(() => false);
 
   // A fresh context with locale: 'de-DE' — this genuinely changes navigator.language and the
   // Accept-Language header the same way a real user's browser setting would, not a DOM-level
@@ -68,9 +85,13 @@ export async function runLocaleFormatCheck(
       }))
       .catch(() => ({ scrollWidth: 0, clientWidth: 0 }));
     const deTokens = await extractFormattedTokens(dePage);
-    const translated = await dePage
+    const deLang = await dePage
       .evaluate(() => document.documentElement.lang || '')
       .catch(() => '');
+    // "Translated" means the page's language actually CHANGED under de-DE — a page that is
+    // lang="en" in both locales did not translate (the old check treated any non-empty lang
+    // attribute as proof of translation).
+    const translated = deLang && deLang.toLowerCase() !== baselineLang.toLowerCase() ? deLang : '';
 
     // ── Text-expansion overflow: only meaningful if the overflow is NEW under de-DE, not
     // already present in the baseline (that's a plain responsive-layout bug, already covered
@@ -107,7 +128,11 @@ export async function runLocaleFormatCheck(
     // than asserted as a defect. ─────────────────────────────────────────────────────────────
     const identicalCurrency = baselineTokens.currency.filter((t) => deTokens.currency.includes(t));
     const identicalDates = baselineTokens.dates.filter((t) => deTokens.dates.includes(t));
-    if (identicalCurrency.length > 0 || identicalDates.length > 0) {
+    if ((identicalCurrency.length > 0 || identicalDates.length > 0) && !multiLocaleSignal && !translated) {
+      ctx.onLog(
+        '[LocaleFormat] Formatting unchanged under de-DE, but the site shows no sign of supporting other locales (no hreflang, language switcher or translation) — not reported',
+      );
+    } else if (identicalCurrency.length > 0 || identicalDates.length > 0) {
       const shot = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', 'locale-format-values.png');
       await dePage.screenshot({ path: shot, fullPage: false }).catch(() => {});
       ctx.onFinding({

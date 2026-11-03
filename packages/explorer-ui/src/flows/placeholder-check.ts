@@ -66,6 +66,13 @@ export async function runPlaceholderCheck(
         if (!parent) continue;
         const style = window.getComputedStyle(parent);
         if (style.display === 'none' || style.visibility === 'hidden') continue;
+        // "Visible" must mean a user could actually see it: a hidden ANCESTOR (collapsed panel,
+        // closed tooltip, chart label at opacity 0) hides the text too, and only the parent's
+        // own style was checked before.
+        const p2 = parent as Element & { checkVisibility?: (o?: object) => boolean };
+        if (p2.checkVisibility && !p2.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
+        const rect = parent.getBoundingClientRect();
+        if (rect.width < 1 || rect.height < 1) continue;
         const match = text.match(templateRe);
         if (match && !seen.has(match[0])) {
           seen.add(match[0]);
@@ -84,7 +91,8 @@ export async function runPlaceholderCheck(
   }
 
   const shot = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', 'placeholder-check.png');
-  await page.screenshot({ path: shot, fullPage: false }).catch(() => {});
+  // Full page: a leaked "${Variable}" further down the page must be in the evidence too.
+  await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
 
   if (leaked.length > 0) {
     ctx.onFinding({
