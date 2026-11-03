@@ -227,7 +227,7 @@ On every session, before any tests run, the agent reads:
 
 ### Layer 2 — Site Classification (`classify-site.ts`)
 
-Scores the collected signals against 7 site-type rules:
+Scores the collected signals against 8 site-type rules (anything below the confidence threshold falls back to `generic`, giving 9 types in all):
 
 | Site type | Key signals | Journeys that follow |
 |-----------|-------------|---------------------|
@@ -238,6 +238,7 @@ Scores the collected signals against 7 site-type rules:
 | `blog-cms` | "read more", "author", "category", "min read" | Browse → Open article → Search → Categories |
 | `social` | "follow", "like", "feed", "profile", "notification" | Feed → Profile → Interact → Notify |
 | `fintech` | "balance", "transfer", "transaction", "send money" | Balance → Transfer → History → Receipt |
+| `ai-product` | "new chat", "send a message", "ai assistant", "stop generating", "copilot" (down-weighted when strong shop/booking/fintech signals are also present) | Prompt → Response appears → Empty prompt → Slow/streaming state → Light prompt-injection probe |
 | `generic` | no strong signals (score < 0.3) | Navigation + form validation only |
 
 Confidence ≥ 0.3 → runs that site type's specific journey first, then all matrix tests.
@@ -392,7 +393,7 @@ packages/
                                    # ALL_AREAS includes 'accessibility' (labels, keyboard, contrast)
   agent-core/src/
     intelligence/
-      classify-site.ts             # classifySite(signals) → SiteClassification (7 site types)
+      classify-site.ts             # classifySite(signals) → SiteClassification (8 site types + generic)
     planner/index.ts               # buildGenericPlan — ALL_AREAS excludes accessibility by default
                                    # (no FLOW_HANDLERS yet; still selectable explicitly)
                                    # areaForFlow() handles accessibility area
@@ -474,7 +475,7 @@ packages/
                                    #   across all sessions, not per-session).
       elementFingerprint()         # helpers.ts — stable-ish id/data-testid/name/tag+text+index
                                    #   fingerprint for a Locator, used for finding dedup
-      journey.ts                   # 7 site-type journeys + generic fallback
+      journey.ts                   # 8 site-type journeys + generic fallback
                                    # findSemanticButton(): 4-strategy discovery (testid→aria→text→class)
                                    # Multi-language button text (EN/FR/DE/ES/IT)
                                    # gateIfSensitive(): pauses before Send/Share/Pay/Transfer/Invite
@@ -595,6 +596,21 @@ a single AI-vision read or a single fuzzy pattern match gets `heuristic` and sho
 spot-checked. See [non-bug-patterns.ts](../../../packages/explorer-ui/src/flows/non-bug-patterns.ts)
 for the growing library referenced below.
 
+- **Outcome checks added (A17–A22, 2026-10-27)** — every existing check asked whether an action
+  did *something* (no crash, value changed, page loaded, badge moved once). None asked whether it
+  did the *right* thing, so a sort that reorders the wrong way, an item link that opens a
+  different item, a field whose keystrokes land in its neighbour, several products sharing one
+  photo, or an order total that doesn't add up all passed silently (all present on SauceDemo's
+  `problem_user`/`error_user`). New flows `sort-verification`, `link-target-consistency`,
+  `input-retention`, `duplicate-images` and `cart-integrity` share one structural list detector
+  (`list-items.ts` — sibling grouping by tag + class signature, no site-specific selectors) and
+  test spread-out items rather than item 0 only. Native `alert()`/`confirm()` pop-ups, which
+  Playwright had been dismissing silently, are now recorded by `dialog-tracker.ts` and reported
+  when their text describes a failure. Verified against a local fixture shop in a bugged and a
+  clean variant: every planted bug reported, zero findings on the clean variant (an early
+  version mis-read order-summary rows as cart items — fixed by excluding total/tax rows and only
+  trusting the item sum when the rows match the cart exactly).
+
 - **`idempotency` and `security-headers` were scheduled but silently dead** — both looked fully
   wired (present in `FLOW_CLASSES`, scheduled by the planner) but had no real executor path:
   `idempotency` had no branch in `api-executor.ts`, and `security-headers` is a UI-only check
@@ -641,3 +657,20 @@ for the growing library referenced below.
   matched `type="text"`/`type="search"`/untyped inputs and `<textarea>`, missing `type="tel"`,
   `type="number"`, `type="email"`, `type="password"`, and `type="url"` — common real-world
   types (e.g. a phone-number field) it silently never touched. Widened to cover all of them.
+- **Instructional text misread as an error message** — `findVisibleErrorText()` (`helpers.ts`)
+  matched broad structural/ARIA selectors (`[role="alert"]`, `[aria-live="assertive"]`,
+  `[class*="validation"]`) and trusted ANY visible text inside them as "the error," with no
+  check on whether the text actually sounded like one. A real site's "Supports .csv files,
+  maximum no. of rows allowed would be 100" upload hint — correctly placed in an ARIA-live
+  region so a screen reader announces it — got reported as an error on a perfectly normal tab.
+  Fixed two ways: (1) selectors whose own name already asserts "error" (`[data-test*="error"]`,
+  `.invalid-feedback`, `[class*="field-error"]`, the final `[class*="error"]` fallback) are
+  trusted on structure alone; purely generic ARIA/structural selectors additionally require the
+  matched text to contain an error-sounding keyword (invalid/required/failed/cannot/denied/...);
+  (2) added `upload-instructions` to the shared `NON_BUG_PATTERNS` library
+  ([non-bug-patterns.ts](../../../packages/explorer-ui/src/flows/non-bug-patterns.ts)) and wired
+  `findVisibleErrorText()` to check it on every tier, not just the keyword-gated one — a class
+  literally named `.error` wrapping the same upload-instructions text would still have been a
+  false positive without that second fix, since the "name already asserts error" tier had no
+  content check at all. One shared pattern file, checked everywhere, instead of two different
+  "is this really a problem" heuristics duplicating (and silently disagreeing with) each other.

@@ -30,6 +30,11 @@ export const NON_BUG_PATTERNS: NonBugPattern[] = [
     label: 'Generic empty/loading state',
     pattern: /(no data (yet|available)|nothing (here|to show)|please wait|loading\.{0,3}$)/i,
   },
+  {
+    id: 'upload-instructions',
+    label: 'File upload format/size instructions',
+    pattern: /(supports?\s+\.\w+\s+files?|max(?:imum)?\s*(?:no\.?|number)?\s*of\s+rows|accepted file types?|file size limit)/i,
+  },
 ];
 
 /** Label of the first matching known non-bug pattern for this text, or null if none apply. */

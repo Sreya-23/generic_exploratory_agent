@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { computeHealthScore, type SessionState } from '@qa/shared';
+import { bucketFindings, sortFindingsForDisplay, computeHealthScore, explainFinding, type SessionState } from '@qa/shared';
 import { generateSessionReport, type SessionReport } from './generate-report.js';
 
 export { generateSessionReport, dedupeFindings } from './generate-report.js';
@@ -35,13 +35,19 @@ export async function saveSessionState(
 /** Full session report (Markdown) */
 export function generateSessionReportMarkdown(state: SessionState): string {
   const health = computeHealthScore(state.findings);
+  const { confirmedDefects, potentialDefects, observations, executionErrors } = bucketFindings(
+    state.findings,
+  );
+  const bugFindings = sortFindingsForDisplay([...confirmedDefects, ...potentialDefects]);
   const lines: string[] = [
     `# Exploration Report`,
     ``,
     `**Session:** ${state.id}`,
     `**Target:** ${state.config.targetUrl}`,
     `**Status:** ${state.status}`,
-    `**Findings:** ${state.findings.length}`,
+    `**Findings:** ${bugFindings.length} (${confirmedDefects.length} confirmed, ${potentialDefects.length} potential — pending validation)`,
+    `**Agent execution issues:** ${executionErrors.length} (not counted as defects)`,
+    `**Observations:** ${observations.length} (not defects)`,
     `**Completed:** ${state.updatedAt}`,
     ``,
     `## Health Score: ${health.grade} (${health.score}/100)`,
@@ -50,20 +56,24 @@ export function generateSessionReportMarkdown(state: SessionState): string {
     ``,
   ];
 
-  lines.push(`## Findings (${state.findings.length})`);
-  if (state.findings.length === 0) {
+  lines.push(`## Findings (${bugFindings.length})`);
+  if (bugFindings.length === 0) {
     lines.push('_No findings recorded._');
   } else {
-    for (const f of state.findings) {
-      lines.push(`### [${f.severity.toUpperCase()}] ${f.title}`);
-      lines.push(`- **Area:** ${f.area}`);
+    for (const f of bugFindings) {
+      const plain = explainFinding(f);
+      lines.push(`### [${f.severity.toUpperCase()}] ${plain.headline}`);
+      lines.push(`- **What's wrong:** ${plain.summary}`);
+      lines.push(`- **Why it matters:** ${plain.whyItMatters}`);
+      lines.push(`- **Area:** ${plain.areaLabel} (\`${f.area}\`)`);
+      lines.push(`- **Check result:** ${f.title}`);
       if (f.taskId) lines.push(`- **Task:** ${f.taskId}`);
       if (f.quarantineReason) lines.push(`- **Quarantined:** ${f.quarantineReason}`);
       if (f.fingerprint) lines.push(`- **Fingerprint:** \`${f.fingerprint}\``);
       lines.push(`- **Expected:** ${f.expected}`);
       lines.push(`- **Actual:** ${f.actual}`);
       if (f.steps.length) {
-        lines.push(`- **Steps to reproduce:**`);
+        lines.push(`- **How to see it yourself:**`);
         for (const [i, s] of f.steps.entries()) lines.push(`  ${i + 1}. ${s}`);
       }
       lines.push('');

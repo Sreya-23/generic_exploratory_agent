@@ -16,6 +16,7 @@ import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask, Severity } from '@qa/shared';
 import { callLLMParts, hasAnyLLMKey, activeLLMProvider, type LLMPart } from '@qa/shared';
 import { waitForRealContent, isLoginWallPage } from './helpers.js';
+import { crossCheckVisualClaim, normalizeCategory, quotedText, type CrossCheckResult } from './visual-crosscheck.js';
 
 // Reads a cheap, coarse "content shape" signal — not proof the page is done loading, but
 // enough to tell whether it's still actively changing right now. Used by waitForStableContent
@@ -60,7 +61,7 @@ const VISUAL_REVIEW_PROMPT = `You are a QA engineer reviewing a screenshot of a 
 7. Unstyled content suggesting a stylesheet failed to load
 8. Elements positioned off-screen, clipped by a parent container, or rendered behind another element
 9. Inconsistent design (mismatched button styles/fonts within the same view)
-10. Leftover placeholder/dev content — ONLY unambiguous markers: literal "Lorem ipsum", "TODO"/"FIXME", unresolved double-curly-brace or dollar-brace template syntax, or a value that is literally the word "test"/"placeholder"/"undefined"/"null" where real content should be. Do NOT flag real-looking data just because it looks short, unusual, or unfamiliar to you (e.g. a person's name, a group/team name, an internal code) — you cannot tell fake data from real data by vibes alone, only by these concrete unresolved-template/placeholder-literal signals.
+10. Leftover placeholder/dev content — ONLY unambiguous markers: literal "Lorem ipsum", "TODO"/"FIXME", unresolved double-curly-brace or dollar-brace template syntax, or a value that is literally the word "test"/"placeholder"/"undefined"/"null" where real content should be. Do NOT flag real-looking data just because it looks short, unusual, or unfamiliar to you (e.g. a person's name, a group/team name, an internal code) — you cannot tell fake data from real data by vibes alone, only by these concrete unresolved-template/placeholder-literal signals. The placeholder must be the ENTIRE visible value of the element: a real product or page name that merely contains a word like "Test" (e.g. "Test.allTheThings() T-Shirt") is NOT a placeholder.
 11. Layout issues suggesting broken RTL/i18n handling (mirrored icons, misaligned translated text)
 12. Charts/graphs that render empty, garbled, or with overlapping labels
 13. Icon glyphs rendering as a box/question-mark (icon font failed to load)
@@ -70,13 +71,16 @@ Only report things you can actually SEE going wrong in this specific image — d
 Do NOT flag a pagination or range indicator — text like "1-5 of 18", "1 - 5 / 18 Groups", "Page 1 of 4" — as truncated, cut-off, or incomplete content, even when it sits next to a small arrow/chevron control. That is a standard, deliberate paging pattern: the arrow is how a user sees the remaining items, not evidence that content failed to load. You cannot tell from a static screenshot alone whether that arrow is functional, so do not guess that it isn't — only flag it if something about its own rendering is visibly broken (e.g. the arrow icon itself is a broken box glyph).
 
 You may be given more than one screenshot in this request, each preceded by a line reading "--- SCREENSHOT N — page: <url> ---". Review every screenshot independently against the same categories above. Respond with ONLY a JSON array (no markdown fences, no commentary) covering issues found across ALL screenshots combined, each element shaped as:
-{"page": "<the exact url from the SCREENSHOT label this issue was found on>", "issue": "<specific, concrete description of what's wrong and where in the image>", "severity": "low"|"medium"|"high"}
+{"page": "<the exact url from the SCREENSHOT label this issue was found on>", "issue": "<specific, concrete description of what's wrong and where in the image>", "category": "overlap"|"clipped"|"contrast"|"image"|"misaligned"|"inconsistent"|"broken-state"|"unstyled"|"placeholder"|"other", "element_text": "<the exact visible text of the element involved (or of the item card it belongs to), copied from the screenshot, or empty if none>", "severity": "low"|"medium"|"high"}
+Each issue you report is automatically re-measured against the live page (contrast ratios, element boxes, image proportions, overflow) — so be precise about element_text, and do not report anything you are not sure you can see.
 If you find nothing wrong in any screenshot, respond with exactly: []`;
 
 interface VisualIssue {
   page?: string;
   issue: string;
   severity: string;
+  category?: string;
+  element_text?: string;
 }
 
 function extractJsonArray(text: string): VisualIssue[] {
@@ -107,8 +111,14 @@ function normalizeSeverity(raw: string): Severity {
 // back (routine while iterating on this agent) can otherwise burn quota fast for very
 // little new signal, since a site's UI doesn't visually change between two runs minutes
 // apart. All limits are checked BEFORE the API call, so a skip here costs nothing.
-const DAILY_CALL_LIMIT = Number(process.env.GEMINI_VISUAL_REVIEW_DAILY_LIMIT ?? 15);
-const COOLDOWN_HOURS = Number(process.env.GEMINI_VISUAL_REVIEW_COOLDOWN_HOURS ?? 6);
+// These limits apply to whichever AI provider is configured (Gemini, OpenAI or Anthropic). The
+// GEMINI_-prefixed names are kept for existing .env files; the provider-neutral names win if set.
+const DAILY_CALL_LIMIT = Number(
+  process.env.VISUAL_REVIEW_DAILY_LIMIT ?? process.env.GEMINI_VISUAL_REVIEW_DAILY_LIMIT ?? 15,
+);
+const COOLDOWN_HOURS = Number(
+  process.env.VISUAL_REVIEW_COOLDOWN_HOURS ?? process.env.GEMINI_VISUAL_REVIEW_COOLDOWN_HOURS ?? 6,
+);
 // Smoke/chaos depth is meant to be a fast, cheap sanity pass — an AI call doesn't belong
 // there. Only standard/deep runs (the ones you'd actually review a full report from) spend
 // the quota.
@@ -173,7 +183,7 @@ export async function runVisualReview(
   const tracker = loadUsageTracker(ctx);
 
   if (tracker.callsToday >= DAILY_CALL_LIMIT) {
-    ctx.onLog(`[VisualReview] Daily Gemini call limit reached (${DAILY_CALL_LIMIT}) — skipping to protect quota`);
+    ctx.onLog(`[VisualReview] Daily AI visual-review limit reached (${DAILY_CALL_LIMIT}) — skipping to protect quota (raise VISUAL_REVIEW_DAILY_LIMIT in .env)`);
     return;
   }
 
@@ -183,7 +193,7 @@ export async function runVisualReview(
     if (hoursSince < COOLDOWN_HOURS) {
       ctx.onLog(
         `[VisualReview] ${origin} was already reviewed ${hoursSince.toFixed(1)}h ago ` +
-          `(cooldown: ${COOLDOWN_HOURS}h) — skipping, UI is unlikely to have changed`,
+          `(cooldown: ${COOLDOWN_HOURS}h, set VISUAL_REVIEW_COOLDOWN_HOURS=0 in .env to disable) — skipping, UI is unlikely to have changed`,
       );
       return;
     }
@@ -278,35 +288,76 @@ export async function runVisualReview(
       return;
     }
 
+    // Re-measure every claim the DOM can check before reporting it (see visual-crosscheck.ts).
+    // AI-only claims that can't be measured are kept but capped at low severity; claims the
+    // measurement contradicts are dropped and logged, never reported.
+    let reported = 0;
+    let dropped = 0;
+    const checkPages = new Map<string, Page>();
+    const pageFor = async (url: string): Promise<Page | null> => {
+      if (url === pageUrl) return page;
+      if (checkPages.has(url)) return checkPages.get(url)!;
+      const p = await page.context().newPage().catch(() => null);
+      if (!p) return null;
+      const ok = await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 }).then(() => true).catch(() => false);
+      if (!ok) return null;
+      await waitForRealContent(p).catch(() => {});
+      checkPages.set(url, p);
+      return p;
+    };
+
     for (const item of issues) {
       const matched =
         images.find((img) => item.page && img.url === item.page) ??
         images.find((img) => item.page && (img.url.includes(item.page) || item.page.includes(img.url))) ??
         images[0];
+      const category = normalizeCategory(item.category, item.issue);
+      const elementText = quotedText(item.issue, item.element_text);
+      const target = await pageFor(matched.url);
+      const check: CrossCheckResult = target
+        ? await crossCheckVisualClaim(target, category, elementText)
+        : { verdict: 'unverifiable', detail: 'page could not be reopened for measurement' };
+
+      if (check.verdict === 'contradicted') {
+        dropped++;
+        ctx.onLog(`[VisualReview] Dropped AI claim "${item.issue.slice(0, 100)}" — ${check.detail}`);
+        continue;
+      }
+      const aiSeverity = normalizeSeverity(item.severity);
+      // AI-only claims nobody could measure ("looks misaligned", "inconsistent font weight")
+      // were wrong far more often than right in real runs — usually a deliberate design choice
+      // (a bold heading, an outlined button). They're listed as info notes for a person to
+      // glance at, never as bugs. Only DOM-confirmed claims become defects.
+      const confirmed = check.verdict === 'confirmed';
+      const severity: Severity = confirmed ? (aiSeverity === 'high' ? 'medium' : aiSeverity) : 'info';
+      reported++;
       ctx.onFinding({
-        severity: normalizeSeverity(item.severity),
+        severity,
         area: 'UI-Visual',
-        title: `Visual issue: ${item.issue}`,
+        title: confirmed ? `Visual issue: ${item.issue}` : `AI suggestion to check (unconfirmed): ${item.issue}`,
         steps: [`Open ${matched.url}`, 'Visually inspect the rendered page'],
         expected: 'No visual rendering defects',
-        actual: item.issue,
+        actual: check.verdict === 'confirmed' ? `${item.issue} (measured: ${check.detail})` : item.issue,
         evidence: [matched.shotPath],
         reproRate: '1/1',
         automationCandidate: false,
         pageUrl: matched.url,
-        confidence: 'heuristic',
+        confidence: check.verdict === 'confirmed' ? 'verified' : 'heuristic',
         confidenceReason:
-          'Single AI-vision read of one screenshot, not cross-validated against a second signal — check the attached screenshot before treating as confirmed.' +
+          (check.verdict === 'confirmed'
+            ? `AI screenshot review, confirmed by a DOM measurement: ${check.detail}.`
+            : `Single AI-vision read of one screenshot that could not be re-measured (${check.detail}) — listed as a note, not a bug; check the attached screenshot.`) +
           (onLoginWall
             ? ' This session may not have completed login — verify this issue reproduces with a genuinely authenticated session, not just an auth-wall stub.'
             : ''),
       });
     }
+    for (const p of checkPages.values()) await p.close().catch(() => {});
 
-    ctx.onLog(`[VisualReview] Found ${issues.length} visual issue(s) via AI review`);
+    ctx.onLog(`[VisualReview] AI suggested ${issues.length} issue(s): ${reported} reported, ${dropped} dropped after measurement`);
   } catch (err) {
     // Network failure, timeout, malformed response — any of these should skip this ONE
     // flow, never affect the rest of the session.
-    ctx.onLog(`[VisualReview] Gemini visual review failed (${(err as Error).message.slice(0, 150)}) — skipping`);
+    ctx.onLog(`[VisualReview] AI visual review failed (${(err as Error).message.slice(0, 150)}) — skipping`);
   }
 }

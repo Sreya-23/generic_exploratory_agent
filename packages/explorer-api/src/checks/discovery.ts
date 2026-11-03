@@ -1,5 +1,5 @@
 import type { ExecutorContext } from '@qa/shared';
-import { probe, mapWithConcurrency, resolveEndpointPaths, writeApiEvidence, formatEvidence, COMMON_PATHS } from '../probe-helpers.js';
+import { probe, mapWithConcurrency, resolveEndpointPaths, writeApiEvidence, formatEvidence, COMMON_PATHS, filterPathsByScope } from '../probe-helpers.js';
 
 // Checklist §1 — "Identify high-risk APIs such as payment, booking, transfer, delete, password
 // and user-management APIs." Purely a classification tag on an already-discovered endpoint —
@@ -48,14 +48,26 @@ export async function discoverFromOpenApiSpec(ctx: ExecutorContext): Promise<num
   }
   if (entries.length === 0) return 0;
 
-  ctx.discoveredApiEndpoints = [...new Set([...(ctx.discoveredApiEndpoints ?? []), ...entries])];
-  ctx.onLog(`[API-Discovery] Parsed ${entries.length} endpoint(s) from OpenAPI spec at ${specUrl}`);
+  // Unlike crawl-harvested endpoints (filtered for free by the UI scope restriction — see
+  // navigation.ts), a spec is fetched directly over HTTP with no browsing involved at all, so a
+  // scope restriction has to be applied here explicitly or spec-derived endpoints would bypass
+  // it entirely.
+  const scopedEntries = filterPathsByScope(entries, ctx.config.allowedSections);
+  if (scopedEntries.length < entries.length) {
+    ctx.onLog(
+      `[API-Discovery] Scope restriction active — ${scopedEntries.length}/${entries.length} spec endpoint(s) fall within the allowed sections`,
+    );
+  }
+  if (scopedEntries.length === 0) return 0;
 
-  const highRisk = entries.filter((e) => classifyEndpointRisk(e) === 'high-risk');
+  ctx.discoveredApiEndpoints = [...new Set([...(ctx.discoveredApiEndpoints ?? []), ...scopedEntries])];
+  ctx.onLog(`[API-Discovery] Parsed ${scopedEntries.length} endpoint(s) from OpenAPI spec at ${specUrl}`);
+
+  const highRisk = scopedEntries.filter((e) => classifyEndpointRisk(e) === 'high-risk');
   if (highRisk.length > 0) {
     ctx.onLog(`[API-Discovery] ${highRisk.length} endpoint(s) classified high-risk (payment/delete/password/admin/etc): ${highRisk.slice(0, 10).join(', ')}`);
   }
-  return entries.length;
+  return scopedEntries.length;
 }
 
 export async function probeCommonEndpoints(

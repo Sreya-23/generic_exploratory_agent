@@ -27,7 +27,7 @@ import {
   fingerprintFinding,
   loadPreviousSessionFindings,
 } from '../reporter/finding-diff.js';
-import { UiExecutor, probeAuth, performSessionLogin, runEmptyCredentialLoginCheck } from '@qa/explorer-ui';
+import { UiExecutor, probeAuth, performSessionLogin, runEmptyCredentialLoginCheck, loadSiteCache } from '@qa/explorer-ui';
 import { ApiExecutor } from '@qa/explorer-api';
 import { ChaosExecutor } from '@qa/chaos-engine';
 
@@ -84,7 +84,7 @@ const executors: BaseExecutor[] = [new UiExecutor(), new ApiExecutor(), new Chao
 // browser" or "this area is split across two executors" — this override map handles both
 // without touching the .areas arrays, which would risk misrouting every OTHER flow class
 // already working correctly through them.
-const FLOW_CLASS_EXECUTOR_OVERRIDE: Record<string, 'ui' | 'api' | 'chaos'> = {
+export const FLOW_CLASS_EXECUTOR_OVERRIDE: Record<string, 'ui' | 'api' | 'chaos'> = {
   'security-headers': 'ui',
   'schema-drift': 'api',
   'golden-path': 'ui',
@@ -313,6 +313,36 @@ export class SessionOrchestrator {
     state.progress = { completedTasks: 0, totalTasks: state.plan.tasks.length, percent: 0 };
     state.status = 'running';
     state.authState = 'ready';
+
+    // Per-hostname nav-structure memory from a previous crawl of this exact site — pre-seed
+    // classification/routes now so the knowledge is available from the very first task, and
+    // hand the full entry to navigation.ts (via ctx.siteCacheHit in runTasks) so it can skip
+    // re-discovering pages it already knows about instead of walking the whole site again.
+    try {
+      const hostname = new URL(state.config.targetUrl).hostname;
+      const siteCacheDir = join(sessionsDir, '..', 'site-cache');
+      const cacheHit = await loadSiteCache(siteCacheDir, hostname);
+      if (cacheHit) {
+        state.siteCacheHit = cacheHit;
+        state.discoveredRoutes = [...new Set([...(state.discoveredRoutes ?? []), ...cacheHit.discoveredRoutes])];
+        state.discoveredApiEndpoints = [...new Set([...(state.discoveredApiEndpoints ?? []), ...cacheHit.discoveredApiEndpoints])];
+        if (cacheHit.classification) state.classification = cacheHit.classification;
+        this.emit({
+          type: 'log',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          payload: {
+            message: `[SiteCache] Found known structure for ${hostname} from a crawl on ${cacheHit.lastCrawledAt} (${cacheHit.pages.length} page(s)) — navigation will reuse it instead of rediscovering from scratch`,
+          },
+        });
+        if (cacheHit.classification) {
+          this.emit({ type: 'site:classified', sessionId, timestamp: new Date().toISOString(), payload: cacheHit.classification });
+        }
+      }
+    } catch {
+      // A missing/corrupt cache is never load-bearing — just explore fresh as if there were none.
+    }
+
     await saveSessionState(sessionsDir, state);
 
     // ── Pre-session login (once, shared across all tasks) ─────────────────────
@@ -508,6 +538,7 @@ export class SessionOrchestrator {
         discoveredRoutes: state.discoveredRoutes,
         environmentChecks: state.environmentChecks,
         accessMap: state.accessMap,
+        siteCacheHit: state.siteCacheHit,
         envDegraded: consecutiveTimeoutFailures >= ENV_DEGRADED_THRESHOLD,
         onFinding: (partial) => {
           const withFp = {
@@ -594,28 +625,44 @@ export class SessionOrchestrator {
           const signals = (raw as unknown as { _rawSignals?: SiteIntelligenceSignals })._rawSignals;
           if (!signals) return;
 
-          // The deterministic rule set is always computed first — it's free, synchronous,
-          // and is exactly what gets used if the AI call below is unavailable, slow, or
-          // returns something we can't validate. This is a strict upgrade path, never a
-          // replacement: classifySite() must keep working standalone regardless of Gemini.
-          const ruleBased: SiteClassification = classifySite(signals);
-          const aiClassification = await classifySiteWithAI(signals).catch(() => null);
-          const classification = aiClassification ?? ruleBased;
+          // A per-hostname cache hit (pre-seeded in beginExploration) already settled this for
+          // the exact same site — skip the AI/rule-based recompute (saving the LLM call) and
+          // reuse what we already know, rather than redoing work a previous crawl already did.
+          let classification: SiteClassification;
+          if (state.siteCacheHit?.classification) {
+            classification = state.siteCacheHit.classification;
+            this.emit({
+              type: 'log',
+              sessionId,
+              timestamp: new Date().toISOString(),
+              payload: {
+                message: `[Classify] Reusing cached classification from a previous crawl of this site: ${classification.siteType} (${Math.round(classification.confidence * 100)}%) — skipping re-classification`,
+              },
+            });
+          } else {
+            // The deterministic rule set is always computed first — it's free, synchronous,
+            // and is exactly what gets used if the AI call below is unavailable, slow, or
+            // returns something we can't validate. This is a strict upgrade path, never a
+            // replacement: classifySite() must keep working standalone regardless of Gemini.
+            const ruleBased: SiteClassification = classifySite(signals);
+            const aiClassification = await classifySiteWithAI(signals).catch(() => null);
+            classification = aiClassification ?? ruleBased;
 
-          this.emit({
-            type: 'log',
-            sessionId,
-            timestamp: new Date().toISOString(),
-            payload: {
-              message: aiClassification
-                ? `[Classify] Using AI (${activeLLMProvider() ?? 'configured provider'}) classification: ${classification.siteType} (${Math.round(classification.confidence * 100)}%)`
-                : `[Classify] Using rule-based classification: ${classification.siteType} (${Math.round(classification.confidence * 100)}%) — ${
-                    hasAnyLLMKey()
-                      ? 'AI classification unavailable or invalid this run'
-                      : 'no LLM API key configured'
-                  }`,
-            },
-          });
+            this.emit({
+              type: 'log',
+              sessionId,
+              timestamp: new Date().toISOString(),
+              payload: {
+                message: aiClassification
+                  ? `[Classify] Using AI (${activeLLMProvider() ?? 'configured provider'}) classification: ${classification.siteType} (${Math.round(classification.confidence * 100)}%)`
+                  : `[Classify] Using rule-based classification: ${classification.siteType} (${Math.round(classification.confidence * 100)}%) — ${
+                      hasAnyLLMKey()
+                        ? 'AI classification unavailable or invalid this run'
+                        : 'no LLM API key configured'
+                    }`,
+              },
+            });
+          }
 
           state.classification = classification;
           state.updatedAt = new Date().toISOString();
@@ -646,7 +693,9 @@ export class SessionOrchestrator {
                 payload: {
                   message: knowledge.isNew
                     ? `[Knowledge] First "${classification.siteType}"-category site seen (${hostname}) — captured a new application walkthrough doc for this category`
-                    : `[Knowledge] Reusing existing "${classification.siteType}"-category walkthrough doc (captured from a previously-seen site of this kind)`,
+                    : knowledge.refreshed
+                      ? `[Knowledge] Refreshed "${classification.siteType}"-category doc from ${knowledge.poolSize} pooled sites (threshold reached since last refresh)`
+                      : `[Knowledge] Reusing existing "${classification.siteType}"-category walkthrough doc (${knowledge.poolSize} site(s) pooled so far, captured from a previously-seen site of this kind)`,
                 },
               });
             }

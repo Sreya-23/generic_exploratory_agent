@@ -7,7 +7,16 @@ import type {
   SessionEvent,
   SessionState,
 } from '@qa/shared';
+import { resultTypeOf } from '@qa/shared';
 import { mergeCredentials, parseAuthFields, credentialsComplete, effectiveAuthState, authPromptForState, detectAuthCorrection, clearAuthField } from './auth-chat.js';
+
+/** Live narration must agree with the final report's counts (same resultTypeOf classification),
+ *  not just echo raw session.findings.length — otherwise a mid-run "60 findings" message and a
+ *  completed-report "55 findings" read as a bug even though both were "correct" by their own
+ *  un-shared definition. Agent/infra failures (timeouts, crashed steps) are excluded here too. */
+function realFindings(findings: Finding[]): Finding[] {
+  return findings.filter((f) => resultTypeOf(f) !== 'execution-error');
+}
 
 /** Parse key:value extras from free-form text. Returns null if nothing found. */
 function parseExtras(text: string, existing?: Record<string, string>): Record<string, string> | null {
@@ -82,11 +91,12 @@ export function sessionEventToChatMessage(event: SessionEvent): ChatMessage | nu
 
     case 'session:completed': {
       const s = event.payload as SessionState;
-      const critical = s.findings.filter((f) => f.severity === 'critical').length;
-      const high = s.findings.filter((f) => f.severity === 'high').length;
+      const real = realFindings(s.findings);
+      const critical = real.filter((f) => f.severity === 'critical').length;
+      const high = real.filter((f) => f.severity === 'high').length;
       return msg(
         'assistant',
-        `✅ Exploration complete — **${s.findings.length} findings** recorded (${critical} critical, ${high} high).` +
+        `✅ Exploration complete — **${real.length} findings** recorded (${critical} critical, ${high} high).` +
           `\n\nOpen the **Report** page to view the full write-up, or download Markdown / HTML.`,
         { kind: 'status' },
       );
@@ -193,7 +203,7 @@ export function processLiveMessage(
     messages.push(
       msg(
         'assistant',
-        `**Status:** ${session.status}\n**Progress:** ${session.progress.percent}% (${session.progress.completedTasks}/${session.progress.totalTasks})\n**Findings:** ${session.findings.length}`,
+        `**Status:** ${session.status}\n**Progress:** ${session.progress.percent}% (${session.progress.completedTasks}/${session.progress.totalTasks})\n**Findings:** ${realFindings(session.findings).length}`,
         { kind: 'status' },
       ),
     );
@@ -210,12 +220,13 @@ export function processLiveMessage(
         ),
       );
     } else {
-      const critical = session.findings.filter((f) => f.severity === 'critical').length;
-      const high = session.findings.filter((f) => f.severity === 'high').length;
+      const real = realFindings(session.findings);
+      const critical = real.filter((f) => f.severity === 'critical').length;
+      const high = real.filter((f) => f.severity === 'high').length;
       messages.push(
         msg(
           'assistant',
-          `📋 **${session.findings.length} findings** (${critical} critical, ${high} high).\nOpen [/report/${session.id}](/report/${session.id}) for the full report, or export Markdown / HTML from that page.`,
+          `📋 **${real.length} findings** (${critical} critical, ${high} high).\nOpen [/report/${session.id}](/report/${session.id}) for the full report, or export Markdown / HTML from that page.`,
           { kind: 'status' },
         ),
       );
@@ -293,11 +304,12 @@ export function processLiveMessage(
   }
 
   if (/findings|issues|bugs/.test(text)) {
+    const real = realFindings(session.findings);
     messages.push(
       msg(
         'assistant',
-        session.findings.length
-          ? `Found **${session.findings.length}** issues. Say "show critical" for top ones.`
+        real.length
+          ? `Found **${real.length}** issues. Say "show critical" for top ones.`
           : 'No findings yet.',
         { kind: 'status' },
       ),

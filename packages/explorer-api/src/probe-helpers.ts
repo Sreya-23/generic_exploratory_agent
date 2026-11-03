@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { ExecutorContext } from '@qa/shared';
+import type { ExecutorContext, ScopeSection } from '@qa/shared';
 
 let evidenceCounter = 0;
 
@@ -213,6 +213,30 @@ export const PUBLIC_ENDPOINTS = new Set(['/health', '/api/health', '/api/status'
 export const COMMON_PATHS = ['/api', '/api/v1', '/api/health', '/health', '/api/users', '/api/status'];
 
 /**
+ * Keep only paths that plausibly belong to an allowed scope section — best-effort, since a
+ * guessed/OpenAPI-spec path has no UI label to match against directly, unlike a crawl-discovered
+ * endpoint (which inherits the crawler's own scope filtering for free, see navigation.ts). A
+ * path is kept if it contains one of the allowed section/sub-section names as a substring
+ * (normalized to alphanumerics) — e.g. an allowed "Dashboard" section keeps "/api/dashboard" and
+ * "/api/v1/dashboard/summary". `allowedSections` undefined/empty is a no-op (no restriction).
+ * Deliberately conservative: when a restriction IS set, an unmatched path is DROPPED rather than
+ * probed — confidentiality is the reason this filter exists at all, so an ambiguous guess should
+ * never win by default.
+ */
+export function filterPathsByScope(paths: string[], allowedSections?: ScopeSection[]): string[] {
+  if (!allowedSections?.length) return paths;
+  const keywords = allowedSections
+    .flatMap((s) => [s.section, ...(s.subSections ?? [])])
+    .map((k) => k.toLowerCase().replace(/[^a-z0-9]+/g, ''))
+    .filter(Boolean);
+  if (keywords.length === 0) return paths;
+  return paths.filter((p) => {
+    const normalized = p.toLowerCase().replace(/[^a-z0-9/]+/g, '');
+    return keywords.some((kw) => normalized.includes(kw));
+  });
+}
+
+/**
  * Returns paths to probe, preferring those actually discovered by recon
  * from the site's real network traffic. Falls back to generic guesses only
  * when recon found nothing.
@@ -235,6 +259,13 @@ export function resolveEndpointPaths(ctx: ExecutorContext, fallback: string[]): 
       return unique;
     }
   }
-  ctx.onLog(`[API] No recon endpoints available — using ${fallback.length} generic path guesses`);
-  return fallback;
+  const scoped = filterPathsByScope(fallback, ctx.config.allowedSections);
+  if (ctx.config.allowedSections?.length) {
+    ctx.onLog(
+      `[API] No recon endpoints available — ${scoped.length}/${fallback.length} generic path guesses fall within the allowed scope`,
+    );
+  } else {
+    ctx.onLog(`[API] No recon endpoints available — using ${fallback.length} generic path guesses`);
+  }
+  return scoped;
 }

@@ -7,12 +7,18 @@
     "apps/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
+    "build": "npm run build:packages && npm run build -w @qa/api -w @qa/web",
+    "build:packages": "npm run build -w @qa/shared && npm run build -w @qa/chat-agent -w @qa/explorer-api -w @qa/explorer-ui -w @qa/chaos-engine && npm run build -w @qa/agent-core",
+    "predev": "npm run build:packages",
     "dev": "concurrently \"npm run dev -w @qa/chat-agent\" \"npm run dev -w @qa/api\" \"npm run dev -w @qa/web\"",
     "dev:api": "npm run dev -w @qa/api",
     "dev:web": "npm run dev -w @qa/web",
     "setup": "bash scripts/setup.sh",
-    "ci:run": "node scripts/ci-run.mjs"
+    "ci:run": "node scripts/ci-run.mjs",
+    "matrix:check": "node scripts/check-exploration-matrix.mjs",
+    "matrix:fix": "node scripts/check-exploration-matrix.mjs --write",
+    "patterns:check": "node scripts/check-non-bug-patterns-sync.mjs",
+    "clean": "node -e \"for (const d of ['packages/shared','packages/chat-agent','packages/explorer-api','packages/explorer-ui','packages/chaos-engine','packages/agent-core','apps/api','apps/web']) { require('fs').rmSync(d+'/dist', {recursive:true, force:true}); require('fs').rmSync(d+'/tsconfig.tsbuildinfo', {force:true}); }\""
   },
   "devDependencies": {
     "concurrently": "^9.1.2",

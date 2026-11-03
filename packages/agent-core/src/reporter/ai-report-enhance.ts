@@ -25,7 +25,24 @@ const REQUEST_TIMEOUT_MS = 50000;
 export async function dedupeFindingsWithAI(findings: Finding[]): Promise<Finding[] | null> {
   if (!hasAnyLLMKey() || findings.length < 2 || findings.length > 60) return null; // skip on very large sets — not worth the token cost/latency for a report this size
 
-  const indexed = findings.map((f, i) => `${i}: [${f.area}] ${f.title}`).join('\n');
+  const pathOf = (u?: string) => {
+    try {
+      return u ? new URL(u).pathname : '';
+    } catch {
+      return '';
+    }
+  };
+  const indexed = findings
+    .map((f, i) => `${i}: [${f.area}] ${f.title}${f.pageUrl ? ` (page ${pathOf(f.pageUrl)})` : ''}`)
+    .join('\n');
+  // Hard limits on what the AI may merge, whatever it answers: same check area, and for
+  // per-page errors the same page — a login-page error and a dashboard error are two bugs even
+  // when the messages look alike (real case: "has_app of null" on /login was folded into a
+  // "map of undefined" on /payment-dropoffs). Never merge a bug into an info note or vice versa.
+  const compatible = (a: Finding, b: Finding) =>
+    a.area === b.area &&
+    (a.severity === 'info') === (b.severity === 'info') &&
+    (!a.pageUrl || !b.pageUrl || pathOf(a.pageUrl) === pathOf(b.pageUrl));
   const prompt = `You are reviewing a QA finding list for duplicates that describe the SAME underlying bug but weren't caught by exact-text matching — e.g. "Cannot read properties of null (reading 'map')" and "Cannot read properties of undefined (reading 'map')" on the same page are almost certainly one bug, not two. Be conservative: only group findings you're genuinely confident are the same root cause, not just the same general category (two different disabled-button findings on different buttons are NOT the same bug).
 
 FINDINGS (index: [area] title):
@@ -57,13 +74,14 @@ Respond with ONLY a JSON array of groups, each group a list of indices that are 
   for (const group of groups) {
     const [surviving, ...rest] = group;
     if (mergedAway.has(surviving)) continue; // already absorbed into an earlier group this pass
-    const altTitles = rest.filter((i) => !mergedAway.has(i)).map((i) => findings[i].title);
+    const mergeable = rest.filter((i) => !mergedAway.has(i) && compatible(findings[surviving], findings[i]));
+    const altTitles = mergeable.map((i) => findings[i].title);
     if (altTitles.length === 0) continue;
     result[surviving] = {
       ...result[surviving],
       actual: `${result[surviving].actual}\n\n(AI-grouped as the same underlying issue as: ${altTitles.join('; ')})`,
     };
-    for (const i of rest) mergedAway.add(i);
+    for (const i of mergeable) mergedAway.add(i);
   }
 
   return result.filter((_, i) => !mergedAway.has(i));

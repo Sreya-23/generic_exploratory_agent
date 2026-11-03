@@ -1,6 +1,29 @@
 import { useState } from 'react';
 import { evidenceUrl, raiseBugsInQualityPilot, type Finding } from '../../api/client';
-import { parseListLikeText } from '@qa/shared';
+import { parseListLikeText, isLikelyFalsePositive, explainFinding } from '@qa/shared';
+
+/** Same validation-status wording as the downloadable report (generate-report.ts) — "confirmed
+ *  / requires validation / possible false positive" rather than the internal 'verified'/
+ *  'heuristic' field names, so the live view and the final report never say different things. */
+function ValidationBadge({ finding }: { finding: Finding }) {
+  if (!finding.confidence) return null;
+  if (isLikelyFalsePositive(finding)) {
+    return (
+      <span className="confidence-badge flagged" title={finding.confidenceReason}>
+        🚩 Possible false positive
+      </span>
+    );
+  }
+  return finding.confidence === 'verified' ? (
+    <span className="confidence-badge verified" title={finding.confidenceReason}>
+      ✓ Confirmed
+    </span>
+  ) : (
+    <span className="confidence-badge heuristic" title={finding.confidenceReason}>
+      ⚠ Requires validation
+    </span>
+  );
+}
 
 /** Renders as a bulleted list when the text turns out to be a list crammed into one sentence
  *  (see parseListLikeText) — otherwise renders as the plain sentence it already is. */
@@ -34,6 +57,7 @@ export function FindingCard({ finding, sessionId }: { finding: Finding; sessionI
     finding.steps.length > 0 ? finding.steps : ['(no steps recorded)'];
   const screenshots = (finding.evidence ?? []).filter((e) => IMAGE_EXT.test(e));
   const rawEvidence = (finding.evidence ?? []).filter((e) => !IMAGE_EXT.test(e));
+  const plain = explainFinding(finding);
   const [raiseStatus, setRaiseStatus] = useState<'idle' | 'raising' | 'done' | 'error'>('idle');
   const [raiseMessage, setRaiseMessage] = useState('');
 
@@ -53,29 +77,26 @@ export function FindingCard({ finding, sessionId }: { finding: Finding; sessionI
     <article className={`finding-card ${SEVERITY_CLASS[finding.severity]}`}>
       <header>
         <span className="finding-severity">{finding.severity}</span>
-        <span className="finding-area">{finding.area}</span>
+        <span className="finding-area" title={`Check area: ${finding.area}`}>{plain.areaLabel}</span>
+        <ValidationBadge finding={finding} />
       </header>
-      <h3>{finding.title}</h3>
-      {finding.preconditions && (
-        <p className="finding-preconditions">
-          <strong>Preconditions:</strong> {finding.preconditions}
+      {/* Plain-English first, so anyone can read it; the technical detail is kept below. */}
+      <h3>{plain.headline}</h3>
+      <div className="finding-plain">
+        <p>
+          <strong>What's wrong:</strong> {plain.summary}
         </p>
-      )}
+        <p>
+          <strong>Why it matters:</strong> {plain.whyItMatters}
+        </p>
+      </div>
       <div className="finding-steps">
-        <strong>Steps to reproduce:</strong>
+        <strong>How to see it yourself:</strong>
         <ol>
           {steps.map((s, i) => (
             <li key={i}>{s}</li>
           ))}
         </ol>
-      </div>
-      <div className="finding-expected-actual">
-        <div className="finding-expected-actual-row">
-          <strong>Expected:</strong> <FindingText text={finding.expected} />
-        </div>
-        <div className="finding-expected-actual-row">
-          <strong>Actual:</strong> <FindingText text={finding.actual} />
-        </div>
       </div>
       {screenshots.length > 0 && (
         <div className="finding-evidence">
@@ -89,21 +110,50 @@ export function FindingCard({ finding, sessionId }: { finding: Finding; sessionI
           })}
         </div>
       )}
-      {rawEvidence.length > 0 && (
-        <div className="finding-evidence-raw">
-          {rawEvidence.map((path, i) => (
-            <a
-              key={i}
-              href={evidenceUrl(sessionId, path)}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="evidence-raw-link"
-            >
-              View raw request/response{rawEvidence.length > 1 ? ` #${i + 1}` : ''}
-            </a>
-          ))}
+      <details className="finding-technical">
+        <summary>Technical details</summary>
+        <p className="finding-preconditions">
+          <strong>Check result:</strong> {finding.title}
+        </p>
+        {finding.pageUrl && (
+          <p className="finding-preconditions">
+            <strong>Page:</strong> {finding.pageUrl}
+          </p>
+        )}
+        {finding.preconditions && (
+          <p className="finding-preconditions">
+            <strong>Preconditions:</strong> {finding.preconditions}
+          </p>
+        )}
+        <div className="finding-expected-actual">
+          <div className="finding-expected-actual-row">
+            <strong>Expected:</strong> <FindingText text={finding.expected} />
+          </div>
+          <div className="finding-expected-actual-row">
+            <strong>Actual:</strong> <FindingText text={finding.actual} />
+          </div>
         </div>
-      )}
+        {finding.confidenceReason && (
+          <p className="finding-preconditions">
+            <strong>How sure the agent is:</strong> {finding.confidenceReason}
+          </p>
+        )}
+        {rawEvidence.length > 0 && (
+          <div className="finding-evidence-raw">
+            {rawEvidence.map((path, i) => (
+              <a
+                key={i}
+                href={evidenceUrl(sessionId, path)}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="evidence-raw-link"
+              >
+                View raw request/response{rawEvidence.length > 1 ? ` #${i + 1}` : ''}
+              </a>
+            ))}
+          </div>
+        )}
+      </details>
       <footer>
         <span>Repro: {finding.reproRate}</span>
         {finding.automationCandidate && <span className="auto-badge">Automatable</span>}

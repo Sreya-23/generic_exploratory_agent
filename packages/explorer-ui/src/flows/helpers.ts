@@ -4,7 +4,8 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrowserContext, Locator, Page } from 'playwright';
-import type { ExecutorContext } from '@qa/shared';
+import type { ExecutorContext, ScopeSection } from '@qa/shared';
+import { matchesKnownNonBugPattern } from './non-bug-patterns.js';
 
 /**
  * Polls for real rendered content instead of trusting a fixed wait or a "title stopped
@@ -291,6 +292,41 @@ export function isRiskyActionLabel(buttonLabel: string): boolean {
   );
 }
 
+function normalizeSectionLabel(label: string): string {
+  return label.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * Is this top-level nav item (sidebar/tab label, e.g. "Dashboard") within the user's scope
+ * restriction? `allowedSections` undefined/empty means no restriction — everything is allowed,
+ * which keeps this a no-op for the common case where the user never set one up. Match is exact
+ * (case/whitespace-insensitive) rather than substring, so an allowed "Settings" doesn't
+ * accidentally also let through an unrelated "Account Settings".
+ */
+export function isSectionAllowed(label: string, allowedSections?: ScopeSection[]): boolean {
+  if (!allowedSections?.length) return true;
+  const norm = normalizeSectionLabel(label);
+  return allowedSections.some((s) => normalizeSectionLabel(s.section) === norm);
+}
+
+/**
+ * Is this sub-tab (e.g. "Overview" inside "Dashboard") within scope? `parentLabel` is the
+ * top-level section the tab was found under — required because the same bare tab text (e.g.
+ * "Overview") can legitimately exist under multiple different sections, so matching the tab
+ * label alone isn't enough (see the earlier false-positive class this codebase already hit
+ * with bare "Overview"/"Summary" labels). If the matching section lists no subSections, every
+ * tab under it is allowed (the whole section is in scope, unrestricted at the tab level).
+ */
+export function isSubTabAllowed(parentLabel: string, tabLabel: string, allowedSections?: ScopeSection[]): boolean {
+  if (!allowedSections?.length) return true;
+  const parentNorm = normalizeSectionLabel(parentLabel);
+  const section = allowedSections.find((s) => normalizeSectionLabel(s.section) === parentNorm);
+  if (!section) return false; // parent itself isn't in scope — shouldn't normally be reached
+  if (!section.subSections?.length) return true;
+  const tabNorm = normalizeSectionLabel(tabLabel);
+  return section.subSections.some((sub) => normalizeSectionLabel(sub) === tabNorm);
+}
+
 // Broader than modals.ts's own detection (which only cares about a modal it just opened
 // itself): this also has to catch a modal that was ALREADY open from a previous, unrelated
 // click — the case that actually causes cascading false positives. `[role="dialog"]`/
@@ -405,7 +441,18 @@ export async function gateIfSensitive(
   // Emit gate — pause and ask user
   const provided = ctx.onPreActionNeeded?.({
     type: actionType,
-    description: `"${buttonLabel}" — this will send a real communication or payment`,
+    description:
+      actionType === 'payment' || actionType === 'purchase'
+        ? `"${buttonLabel}" — this may charge money or place a real order`
+        : actionType === 'send_link'
+          ? `"${buttonLabel}" — this may send a real message, email or invite`
+          : /delete|destroy|remove/.test(label)
+            ? `"${buttonLabel}" — this may delete or remove data`
+            : /logout|sign ?out/.test(label)
+              ? `"${buttonLabel}" — this would end the logged-in session`
+              : /post|publish|tweet/.test(label)
+                ? `"${buttonLabel}" — this may publish content publicly`
+                : `"${buttonLabel}" — this may have a real, irreversible effect`,
     requiredExtras: [requiredKey],
     pageUrl: page.url(),
   });
@@ -418,6 +465,63 @@ export async function gateIfSensitive(
   }
 
   ctx.onLog(`[Gate] Skipped sensitive action "${buttonLabel}" — user did not provide required data`);
+  return false;
+}
+
+export interface WriteActionDetails {
+  action: 'create' | 'edit' | 'delete';
+  /** What's being acted on, e.g. the create/delete button's own label ("Add Member") */
+  entityLabel: string;
+  /** Human-readable summary of the exact data involved, e.g. `Name: "QA-CRUD-1729..."` or
+   * `Name: "QA-CRUD-1729..." → "QA-CRUD-1729...-edited"` for an edit. Shown verbatim in the
+   * chat prompt so the user sees precisely what's about to change before approving it. */
+  data: string;
+}
+
+/**
+ * Unconditional write-action confirmation for generic-crud-style flows — unlike
+ * gateIfSensitive() (which only gates labels matching known-risky patterns like payment/send,
+ * and never matches a plain "Create"/"Edit"/"Add" label), this ALWAYS asks before a Create,
+ * Edit, or Delete and always shows the exact data involved. Reuses the same
+ * onPreActionNeeded/extras mechanism as every other gate in this codebase: a `confirm_<action>`
+ * extra set to "yes" pre-approves future prompts of that action type for the rest of the
+ * session (consistent with how `card`/`recipient` already work for other gated actions), and
+ * an explicit "no" permanently declines without re-prompting — nothing is ever force-approved
+ * on the first ask.
+ */
+export async function confirmWriteAction(
+  page: Page,
+  ctx: ExecutorContext,
+  details: WriteActionDetails,
+): Promise<boolean> {
+  const extras = ctx.config.credentials?.extras ?? {};
+  const confirmKey = `confirm_${details.action}`;
+  const isAffirmative = (v: string | undefined) => /^(yes|true)$/i.test(v ?? '');
+
+  if (extras['_user_skip'] === 'true') {
+    ctx.onLog(`[Gate] ${details.action} skipped — user requested skip`);
+    return false;
+  }
+  if (isAffirmative(extras[confirmKey])) return true;
+
+  const verb = details.action === 'create' ? 'Create' : details.action === 'edit' ? 'Edit' : 'Delete';
+  const provided = ctx.onPreActionNeeded?.({
+    type: details.action === 'delete' ? 'delete' : 'generic',
+    description: `${verb} "${details.entityLabel}" — ${details.data}`,
+    requiredExtras: [confirmKey],
+    pageUrl: page.url(),
+  });
+
+  if (provided && isAffirmative(provided[confirmKey])) {
+    ctx.config.credentials = ctx.config.credentials ?? { type: 'none' };
+    ctx.config.credentials.extras = { ...extras, ...provided };
+    return true;
+  }
+
+  ctx.onLog(
+    `[Gate] ${verb} "${details.entityLabel}" (${details.data}) needs confirmation — ` +
+    `reply \`${confirmKey}: yes\` in chat to allow it — skipped for now`,
+  );
   return false;
 }
 
@@ -488,27 +592,42 @@ export async function isLoginWallPage(page: Page): Promise<boolean> {
  * permanently-present but empty error containers (e.g. Sauce Demo's
  * `<div class="error-message-container">` which is always in the DOM).
  */
+// Selectors whose NAME already asserts "this is an error" — an app that writes
+// `data-test="error-message"` or `class="field-error"` is telling us directly what the
+// element is for, so structure alone (plus having real text) is enough to trust it.
+const NAME_ASSERTS_ERROR = [
+  '[data-test*="error"]',
+  '[data-testid*="error"]',
+  '[data-test*="alert"]',
+  '.invalid-feedback',
+  '.mat-error',
+  '[class*="field-error"]',
+  '[class*="form-error"]',
+];
+
+// Generic ARIA/structural announcement mechanisms — legitimately used for ANY important
+// message, not just errors (a file-upload format hint, a character-count notice, a success
+// toast can all correctly live in a `role="alert"`/`aria-live="assertive"` region so a screen
+// reader announces them). A real site produced exactly this false positive: "Supports .csv
+// files, maximum no. of rows allowed would be 100" is help text, not an error, but it was
+// sitting in one of these structural containers. These need the CONTENT to actually sound
+// like an error too, not just the structure.
+const STRUCTURAL_ONLY = [
+  '[role="alert"]',
+  '[aria-live="assertive"]',
+  '[aria-invalid="true"] + *',
+  '.v-messages',
+  '[class*="validation"]',
+];
+
+const ERROR_KEYWORD_PATTERN =
+  /\b(error|invalid|fail(?:ed|s)?|wrong|incorrect|required|must|cannot|can't|unable|denied|rejected|not allowed|not valid|try again)\b/i;
+
 export async function findVisibleErrorText(
   page: Page,
   waitMs = 600,
 ): Promise<string | null> {
   await page.waitForTimeout(waitMs);
-
-  // Prioritise specific data-test selectors (app-defined) over generic class matches
-  const ORDERED_SELECTORS = [
-    '[data-test*="error"]',
-    '[data-testid*="error"]',
-    '[data-test*="alert"]',
-    '[role="alert"]',
-    '[aria-live="assertive"]',
-    '[aria-invalid="true"] + *',
-    '.invalid-feedback',
-    '.mat-error',
-    '.v-messages',
-    '[class*="field-error"]',
-    '[class*="form-error"]',
-    '[class*="validation"]',
-  ];
 
   // A real error message always has at least one letter and more than a couple of
   // characters — a bare "*" (a required-field marker, extremely common inside the exact
@@ -517,23 +636,34 @@ export async function findVisibleErrorText(
   // exactly what produced a false "error message on page" finding on a real site.
   const looksLikeRealMessage = (text: string): boolean => text.length > 2 && /[a-zA-Z]/.test(text);
 
-  for (const sel of ORDERED_SELECTORS) {
+  for (const sel of NAME_ASSERTS_ERROR) {
     const els = await page.locator(sel).all();
     for (const el of els) {
       const visible = await el.isVisible().catch(() => false);
       if (!visible) continue;
       const text = (await el.textContent().catch(() => null))?.trim();
-      if (text && looksLikeRealMessage(text)) return text;
+      if (text && looksLikeRealMessage(text) && !matchesKnownNonBugPattern(text)) return text;
     }
   }
 
-  // Final fallback: any element with class containing "error" that has text
+  for (const sel of STRUCTURAL_ONLY) {
+    const els = await page.locator(sel).all();
+    for (const el of els) {
+      const visible = await el.isVisible().catch(() => false);
+      if (!visible) continue;
+      const text = (await el.textContent().catch(() => null))?.trim();
+      if (text && looksLikeRealMessage(text) && ERROR_KEYWORD_PATTERN.test(text) && !matchesKnownNonBugPattern(text)) return text;
+    }
+  }
+
+  // Final fallback: any element with class containing "error" that has text — the class
+  // name itself asserts "error", same trust level as NAME_ASSERTS_ERROR above.
   const fallbacks = await page.locator('[class*="error"]').all();
   for (const el of fallbacks) {
     const visible = await el.isVisible().catch(() => false);
     if (!visible) continue;
     const text = (await el.textContent().catch(() => null))?.trim();
-    if (text && looksLikeRealMessage(text)) return text;
+    if (text && looksLikeRealMessage(text) && !matchesKnownNonBugPattern(text)) return text;
   }
 
   return null;

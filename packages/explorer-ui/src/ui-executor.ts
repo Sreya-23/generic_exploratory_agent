@@ -74,8 +74,14 @@ import { runPlaceholderCheck } from './flows/placeholder-check.js';
 import { runBrokenImagesCheck } from './flows/broken-images.js';
 import { runElementOverflowCheck } from './flows/element-overflow.js';
 import { runJsErrorsReport } from './flows/js-errors-report.js';
-import { attachErrorTracking } from './flows/js-error-tracker.js';
+import { attachErrorTracking, setPageTask } from './flows/js-error-tracker.js';
 import { attachVisitTracking } from './flows/page-visit-tracker.js';
+import { attachDialogTracking } from './flows/dialog-tracker.js';
+import { runSortVerification } from './flows/sort-verification.js';
+import { runLinkTargetConsistency } from './flows/link-target-consistency.js';
+import { runInputRetention } from './flows/input-retention.js';
+import { runDuplicateImages } from './flows/duplicate-images.js';
+import { runCartIntegrity } from './flows/cart-integrity.js';
 import { runCoverageReport } from './flows/coverage-report.js';
 import { performLogin, detectLoginWall, checkConsentCheckboxes } from './auth/login.js';
 import {
@@ -234,6 +240,8 @@ async function createPage(ctx: ExecutorContext, restoreAuth = true): Promise<Pag
   const page = await context.newPage();
   attachErrorTracking(page, ctx);
   attachVisitTracking(page, ctx.sessionId);
+  // A22 — record native alert()/confirm() pop-ups instead of letting Playwright drop them silently.
+  attachDialogTracking(page, ctx);
   return page;
 }
 
@@ -276,6 +284,7 @@ export async function performSessionLogin(ctx: ExecutorContext): Promise<boolean
   const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1280, height: 720 } });
   const page = await context.newPage();
   attachErrorTracking(page, ctx);
+  setPageTask(page, 'login', 'Logging in');
   attachVisitTracking(page, ctx.sessionId);
 
   try {
@@ -625,6 +634,12 @@ const FLOW_HANDLERS: Record<
   'element-overflow': runElementOverflowCheck,
   'js-errors': runJsErrorsReport,
   'coverage-report': runCoverageReport,
+  // A17–A21 — outcome checks: did the action do the RIGHT thing, not just something
+  'sort-verification': runSortVerification,
+  'link-target-consistency': runLinkTargetConsistency,
+  'input-retention': runInputRetention,
+  'duplicate-images': runDuplicateImages,
+  'cart-integrity': runCartIntegrity,
 };
 
 // Both flows call out to Gemini and document themselves as purely additive — skipping
@@ -653,6 +668,8 @@ export class UiExecutor implements BaseExecutor {
       actionInventory: ctx.actionInventory,
       discoveredRoutes: ctx.discoveredRoutes,
       visitedRoutes: ctx.visitedRoutes,
+      environmentChecks: ctx.environmentChecks,
+      accessMap: ctx.accessMap,
     };
     const wrappedCtx: ExecutorContext = {
       ...ctx,
@@ -674,6 +691,7 @@ export class UiExecutor implements BaseExecutor {
 
     try {
       page = await createPage(wrappedCtx);
+      setPageTask(page, task.flowClass, task.title);
       const startUrl = resolveExplorationStartUrl(ctx);
       try {
         await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -754,6 +772,15 @@ export class UiExecutor implements BaseExecutor {
       if (wrappedCtx.visitedRoutes !== before.visitedRoutes) {
         ctx.visitedRoutes = wrappedCtx.visitedRoutes;
       }
+      // device-matrix / cross-browser record every (page, device/browser) pair they checked,
+      // and hidden-route-access records its access map. These were never copied back, so the
+      // results were silently dropped and the report's device/browser grid was always empty.
+      if (wrappedCtx.environmentChecks !== before.environmentChecks) {
+        ctx.environmentChecks = wrappedCtx.environmentChecks;
+      }
+      if (wrappedCtx.accessMap !== before.accessMap) {
+        ctx.accessMap = wrappedCtx.accessMap;
+      }
 
       return { taskId: task.id, success: true, findingsCount };
     } catch (err) {
@@ -767,7 +794,7 @@ export class UiExecutor implements BaseExecutor {
       // presenting an internal failure as if it were evidence of a site defect.
       if (SELF_GATING_OPTIONAL_FLOWS.has(task.flowClass)) {
         ctx.onLog(
-          `[UI] "${task.title}" did not complete (likely a slow/unavailable Gemini call) — skipping without reporting a finding, per this flow's own graceful-failure design`,
+          `[UI] "${task.title}" did not complete (likely a slow/unavailable AI call) — skipping without reporting a finding, per this flow's own graceful-failure design`,
         );
         return { taskId: task.id, success: false, findingsCount };
       }

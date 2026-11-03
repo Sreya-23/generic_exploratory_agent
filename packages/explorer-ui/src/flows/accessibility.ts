@@ -348,7 +348,24 @@ export async function runContrastCheck(
       const rect = el.getBoundingClientRect();
       if (rect.width === 0 || rect.height === 0) continue;
 
-      const fg = parseColor(style.color);
+      // Text that is present for screen readers but not drawn (icon links with text-indent:
+      // -9999px, font-size:0, transparent colour, or text clipped outside its own box — e.g.
+      // SauceDemo's X/Facebook/LinkedIn footer icons) has no visual contrast to measure.
+      const fgRaw = parseColor(style.color);
+      if (fgRaw[3] === 0 || parseFloat(style.fontSize) < 2) continue;
+      const textNode = Array.from(el.childNodes).find(
+        (n) => n.nodeType === Node.TEXT_NODE && (n.textContent ?? '').trim().length > 0,
+      );
+      if (textNode) {
+        const range = document.createRange();
+        range.selectNodeContents(textNode);
+        const tr = range.getBoundingClientRect();
+        const ix = Math.min(tr.right, rect.right) - Math.max(tr.left, rect.left);
+        const iy = Math.min(tr.bottom, rect.bottom) - Math.max(tr.top, rect.top);
+        if (tr.width === 0 || tr.right <= 0 || ix <= 1 || iy <= 1) continue;
+      }
+
+      const fg = fgRaw;
       const bg = effectiveBackground(el);
       const ratio = contrastRatio(fg, bg);
 

@@ -16,8 +16,8 @@ Before running any tests, the agent goes through a 4-layer intelligence pipeline
 ```
 1. RECON          Read page signals: title, buttons, links, inputs, URL paths, body text
       ↓
-2. CLASSIFY       Score against 7 site-type rules (ecommerce / booking / saas /
-                  auth-portal / blog / social / fintech / generic)
+2. CLASSIFY       Score against 8 site-type rules (ecommerce / booking / saas /
+                  auth-portal / blog / social / fintech / ai-product), else generic
       ↓
 3. JOURNEY        Run site-type-specific user flows first (using semantic button
                   discovery — works across languages and frameworks, not hardcoded English)
@@ -70,6 +70,12 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | A14 | Malicious file upload content | `file-upload-security` | 📋 | Double extension (`.jpg.exe`), script embedded in SVG, zip bomb, polyglot file — extends A11's MIME/size-only checks |
 | A15 | Internationalization & RTL | `i18n-rtl` | 📋 | RTL layout rendering, bidi/non-Latin text input, locale-specific date/number formats |
 | A16 | Empty-credential login boundary | — | ✅ | Submits the login/OTP form with every field left blank, in its own throwaway browser context before the real login runs. Zero real-account risk (no credential guess made, so it can never count against a lockout counter) — flags silent no-feedback submissions and, most importantly, blank credentials being accepted as valid. Not a scheduled matrix task: runs once from the orchestrator (`runEmptyCredentialLoginCheck` in `run-session.ts`) before `performSessionLogin`, so it has no `FLOW_CLASSES`/`FLOW_HANDLERS` entry. Deliberately does NOT test wrong (non-blank) credentials — that risks tripping the real site's own lockout/fraud-alert policy against a live account and was intentionally scoped out |
+| A17 | Sort order matches label | `sort-verification` | ✅ | Reads each sort option's promise from its label (Name A→Z / Z→A, Price low→high / high→low) and checks the visible list actually obeys it — catches a sort that does nothing or sorts the wrong way. Native `<select>` sort controls; options with no checkable promise ("Popular") are skipped. Distinct from A12's table-header check, which only asks whether rows moved at all |
+| A18 | List item opens matching page | `link-target-consistency` | ✅ | Opens a spread of list items (first, middle, last — never only item 0) and checks the page that opens is about the clicked item (heading/name match) and shows the same price. `verified` when the page names a different item from the same list |
+| A19 | Fields keep typed values | `input-retention` | ✅ | Types a placeholder key-by-key into each safe field on the landing page and up to 5 known routes, leaves the field, reads every field back: flags a field that loses or alters its value, and typing that changes a different field. Never submits; high-risk fields skipped, PII fields only filled from `credentials.extras` |
+| A20 | Duplicate item images | `duplicate-images` | ✅ | ≥3 differently-named items in one list loading the identical image URL — wrong-but-loading images that A-section broken-images can't see, no AI key needed. Placeholder-named images (`no-image`, `placeholder`…) excluded. `heuristic` |
+| A21 | Cart & checkout consistency | `cart-integrity` | ✅ | Shop sites only (pruned when recon sees no cart wording). Adds 3 spread-out items checking the cart count each time, removes one it added, checks the cart page lists exactly those items, runs A19 on the checkout details form, then checks summary arithmetic (items = subtotal, subtotal + tax = total). Stops before Finish/Place order. Reaching the summary needs PII fields (e.g. postcode) supplied in `credentials.extras` |
+| A22 | Unexpected native dialogs | — | ✅ | Attached to every UI task's page (not a scheduled flow): records each `alert()`/`confirm()`/`prompt()` the app raises — previously Playwright dismissed them silently — and reports the ones whose text reads like a failure ("error", "broken", "failed"…). Dismisses as before; `beforeunload` is accepted so navigation never hangs |
 
 ## Navigation & Session
 
@@ -150,7 +156,7 @@ For each journey step, the agent finds buttons using 4 strategies in order:
 | F3 | Vertical privilege | `vertical-privilege` | ✅ | Low-role user accessing admin endpoints |
 | F4 | XSS in inputs | `xss-probe` | 🔄 | Basic payload injection; reflection check only |
 | F5 | Mass assignment | `mass-assignment` | ✅ | Extra fields in POST body (role, isAdmin, price) |
-| F6 | Security headers audit | `security-headers` | 📋 | Presence/misconfig of CSP, X-Frame-Options, HSTS, X-Content-Type-Options, Referrer-Policy |
+| F6 | Security headers audit | `security-headers` | ✅ | Presence/misconfig of CSP, X-Frame-Options, HSTS, X-Content-Type-Options, Referrer-Policy |
 | F7 | Cookie security flags | `cookie-flags` | 📋 | Secure / HttpOnly / SameSite attributes on session cookies |
 | F8 | Clickjacking | `clickjacking-probe` | 📋 | Page frameable via iframe; missing frame-busting / CSP `frame-ancestors` |
 | F9 | Open redirect | `open-redirect` | 📋 | Manipulate redirect/return-url query params to point at an external domain |

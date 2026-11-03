@@ -373,7 +373,7 @@ This is a **per-session credential you supply for the target site's own API** �
 
 `buildHeaders()` (`packages/explorer-api/src/probe-helpers.ts:43`) is called once per API check and layers the credential header on top of the restored browser-session cookie (`readSessionCookieHeader()`) when both exist — so a `login`-type session's cookie and an `api-key`/`bearer` header aren't mutually exclusive, though in practice a target usually only needs one or the other. This is what makes IDOR, privilege-escalation, and mass-assignment checks (see [§4.4](#44-bug-detection)) meaningful against APIs that authenticate purely via a header rather than a cookie session — without it, every probe would look identically "unauthenticated" whether or not the endpoint was actually protected.
 
-Supplied via: the classic setup form's credential-type selector (`SessionSetupPage.tsx`), or in chat by typing `api-key: <key>` or `bearer: <token>` (parsed by `auth-chat.ts`).
+Supplied in the setup chat by typing `api-key: <key>` or `bearer: <token>` (parsed by `auth-chat.ts`).
 
 See [§11](#11-setup--installation) for the platform-level `.env` variables.
 

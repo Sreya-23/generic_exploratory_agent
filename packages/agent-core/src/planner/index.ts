@@ -13,8 +13,8 @@ import { FLOW_CLASSES, FLOW_TITLES, GENERIC_PHASES } from '@qa/shared';
 import { expandRequirementWithAI } from '../intelligence/requirement-expand-ai.js';
 
 // standard's cap must stay comfortably above the total flow-class count across ALL_AREAS
-// (94 as of 2026-10-06: ui 52 + chaos 10 + api 19 + security 2 + performance 4 + regression 3
-// + accessibility 3 + 1 recon) — otherwise it silently becomes the real constraint on coverage:
+// (119 as of 2026-10-27: ui 68 + chaos 12 + api 25 + security 2 + performance 4 + regression 3
+// + accessibility 4 + 1 recon) — otherwise it silently becomes the real constraint on coverage:
 // every new check added anywhere just displaces an existing one out of the same fixed budget,
 // so the scheduled-task count never visibly grows no matter how much real detection logic gets
 // built. Re-check this against the catalog total whenever a new flow class is added; it should
@@ -43,7 +43,7 @@ function tasksForArea(area: keyof typeof FLOW_CLASSES, startPriority: number): F
  * 'accessibility' (labels, keyboard focus visibility, colour contrast) now has real
  * FLOW_HANDLERS entries (see accessibility.ts) and is included by default.
  */
-const ALL_AREAS: (keyof typeof FLOW_CLASSES)[] = [
+export const ALL_AREAS: (keyof typeof FLOW_CLASSES)[] = [
   'ui',
   'chaos',
   'api',
@@ -67,12 +67,13 @@ const CRITICAL_RISK = new Set([
   'token-validation', // invalid/malformed/expired-token bypass + JWT alg:none — same class as auth-matrix
 ]);
 const HIGH_RISK = new Set([
-  'crud', 'journey', 'data-integrity', 'state-transition', 'business-logic-boundary', 'rate-limit',
+  'crud', 'journey', 'cart-integrity', 'link-target-consistency', 'input-retention', 'sort-verification', 'data-integrity', 'state-transition', 'business-logic-boundary', 'rate-limit',
   'session-timeout', 'multi-tab-logout', 'logout-session', 'session-expires-mid-op', 'deep-link', 'schema-drift', 'generic-crud',
   'cancel-creation', 'cancel-deletion', 'duplicate-creation',
   'crud-lifecycle', 'concurrency', 'malformed-input', 'state-transition-api', 'request-ordering',
 ]);
 const LOW_RISK = new Set([
+  'duplicate-images',
   'dark-mode', 'reduced-motion', 'rtl-layout', 'placeholder-check', 'broken-images',
   'element-overflow', 'zoom-reflow', 'cross-browser', 'device-matrix', 'toast-stacking',
   'long-content', 'locale-format', 'bfcache', 'coverage-report', 'web-vitals',
@@ -164,7 +165,7 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
       .filter((t) => {
         if (phase.id === 'recon') return t.flowClass === 'recon';
         if (phase.id === 'smoke')
-          return ['navigation', 'crud', 'journey', 'user-directed', 'action-inventory', 'data-integrity', 'state-transition', 'consent-exploration', 'visual-review', 'agentic-explore', 'generic-crud', 'cancel-creation', 'cancel-deletion', 'duplicate-creation'].includes(t.flowClass);
+          return ['navigation', 'crud', 'journey', 'user-directed', 'action-inventory', 'data-integrity', 'state-transition', 'consent-exploration', 'visual-review', 'agentic-explore', 'generic-crud', 'cancel-creation', 'cancel-deletion', 'duplicate-creation', 'cart-integrity', 'link-target-consistency'].includes(t.flowClass);
         if (phase.id === 'boundary')
           return [
             'form-validation',
@@ -194,6 +195,9 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
             'broken-images',
             'element-overflow',
             'locale-format',
+            'sort-verification',
+            'input-retention',
+            'duplicate-images',
           ].includes(t.flowClass);
         if (phase.id === 'interruption')
           return [
@@ -359,10 +363,17 @@ export function removeUnlikelyTasks(plan: ExplorationPlan, signals: SiteIntellig
     signals.buttonTexts.some((t) => /\b(download|export)\b/i.test(t)) ||
     signals.linkTexts.some((t) => /\b(download|export)\b/i.test(t));
 
+  // Cart/checkout consistency only means something on a shop. Any cart/basket/bag wording in
+  // recon's link or button text keeps it; a site with none of it anywhere skips the task.
+  const looksLikeShop = [...signals.buttonTexts, ...signals.linkTexts].some((t) =>
+    /\b(add to (cart|bag|basket)|cart|basket|bag|checkout)\b/i.test(t),
+  );
+
   const toRemove = new Set(
     plan.tasks
       .filter(
         (t) =>
+          (t.flowClass === 'cart-integrity' && !looksLikeShop) ||
           (t.flowClass === 'file-upload' && !hasFileInput) ||
           (t.flowClass === 'pagination-ui' && !looksPaginated) ||
           (t.flowClass === 'autofill-overlap' && !hasAutofillProneInput) ||

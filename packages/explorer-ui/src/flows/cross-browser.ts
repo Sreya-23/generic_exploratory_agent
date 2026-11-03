@@ -8,6 +8,11 @@ import type { Page } from 'playwright';
 import { join } from 'node:path';
 import { savedSessionStatePath, restoreSessionStorage, waitForRealContent, waitForTitleStable } from './helpers.js';
 
+// A browser engine that isn't installed on THIS machine ("Executable doesn't exist") is a
+// setup problem with the agent, not a defect in the site — report it under UI-Environment (an
+// execution-error area that is never scored) with the fix, instead of "page fails to load".
+const ENGINE_MISSING = /executable doesn't exist|browserType\.launch|npx playwright install/i;
+
 // Ground truth for the report's environment-comparison grid: findings alone only ever record
 // failures, so without this, a page that PASSED in an environment would render as a blank cell
 // rather than a ✓ — indistinguishable from "never checked."
@@ -179,6 +184,21 @@ async function checkPageAcrossEngines(
     const engineLabel = other.engine.charAt(0).toUpperCase() + other.engine.slice(1);
     if (other.loadError) {
       recordCheck(ctx, targetUrl, engineLabel, false, other.loadError);
+      if (ENGINE_MISSING.test(other.loadError ?? '')) {
+        ctx.onFinding({
+          severity: 'info',
+          area: 'UI-Environment',
+          title: `Could not test ${engineLabel}: browser engine not installed on the agent machine`,
+          steps: ['On the machine running the agent, run: npx playwright install chromium firefox webkit', 'Re-run the session'],
+          expected: 'All browser engines can be launched',
+          actual: (other.loadError ?? '').split('\n')[0],
+          evidence: [],
+          reproRate: '1/1',
+          automationCandidate: false,
+          pageUrl: targetUrl,
+        });
+        continue;
+      }
       ctx.onFinding({
         severity: 'high',
         area: 'CrossBrowser',

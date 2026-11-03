@@ -10,6 +10,50 @@ import type { ExecutorContext, FlowTask } from '@qa/shared';
 const ANALYTICS_BEACON_PATTERN =
   /unagi|analytics|telemetry|\/metrics\/|beacon|\/collect\b|\/pixel\b|google-analytics|googletagmanager|doubleclick\.net|segment\.(io|com)|mixpanel|amplitude|\/csm\/|\.eel\.katal\./i;
 
+// Error-reporting / session-replay / APM services send one report per error or event by design.
+// Observed false positive (SauceDemo error_user): each failing "Add to cart" click sent a crash
+// report to submit.backtrace.io, and 3 crash reports were read as "3 add-to-cart requests".
+const MONITORING_PATTERN =
+  /backtrace\.io|sentry\.io|ingest\.sentry|bugsnag|rollbar|datadoghq|browser-intake|newrelic|nr-data\.net|logrocket|fullstory|hotjar|clarity\.ms|raygun|trackjs|honeybadger|\/(log|logs|errors?|telemetry|rum|crash|report-error)(\/|\?|$)/i;
+
+/** Registrable domain, e.g. shop.example.co.uk → example.co.uk, api.example.com → example.com. */
+function siteDomain(host: string): string {
+  const parts = host.split('.');
+  if (parts.length <= 2) return host;
+  const sld = parts[parts.length - 2];
+  const tld = parts[parts.length - 1];
+  const twoPartTld = tld.length === 2 && /^(co|com|org|net|ac|gov|edu)$/.test(sld);
+  return parts.slice(twoPartTld ? -3 : -2).join('.');
+}
+
+/**
+ * Is this request one of the SITE's own actions (as opposed to a third-party side effect)?
+ * - same registrable domain as the page (shop.example.com → api.example.com counts), or
+ * - an origin the site was already seen calling as its API during recon/crawl (covers apps
+ *   whose backend lives elsewhere, e.g. myshop-api.herokuapp.com),
+ * and never an analytics beacon or error-reporting/monitoring call.
+ */
+function isOwnActionRequest(url: string, pageHost: string, knownApiOrigins: Set<string>): boolean {
+  if (ANALYTICS_BEACON_PATTERN.test(url) || MONITORING_PATTERN.test(url)) return false;
+  try {
+    const u = new URL(url);
+    return siteDomain(u.hostname) === siteDomain(pageHost) || knownApiOrigins.has(u.origin);
+  } catch {
+    return false;
+  }
+}
+
+function knownApiOriginsFrom(ctx: ExecutorContext): Set<string> {
+  const out = new Set<string>();
+  for (const e of ctx.discoveredApiEndpoints ?? []) {
+    const m = e.match(/https?:\/\/[^/\s]+/);
+    if (!m) continue;
+    if (ANALYTICS_BEACON_PATTERN.test(m[0]) || MONITORING_PATTERN.test(m[0])) continue;
+    out.add(m[0]);
+  }
+  return out;
+}
+
 // Buttons that trigger state mutations — highest risk for duplicate actions.
 // Ordered: transactional first (highest impact), then general actions.
 const ACTION_BUTTON_SELECTORS = [
@@ -61,6 +105,10 @@ async function readCartCount(page: Page): Promise<number | null> {
       if (!isNaN(n)) return n;
     }
   }
+  // Many shops hide the badge entirely when the cart is empty — a visible cart link with no
+  // badge is a count of 0, not "unknown".
+  const cartLink = page.locator('a[href*="cart" i], a[class*="cart" i], [data-test*="cart" i], [aria-label*="cart" i]').first();
+  if ((await cartLink.count().catch(() => 0)) > 0) return 0;
   return null;
 }
 
@@ -142,15 +190,28 @@ async function checkToggleIdempotency(
  * This is more reliable than calling .click() N times because it
  * doesn't wait for the browser's own event processing between calls.
  */
-async function rapidClickN(page: Page, selector: string, n: number): Promise<void> {
+async function rapidClickN(page: Page, selector: string, n: number): Promise<Set<string>> {
+  const labelsSeen = new Set<string>();
+  // Pin the element ONCE. Re-resolving `selector` before every click silently moved on to the
+  // NEXT matching button whenever the first one changed its label (Add to cart → Remove), so
+  // "5 rapid clicks on one button" was really 5 clicks spread over several products.
+  const handle = await page.locator(selector).first().elementHandle({ timeout: 2000 }).catch(() => null);
   for (let i = 0; i < n; i++) {
     // Bounded timeout matters especially here — this runs in a tight N-iteration loop, so
     // an unguarded default timeout would pay its full cost on EVERY iteration if selector
     // doesn't match anything, not just once.
-    await page.locator(selector).first().click({ force: true, timeout: 2000 }).catch(() => {});
+    if (handle) await handle.click({ force: true, timeout: 2000 }).catch(() => {});
+    else await page.locator(selector).first().click({ force: true, timeout: 2000 }).catch(() => {});
+    // Sample the label after each click — a toggle may land back on its original label after an
+    // even number of effective clicks, so the final label alone can't identify it.
+    if (handle) {
+      const t = ((await handle.textContent().catch(() => '')) ?? '').trim();
+      if (t) labelsSeen.add(t);
+    }
     // Tiny gap — realistic "fast human" clicking (50–80ms between clicks)
     await page.waitForTimeout(60);
   }
+  return labelsSeen;
 }
 
 export async function runDoubleClick(
@@ -192,38 +253,79 @@ export async function runDoubleClick(
     // Read cart count before clicking (for cart-kind buttons)
     const cartBefore = kind === 'cart' ? await readCartCount(page) : null;
 
-    // Monitor network requests during the click sequence
-    let requestCount = 0;
-    const requestUrls: string[] = [];
-    const reqListener = (req: import('playwright').Request) => {
-      if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method()) && !ANALYTICS_BEACON_PATTERN.test(req.url())) {
-        requestCount++;
-        requestUrls.push(`${req.method()} ${req.url()}`);
+    // Monitor the SITE's own write requests during the click sequence (see isOwnActionRequest),
+    // with timing, so "no loading state" is only judged for actions that actually waited on a server.
+    const pageHost = (() => {
+      try {
+        return new URL(page.url()).hostname;
+      } catch {
+        return '';
       }
+    })();
+    const apiOrigins = knownApiOriginsFrom(ctx);
+    let requestCount = 0;
+    let ignoredCount = 0;
+    const requestUrls: string[] = [];
+    const started = new Map<import('playwright').Request, number>();
+    let slowestMs = 0;
+    const reqListener = (req: import('playwright').Request) => {
+      if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method())) return;
+      if (!isOwnActionRequest(req.url(), pageHost, apiOrigins)) {
+        ignoredCount++;
+        return;
+      }
+      requestCount++;
+      requestUrls.push(`${req.method()} ${req.url()}`);
+      started.set(req, Date.now());
+    };
+    const doneListener = (req: import('playwright').Request) => {
+      const t = started.get(req);
+      if (t !== undefined) slowestMs = Math.max(slowestMs, Date.now() - t);
     };
     page.on('request', reqListener);
+    page.on('requestfinished', doneListener);
+    page.on('requestfailed', doneListener);
+
+    const labelBefore = ((await btn.textContent().catch(() => '')) ?? '').trim();
+    const pinned = await btn.elementHandle({ timeout: 2000 }).catch(() => null);
 
     // Click 5 times rapidly — covers both double-click and rage-click scenarios
     const CLICK_COUNT = 5;
-    await rapidClickN(page, sel, CLICK_COUNT);
+    const labelsSeen = await rapidClickN(page, sel, CLICK_COUNT);
     await page.waitForTimeout(1500); // wait for all async effects to settle
 
     page.off('request', reqListener);
+    page.off('requestfinished', doneListener);
+    page.off('requestfailed', doneListener);
+    if (ignoredCount > 0) {
+      ctx.onLog(`[RapidClick] "${label}": ignored ${ignoredCount} third-party/monitoring request(s) (not the site's own action)`);
+    }
 
     const shotAfter = join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `rapid-${label.replace(/\s+/g, '-')}-after.png`);
     await page.screenshot({ path: shotAfter });
 
-    // ── Check 1: Was the button debounced / disabled? ──────────────────────
-    // After first click a well-behaved button becomes disabled or shows a
-    // loading state, preventing subsequent clicks from firing.
-    const btnDisabledAfter = await btn.isDisabled().catch(() => false);
-    const btnStillVisible = await btn.isVisible().catch(() => false);
+    const btnDisabledAfter = pinned
+      ? await pinned.isDisabled().catch(() => false)
+      : await btn.isDisabled().catch(() => false);
+    const btnStillVisible = pinned ? await pinned.isVisible().catch(() => false) : await btn.isVisible().catch(() => false);
+    const labelAfter = pinned ? ((await pinned.textContent().catch(() => '')) ?? '').trim() : labelBefore;
+    // A button that changes its own label when clicked (Add to cart ⇄ Remove, Follow ⇄ Unfollow)
+    // is a TOGGLE: each click is a distinct, intended action, so several requests are expected.
+    labelsSeen.add(labelBefore);
+    const isToggle = (!!labelAfter && labelAfter !== labelBefore) || labelsSeen.size > 1;
 
-    // ── Check 2: How many network requests fired? ──────────────────────────
     const isTransactional = TRANSACTIONAL_KINDS.has(kind);
-    const severity = isTransactional ? 'high' : (isAuthPage ? 'medium' : 'medium');
+    const severity = isTransactional ? 'high' : 'medium';
+    const cartAfter = kind === 'cart' && cartBefore !== null ? await readCartCount(page) : null;
+    const cartAdded = cartAfter !== null && cartBefore !== null ? cartAfter - cartBefore : null;
 
-    if (requestCount > 1) {
+    // ── Check 1/2: duplicate submissions (non-toggle buttons only) ─────────
+    if (isToggle) {
+      ctx.onLog(`[RapidClick] "${label}" is a toggle ("${labelBefore}" → "${labelAfter}") — ${requestCount} request(s) for ${CLICK_COUNT} distinct clicks is expected`);
+    } else if (requestCount > 1 && cartAdded !== null && cartAdded <= 1) {
+      // The cart only grew by one, so whatever the extra requests were, nothing was duplicated.
+      ctx.onLog(`[RapidClick] "${label}": ${requestCount} requests but the cart only grew by ${cartAdded} — no duplicate effect`);
+    } else if (requestCount > 1) {
       ctx.onFinding({
         severity,
         area: 'UI-RapidClick',
@@ -231,64 +333,69 @@ export async function runDoubleClick(
         steps: [
           `Page: ${pageUrl} ("${pageTitle}")`,
           `Click "${label}" ${CLICK_COUNT} times in rapid succession (~60ms apart)`,
-          'Monitor POST/PUT/PATCH/DELETE network requests',
+          "Monitor the site's own POST/PUT/PATCH/DELETE requests",
         ],
         expected: `Only 1 request sent (button should disable or debounce after first click)`,
         actual: `${requestCount} requests fired: ${requestUrls.slice(0, 4).join(' | ')}`,
         evidence: [shotBefore, shotAfter],
         reproRate: '1/1',
         automationCandidate: true,
+        pageUrl,
+        confidence: 'verified',
+        confidenceReason: "Counted only write requests to the site's own servers (third-party analytics and error reporting excluded).",
       });
     } else if (requestCount === 1) {
       ctx.onLog(`[RapidClick] "${label}" correctly debounced — 1 request on ${CLICK_COUNT} rapid clicks ✓`);
     } else {
-      ctx.onLog(`[RapidClick] "${label}" fired no requests — may be client-side only`);
+      ctx.onLog(`[RapidClick] "${label}" sent no requests to the site's server — client-side action`);
     }
 
-    // ── Check 3: Cart quantity after rapid "Add to Cart" clicks ───────────
-    if (kind === 'cart' && cartBefore !== null) {
-      const cartAfter = await readCartCount(page);
-      if (cartAfter !== null) {
-        const added = cartAfter - cartBefore;
-        if (added > 1) {
-          ctx.onFinding({
-            severity: 'high',
-            area: 'UI-RapidClick',
-            title: `"Add to Cart" clicked ${CLICK_COUNT}× added ${added} items instead of 1`,
-            steps: [
-              `Note cart count: ${cartBefore}`,
-              `Click "Add to Cart" ${CLICK_COUNT} times rapidly`,
-              `Check cart count`,
-            ],
-            expected: `Cart count increases by 1 regardless of click speed`,
-            actual: `Cart went from ${cartBefore} → ${cartAfter} (${added} items added by ${CLICK_COUNT} rapid clicks)`,
-            evidence: [shotBefore, shotAfter],
-            reproRate: '1/1',
-            automationCandidate: true,
-          });
-        } else if (added === 1) {
-          ctx.onLog(`[RapidClick] "Add to Cart" correctly added 1 item despite ${CLICK_COUNT} rapid clicks ✓`);
-        }
+    // ── Check 3: cart state after rapid clicks ───────────────────────────
+    if (cartAdded !== null) {
+      // Toggle: the final label says whether the item should be in the cart (label now offers
+      // "Remove" ⇒ item added ⇒ +1; label back to "Add" ⇒ +0). Plain add button: at most +1.
+      const expectedAdded = isToggle ? (/remove|added|in cart/i.test(labelAfter) ? 1 : 0) : null;
+      const wrong = expectedAdded !== null ? cartAdded !== expectedAdded : cartAdded > 1;
+      if (wrong) {
+        ctx.onFinding({
+          severity: 'high',
+          area: 'UI-RapidClick',
+          title: `Rapid clicks on "${label}" leave the cart count wrong (${cartBefore} → ${cartAfter})`,
+          steps: [`Note cart count: ${cartBefore}`, `Click "${label}" ${CLICK_COUNT} times rapidly`, 'Check cart count and the button label'],
+          expected:
+            expectedAdded !== null
+              ? `Button now reads "${labelAfter}", so the cart should be ${cartBefore! + expectedAdded}`
+              : `Cart count increases by at most 1 regardless of click speed`,
+          actual: `Cart went from ${cartBefore} → ${cartAfter}`,
+          evidence: [shotBefore, shotAfter],
+          reproRate: '1/1',
+          automationCandidate: true,
+          pageUrl,
+          confidence: 'verified',
+          confidenceReason: 'Cart counter read before and after, compared with what the button label says the state is.',
+        });
+      } else {
+        ctx.onLog(`[RapidClick] Cart count consistent after rapid clicks (${cartBefore} → ${cartAfter}) ✓`);
       }
     }
 
-    // ── Check 4: Button never disabled — UX gap ───────────────────────────
-    // If button stays enabled after click, user has no visual feedback that
-    // the action is in progress (leads to rage-clicking)
-    if (requestCount >= 1 && !btnDisabledAfter && btnStillVisible && isTransactional) {
+    // ── Check 4: no loading state on a SLOW server action ─────────────────
+    // Only meaningful when the click really waited on the site's server; an instant client-side
+    // action (local cart, toggle, filter) has nothing to show a spinner for.
+    if (requestCount >= 1 && slowestMs >= 300 && !btnDisabledAfter && btnStillVisible && isTransactional && !isToggle) {
       ctx.onFinding({
         severity: 'low',
         area: 'UI-RapidClick',
-        title: `"${label}" button stays enabled after click — no loading/disabled state`,
-        steps: [
-          `Click "${label}"`,
-          `Observe button state while request is in-flight`,
-        ],
+        title: `"${label}" button stays enabled while its request is in flight — no loading/disabled state`,
+        steps: [`Click "${label}"`, `Observe the button during the ${slowestMs}ms server request`],
         expected: 'Button disabled or shows loading indicator after click to prevent rage-clicking',
-        actual: 'Button remains fully clickable with no visual feedback — users may click multiple times',
+        actual: `The request took ${slowestMs}ms and the button stayed fully clickable with no visual feedback`,
         evidence: [shotAfter],
         reproRate: '1/1',
         automationCandidate: true,
+        pageUrl,
+        confidence: 'verified',
+        confidenceReason: "Measured the site's own request duration and the button's disabled state.",
       });
     }
 

@@ -1,6 +1,7 @@
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
 import { isLoginWallPage } from './helpers.js';
+import { elementFingerprint } from './helpers.js';
 
 /**
  * Checklist (UI) §5 — Dropdowns/Selects. Previously this entire category had zero dedicated
@@ -38,7 +39,15 @@ export async function runDropdownExploration(
     return;
   }
 
-  const fieldName = (await select.getAttribute('name')) ?? (await select.getAttribute('id')) ?? 'unnamed select';
+  const fieldName =
+    (await select.getAttribute('name')) ??
+    (await select.getAttribute('id')) ??
+    (await select.getAttribute('aria-label')) ??
+    'unnamed select';
+  // Same page + element identity as sort-verification uses, so the report folds findings about
+  // this one control (e.g. a broken sort dropdown) into a single entry instead of several.
+  const ddPageUrl = page.url().split('#')[0];
+  const ddTarget = (await elementFingerprint(select)) ?? undefined;
   const originalValue = await select.inputValue().catch(() => '');
   let count = 0;
 
@@ -49,6 +58,8 @@ export async function runDropdownExploration(
     const actual = await select.inputValue();
     if (expected && actual !== expected) {
       ctx.onFinding({
+        pageUrl: ddPageUrl,
+        targetSelector: ddTarget,
         severity: 'medium',
         area: 'UI-Dropdowns',
         title: `Selecting the first option doesn't update the dropdown's value: ${fieldName}`,
@@ -73,6 +84,8 @@ export async function runDropdownExploration(
     const actual = await select.inputValue();
     if (expected && actual !== expected) {
       ctx.onFinding({
+        pageUrl: ddPageUrl,
+        targetSelector: ddTarget,
         severity: 'medium',
         area: 'UI-Dropdowns',
         title: `Selecting the last option doesn't update the dropdown's value: ${fieldName}`,
@@ -110,6 +123,8 @@ export async function runDropdownExploration(
         );
         if (selected.length !== 2) {
           ctx.onFinding({
+        pageUrl: ddPageUrl,
+        targetSelector: ddTarget,
             severity: 'medium',
             area: 'UI-Dropdowns',
             title: `Multi-select doesn't retain multiple selections: ${fieldName}`,
@@ -139,6 +154,8 @@ export async function runDropdownExploration(
     const afterArrow = await select.inputValue();
     if (afterArrow === beforeArrow && midIndex < options.length - 1) {
       ctx.onFinding({
+        pageUrl: ddPageUrl,
+        targetSelector: ddTarget,
         severity: 'low',
         area: 'UI-Dropdowns',
         title: `Dropdown doesn't respond to keyboard navigation: ${fieldName}`,

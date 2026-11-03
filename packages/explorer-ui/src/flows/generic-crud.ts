@@ -7,16 +7,17 @@
 // closes: "you don't need domain-specific code for each one").
 //
 // Safety: every field filled is 'safe'-classified only (classifyInputRisk), same discipline as
-// every other probe-filling flow in this codebase. The delete step is NOT auto-bypassed just
-// because the entity is one this flow created itself — it goes through the exact same
-// gateIfSensitive() confirmation gate every other destructive action in this codebase uses.
-// That gate exists because "the agent created it" doesn't guarantee deleting it is side-effect
-// free (cascading deletes, real associations) — reusing it here rather than inventing a
-// special-case bypass keeps this consistent with the rest of the codebase's risk posture.
+// every other probe-filling flow in this codebase. Every real write — Create, Edit, AND Delete,
+// not just Delete — goes through confirmWriteAction(), which always asks before proceeding and
+// always shows the exact data involved; it's never auto-bypassed just because the entity being
+// touched is one this flow created itself. That matters because "the agent created it" doesn't
+// guarantee writing to it is side-effect free (cascading deletes, billing/quota effects, real
+// associations) — asking every time, with the data shown, keeps the user in control of what
+// actually gets written rather than only gating the Delete step.
 import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
-import { waitForRealContent, isRiskyActionLabel, gateIfSensitive } from './helpers.js';
+import { waitForRealContent, isRiskyActionLabel, confirmWriteAction } from './helpers.js';
 import { classifyInputRisk } from './forms.js';
 
 const CREATE_TRIGGER_PATTERN = /^(create|add|new)\b/i;
@@ -35,20 +36,35 @@ async function shot(page: Page, ctx: ExecutorContext, name: string): Promise<str
   }
 }
 
-async function fillSafeFields(page: Page, value: string): Promise<boolean> {
+interface FilledField {
+  label: string;
+  value: string;
+  previous: string;
+}
+
+async function fillSafeFields(page: Page, value: string): Promise<FilledField[]> {
   const inputs = await page
     .locator('input:not([type=hidden]):not([type=checkbox]):not([type=radio]):visible, textarea:visible')
     .all();
-  let filledAny = false;
+  const filled: FilledField[] = [];
   for (const el of inputs.slice(0, 15)) {
     const name = (await el.getAttribute('name').catch(() => '')) || '';
     const placeholder = (await el.getAttribute('placeholder').catch(() => '')) || '';
     const type = (await el.getAttribute('type').catch(() => '')) || 'text';
     if (classifyInputRisk(name, placeholder, placeholder || name, type) !== 'safe') continue;
+    const previous = (await el.inputValue().catch(() => '')) || '';
     await el.fill(value).catch(() => {});
-    filledAny = true;
+    filled.push({ label: name || placeholder || 'field', value, previous });
   }
-  return filledAny;
+  return filled;
+}
+
+/** For the confirmation prompt shown before Create/Edit — e.g. `name: "QA-CRUD-123"`, or with
+ * `showPrevious` for an edit: `name: "QA-CRUD-123" -> "QA-CRUD-123-edited"`. */
+function describeFilledFields(fields: FilledField[], showPrevious = false): string {
+  return fields
+    .map((f) => (showPrevious ? `${f.label}: "${f.previous}" -> "${f.value}"` : `${f.label}: "${f.value}"`))
+    .join(', ');
 }
 
 export async function runGenericCrudCheck(page: Page, ctx: ExecutorContext, _task: FlowTask): Promise<void> {
@@ -75,7 +91,8 @@ export async function runGenericCrudCheck(page: Page, ctx: ExecutorContext, _tas
   await waitForRealContent(page).catch(() => {});
 
   const marker = `QA-CRUD-${Date.now()}`.slice(0, 30);
-  if (!(await fillSafeFields(page, marker))) {
+  const createFields = await fillSafeFields(page, marker);
+  if (createFields.length === 0) {
     ctx.onLog('[GenericCrud] Create trigger opened, but no safe-classified field found to fill — stopping here');
     return;
   }
@@ -88,6 +105,17 @@ export async function runGenericCrudCheck(page: Page, ctx: ExecutorContext, _tas
     ctx.onLog('[GenericCrud] Filled the create form but found no submit control — stopping here');
     return;
   }
+
+  const createOk = await confirmWriteAction(page, ctx, {
+    action: 'create',
+    entityLabel: createLabel,
+    data: describeFilledFields(createFields),
+  });
+  if (!createOk) {
+    ctx.onLog('[GenericCrud] Create step skipped pending confirmation — nothing was submitted');
+    return;
+  }
+
   await submitBtn.click({ timeout: 5000 }).catch(() => {});
   await page.waitForTimeout(1200);
   await waitForRealContent(page).catch(() => {});
@@ -142,14 +170,24 @@ export async function runGenericCrudCheck(page: Page, ctx: ExecutorContext, _tas
 
   const editedMarker = `${marker}-edited`;
   const editUrl = page.url();
-  if (!(await fillSafeFields(page, editedMarker))) {
+  const editFields = await fillSafeFields(page, editedMarker);
+  if (editFields.length === 0) {
     ctx.onLog('[GenericCrud] Opened the entity but found no safe field to edit — skipping edit verification');
   } else {
     const editSubmitBtn = page
       .locator('button:visible, [role="button"]:visible, input[type="submit"]:visible')
       .filter({ hasText: SUBMIT_PATTERN })
       .first();
-    if ((await editSubmitBtn.count().catch(() => 0)) > 0) {
+    const editOk =
+      (await editSubmitBtn.count().catch(() => 0)) > 0 &&
+      (await confirmWriteAction(page, ctx, {
+        action: 'edit',
+        entityLabel: createLabel,
+        data: describeFilledFields(editFields, true),
+      }));
+    if (!editOk) {
+      ctx.onLog('[GenericCrud] Edit step skipped pending confirmation (or no submit control) — nothing was submitted');
+    } else {
       await editSubmitBtn.click({ timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(1200);
       await waitForRealContent(page).catch(() => {});
@@ -196,7 +234,11 @@ export async function runGenericCrudCheck(page: Page, ctx: ExecutorContext, _tas
   }
   const deleteLabel = ((await deleteTrigger.textContent().catch(() => '')) ?? '').trim().slice(0, 40) || 'Delete';
 
-  const canProceed = await gateIfSensitive(page, ctx, deleteLabel);
+  const canProceed = await confirmWriteAction(page, ctx, {
+    action: 'delete',
+    entityLabel: deleteLabel,
+    data: finalMarker,
+  });
   if (!canProceed) {
     ctx.onLog(`[GenericCrud] Delete step skipped pending confirmation (or user declined) — the QA-created test entity ("${finalMarker}") may still be left behind and should be cleaned up manually`);
     return;
@@ -264,7 +306,9 @@ export async function runCancelCreationCheck(page: Page, ctx: ExecutorContext, _
   await waitForRealContent(page).catch(() => {});
 
   const marker = `QA-CANCEL-CREATE-${Date.now()}`.slice(0, 30);
-  if (!(await fillSafeFields(page, marker))) {
+  // No confirmWriteAction gate here — the whole point of this check is clicking Cancel instead
+  // of Submit, so nothing is ever actually written.
+  if ((await fillSafeFields(page, marker)).length === 0) {
     ctx.onLog('[GenericCrud] Create trigger opened, but no safe field to fill — skipping cancel-creation check');
     return;
   }
@@ -327,13 +371,26 @@ export async function runCancelDeletionCheck(page: Page, ctx: ExecutorContext, _
   await waitForRealContent(page).catch(() => {});
 
   const marker = `QA-CANCEL-DELETE-${Date.now()}`.slice(0, 30);
-  if (!(await fillSafeFields(page, marker))) {
+  const setupFields = await fillSafeFields(page, marker);
+  if (setupFields.length === 0) {
     ctx.onLog('[GenericCrud] No safe field to fill — skipping cancel-deletion check');
     return;
   }
   const submitBtn = page.locator('button:visible, [role="button"]:visible, input[type="submit"]:visible').filter({ hasText: SUBMIT_PATTERN }).first();
   if ((await submitBtn.count().catch(() => 0)) === 0) {
     ctx.onLog('[GenericCrud] No submit control — skipping cancel-deletion check');
+    return;
+  }
+  // This check needs a real synthetic entity to exist so it has something to delete/cancel —
+  // the create here is genuine (unlike runCancelCreationCheck), so it goes through the same
+  // confirmation gate as the main lifecycle's create step.
+  const setupOk = await confirmWriteAction(page, ctx, {
+    action: 'create',
+    entityLabel: createLabel,
+    data: describeFilledFields(setupFields),
+  });
+  if (!setupOk) {
+    ctx.onLog('[GenericCrud] Cancel-deletion check skipped pending confirmation — nothing was created');
     return;
   }
   await submitBtn.click({ timeout: 5000 }).catch(() => {});
@@ -405,7 +462,7 @@ export async function runCancelDeletionCheck(page: Page, ctx: ExecutorContext, _
   const cleanupDeleteTrigger = cleanupScope.locator('button:visible, [role="button"]:visible').filter({ hasText: DELETE_TRIGGER_PATTERN }).first();
   if ((await cleanupDeleteTrigger.count().catch(() => 0)) > 0) {
     const deleteLabel = ((await cleanupDeleteTrigger.textContent().catch(() => '')) ?? '').trim().slice(0, 40) || 'Delete';
-    const canProceed = await gateIfSensitive(page, ctx, deleteLabel);
+    const canProceed = await confirmWriteAction(page, ctx, { action: 'delete', entityLabel: deleteLabel, data: marker });
     if (canProceed) {
       await cleanupDeleteTrigger.click({ timeout: 5000 }).catch(() => {});
       await page.waitForTimeout(500);
@@ -449,13 +506,23 @@ export async function runDuplicateCreationCheck(page: Page, ctx: ExecutorContext
     await createTrigger.click({ timeout: 5000 }).catch(() => {});
     await page.waitForTimeout(800);
     await waitForRealContent(page).catch(() => {});
-    if (!(await fillSafeFields(page, marker))) {
+    const fields = await fillSafeFields(page, marker);
+    if (fields.length === 0) {
       ctx.onLog('[GenericCrud] No safe field to fill — skipping duplicate-creation check');
       return;
     }
     const submitBtn = page.locator('button:visible, [role="button"]:visible, input[type="submit"]:visible').filter({ hasText: SUBMIT_PATTERN }).first();
     if ((await submitBtn.count().catch(() => 0)) === 0) {
       ctx.onLog('[GenericCrud] No submit control — skipping duplicate-creation check');
+      return;
+    }
+    const createOk = await confirmWriteAction(page, ctx, {
+      action: 'create',
+      entityLabel: `${createLabel} (duplicate attempt ${attempt + 1}/2)`,
+      data: describeFilledFields(fields),
+    });
+    if (!createOk) {
+      ctx.onLog('[GenericCrud] Duplicate-creation check skipped pending confirmation — nothing was submitted');
       return;
     }
     await submitBtn.click({ timeout: 5000 }).catch(() => {});
@@ -481,7 +548,7 @@ export async function runDuplicateCreationCheck(page: Page, ctx: ExecutorContext
     const deleteTrigger = scope.locator('button:visible, [role="button"]:visible').filter({ hasText: DELETE_TRIGGER_PATTERN }).first();
     if ((await deleteTrigger.count().catch(() => 0)) === 0) break;
     const deleteLabel = ((await deleteTrigger.textContent().catch(() => '')) ?? '').trim().slice(0, 40) || 'Delete';
-    const canProceed = await gateIfSensitive(page, ctx, deleteLabel);
+    const canProceed = await confirmWriteAction(page, ctx, { action: 'delete', entityLabel: deleteLabel, data: marker });
     if (!canProceed) {
       ctx.onLog(`[GenericCrud] Cleanup skipped pending confirmation — synthetic duplicate(s) of "${marker}" may be left behind`);
       break;

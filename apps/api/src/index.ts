@@ -191,6 +191,7 @@ app.post<{ Body: SessionConfig }>('/api/sessions', async (req) => {
     openApiUrl: config.openApiUrl,
     flowInstructions: config.flowInstructions,
     selectedFlowClasses: config.selectedFlowClasses,
+    allowedSections: config.allowedSections,
   });
   return session;
 });

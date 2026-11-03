@@ -1,7 +1,8 @@
 import { join } from 'node:path';
 import type { Page } from 'playwright';
-import type { ExecutorContext, FlowTask } from '@qa/shared';
-import { findVisibleErrorText, explorationBreadth, dismissBlockingOverlay, isRiskyActionLabel } from './helpers.js';
+import type { CachedNavChild, ExecutorContext, FlowTask } from '@qa/shared';
+import { findVisibleErrorText, explorationBreadth, dismissBlockingOverlay, isRiskyActionLabel, isSectionAllowed, isSubTabAllowed } from './helpers.js';
+import { loadSiteCache, saveSiteCache } from '../site-cache.js';
 
 interface NavPage {
   url: string;
@@ -168,6 +169,23 @@ interface NavItem {
   kind: 'link' | 'tab' | 'button';
 }
 
+// Per-page cache key — URL when there is one (the common case), otherwise the label, for the
+// rarer click-only destination with no real href. Used both to look up what a page's sub-links
+// were last time, and to record them again after a fresh scan.
+function navCacheKey(url: string | null, label: string): string {
+  return url ?? `label:${label}`;
+}
+
+function toCachedNavChildren(items: NavItem[]): CachedNavChild[] {
+  return items.map((i) => ({ label: i.label, href: i.href, selector: i.selector }));
+}
+
+// `kind` is never read by any caller of collectNavItems (confirmed — only label/href/selector
+// are used downstream), so a fixed placeholder is fine here.
+function fromCachedNavChildren(children: CachedNavChild[]): NavItem[] {
+  return children.map((c) => ({ label: c.label, href: c.href, selector: c.selector, kind: 'link' }));
+}
+
 /**
  * Collect all distinct navigation items currently visible on the page.
  * Covers: links in nav/sidebar/header, tabs, and hamburger-revealed panels.
@@ -317,11 +335,36 @@ export async function runNavigation(
   }
   const queue: QueueItem[] = [];
 
+  // Per-hostname memory from a previous crawl of THIS site (distinct from the per-category
+  // siteKnowledge doc) — lets a page whose sub-links are already known get replayed instead of
+  // re-discovered live, so a repeat run against a site already mapped out doesn't have to walk
+  // the whole thing again from scratch.
+  const siteCache = ctx.siteCacheHit;
+  const cachedPages = new Map<string, CachedNavChild[]>((siteCache?.pages ?? []).map((p) => [p.key, p.children]));
+  const newCachedPages = new Map<string, CachedNavChild[]>();
+
   // Collect initial nav from the landing/post-login page
-  const initialItems = await collectNavItems(page, baseOrigin);
-  ctx.onLog(`[Navigation] Discovered ${initialItems.length} nav items on entry page`);
+  const allowedSections = ctx.config.allowedSections;
+  const landingKey = navCacheKey(startUrl, 'ENTRY');
+  const cachedLanding = cachedPages.get(landingKey);
+  const initialItems = cachedLanding ? fromCachedNavChildren(cachedLanding) : await collectNavItems(page, baseOrigin);
+  newCachedPages.set(landingKey, toCachedNavChildren(initialItems));
+  ctx.onLog(
+    cachedLanding
+      ? `[Navigation] Reusing ${initialItems.length} known nav item(s) from a previous crawl of this site — skipping fresh discovery`
+      : `[Navigation] Discovered ${initialItems.length} nav items on entry page`,
+  );
+  if (allowedSections?.length) {
+    ctx.onLog(`[Navigation] Scope restriction active — only exploring: ${allowedSections.map((s) => s.section).join(', ')}`);
+  }
 
   for (const item of initialItems) {
+    // Top-level items (the landing page's own sidebar) must match an allowed section by name —
+    // there's no parent to inherit scope from at the root of the tree.
+    if (!isSectionAllowed(item.label, allowedSections)) {
+      ctx.onLog(`[Navigation] Skipping "${item.label}" — outside the allowed scope`);
+      continue;
+    }
     queue.push({ url: item.href, label: item.label, depth: 1, selector: item.selector, discoveredOnUrl: startUrl });
   }
 
@@ -596,6 +639,10 @@ export async function runNavigation(
             ctx.onLog(`[Navigation] Skipping tab "${tab.label}" — matches a risky-action pattern`);
             continue;
           }
+          if (!isSubTabAllowed(next.label, tab.label, allowedSections)) {
+            ctx.onLog(`[Navigation] Skipping tab "${tab.label}" (under "${next.label}") — outside the allowed scope`);
+            continue;
+          }
           const stateKey = `${finalUrl}::tab:${tab.label}`;
           if (visitedTabStates.has(stateKey)) continue;
           visitedTabStates.add(stateKey);
@@ -648,10 +695,26 @@ export async function runNavigation(
       // Only discover deeper nav from authenticated pages (has content, no login wall)
       const hasPasswordInput = (await page.locator('input[type="password"]').count()) > 0;
       if (!hasPasswordInput && next.depth < MAX_DEPTH) {
-        const childItems = await collectNavItems(page, baseOrigin);
+        const childKey = navCacheKey(next.url, next.label);
+        const cachedChildren = cachedPages.get(childKey);
+        const childItems = cachedChildren ? fromCachedNavChildren(cachedChildren) : await collectNavItems(page, baseOrigin);
+        newCachedPages.set(childKey, toCachedNavChildren(childItems));
+        if (cachedChildren) {
+          ctx.onLog(`[Navigation] Reusing ${cachedChildren.length} known sub-link(s) for "${next.label}" from a previous crawl — skipping rediscovery`);
+        }
         for (const child of childItems) {
           if (child.href && visitedUrls.has(child.href)) continue;
           if (!child.href && visitedKeys.has(`${finalUrl}::${child.label}`)) continue;
+          // Allow it either as its own top-level section, or as a (href-based) sub-item of the
+          // CURRENT, already-in-scope page — covers both a persistent sidebar re-offering other
+          // top-level sections (rejected unless separately allowed) and a genuine sub-page link
+          // (e.g. an "Overview" page, not just a same-URL tab) nested under an allowed section.
+          const allowed =
+            isSectionAllowed(child.label, allowedSections) || isSubTabAllowed(next.label, child.label, allowedSections);
+          if (!allowed) {
+            ctx.onLog(`[Navigation] Skipping "${child.label}" (under "${next.label}") — outside the allowed scope`);
+            continue;
+          }
           queue.push({
             url: child.href,
             label: child.label,
@@ -729,6 +792,30 @@ export async function runNavigation(
     `found ${visitedPages.filter((p) => p.issues.length > 0).length} with issues, ` +
     `${uniqueJsErrors.length} JS errors`,
   );
+
+  // ── Save per-hostname nav-structure memory for next time ──────────────────
+  // Merge with whatever's already on disk (ignoring staleness here — we're about to refresh
+  // `lastCrawledAt` anyway) so a scope-restricted run that only touched a couple of pages
+  // doesn't wipe out everything previously known about the rest of the site — it only
+  // refreshes the pages it actually visited this run.
+  try {
+    const hostname = new URL(ctx.config.targetUrl).hostname;
+    const siteCacheDir = join(ctx.sessionsDir, '..', 'site-cache');
+    const existing = await loadSiteCache(siteCacheDir, hostname, { ignoreAge: true });
+    const mergedPages = new Map<string, CachedNavChild[]>((existing?.pages ?? []).map((p) => [p.key, p.children]));
+    for (const [key, children] of newCachedPages) mergedPages.set(key, children);
+    await saveSiteCache(siteCacheDir, {
+      hostname,
+      lastCrawledAt: new Date().toISOString(),
+      classification: ctx.classification ?? existing?.classification,
+      discoveredRoutes: [...new Set([...(existing?.discoveredRoutes ?? []), ...(ctx.discoveredRoutes ?? [])])],
+      discoveredApiEndpoints: [...new Set([...(existing?.discoveredApiEndpoints ?? []), ...(ctx.discoveredApiEndpoints ?? [])])],
+      pages: [...mergedPages].map(([key, children]) => ({ key, children })),
+    });
+    ctx.onLog(`[Navigation] Saved known site structure (${mergedPages.size} page(s)) for faster re-exploration next time`);
+  } catch (err) {
+    ctx.onLog(`[Navigation] Could not save site structure cache: ${(err as Error).message.slice(0, 150)}`);
+  }
 
   // Return to start
   await page.goto(startUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});

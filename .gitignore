@@ -5,8 +5,17 @@ build/
 credentials.json
 qualitypilot-integration.json
 sessions/
+site-cache/
+knowledge-base/*.signals.json
+knowledge-base/*.meta.json
 *.log
 .DS_Store
 playwright-report/
 test-results/
 .turbo/
+*.tsbuildinfo
+
+# Local-only Claude / editor state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+Claude outputs/

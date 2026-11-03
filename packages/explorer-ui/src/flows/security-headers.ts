@@ -77,15 +77,33 @@ export async function runSecurityHeadersCheck(
     );
   } else {
     const weak = cookies.filter((c) => !c.httpOnly || !c.secure || c.sameSite === 'None');
+    // Severity depends on what the cookie actually holds. A credential-like value (a JWT, or a
+    // long random-looking id under a session/auth-ish name) readable from JavaScript is a real
+    // session-theft risk; a short readable value like SauceDemo's session-username=standard_user
+    // is a preference/display cookie and only worth a low note.
+    const looksLikeCredential = (c: { name: string; value: string }) =>
+      /^eyJ[\w-]+\.[\w-]+\./.test(c.value) ||
+      (/sess|sid|token|auth|jwt|login|remember/i.test(c.name) && c.value.length >= 16 && /[0-9]/.test(c.value) && /[a-z]/i.test(c.value));
+    const credentialCookies = weak.filter(looksLikeCredential);
+    // Only cookies that could carry a login are a security finding. Analytics/CDN cookies
+    // (Mixpanel, Google Analytics, Cloudflare…) are usually readable by script by design and hold
+    // nothing an attacker can use — they become an info note, not a bug.
     if (weak.length > 0) {
+      const anyCredential = credentialCookies.length > 0;
       ctx.onFinding({
-        severity: 'medium',
+        severity: anyCredential ? 'medium' : 'info',
         area: 'Security-Headers',
-        title: `${weak.length} of ${cookies.length} cookie(s) missing secure flags`,
+        title: anyCredential
+          ? `${credentialCookies.length} login cookie(s) missing secure flags`
+          : `${weak.length} cookie(s) without secure flags — none of them hold login data`,
         steps: [`Log in and reach ${url}`, 'Inspect cookies in DevTools → Application → Cookies'],
         expected: 'Session-relevant cookies should set httpOnly, secure, and SameSite=Lax or Strict',
         actual: weak
-          .map((c) => `${c.name}: httpOnly=${c.httpOnly}, secure=${c.secure}, sameSite=${c.sameSite ?? 'none'}`)
+          .map(
+            (c) =>
+              `${c.name}: httpOnly=${c.httpOnly}, secure=${c.secure}, sameSite=${c.sameSite ?? 'none'}` +
+              (looksLikeCredential(c) ? ' (value looks like a session credential)' : ' (value does not look like a credential)'),
+          )
           .join('; '),
         evidence: [],
         reproRate: '1/1',
