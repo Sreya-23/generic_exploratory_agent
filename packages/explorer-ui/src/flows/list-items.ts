@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import type { Locator, Page } from 'playwright';
 import type { ExecutorContext } from '@qa/shared';
+import { isUrlInScope } from './helpers.js';
 
 // Shared "what is the main repeating list on this page" detection, used by the outcome-check
 // flows (sort-verification, link-target-consistency, duplicate-images, cart-integrity).
@@ -80,8 +81,17 @@ export async function detectListItems(
 
         let best: { members: Element[]; score: number } | null = null;
         const parents = Array.from(document.querySelectorAll('body *')).slice(0, 4000);
+        // Sidebars, top bars and menus are repeating links too, but they are navigation, not
+        // a list of records — OrangeHRM's sidebar (Admin, PIM, Leave…) was picked as "the list"
+        // and its first entry clicked, leaving the allowed section and reporting a false mismatch.
+        const NAV_CONTAINER =
+          'nav, aside, header, footer, [role="navigation"], [role="menu"], [role="menubar"], [role="tablist"], ' +
+          '[class*="sidebar" i], [class*="sidenav" i], [class*="side-nav" i], [class*="navbar" i], [class*="main-menu" i]';
         for (const parent of parents) {
           if (parent.children.length < minItems) continue;
+          const navAncestor = parent.closest(NAV_CONTAINER);
+          // A layout wrapper such as <div class="with-sidebar"> also contains the main content.
+          if (navAncestor && !navAncestor.querySelector('main, [role="main"]')) continue;
           const groups = new Map<string, Element[]>();
           for (const child of Array.from(parent.children)) {
             if (!isVisible(child)) continue;
@@ -201,6 +211,8 @@ export function sameOriginRoutes(ctx: ExecutorContext, startUrl: string, max: nu
     }
     if (!abs.startsWith(origin) || seen.has(abs)) continue;
     if (/logout|sign-?out|delete|remove/i.test(abs)) continue;
+    // Respect the user's section restriction — never open a known route outside it.
+    if (!isUrlInScope(abs, ctx.config.allowedSections)) continue;
     seen.add(abs);
     out.push(abs);
     if (out.length >= max) break;

@@ -166,6 +166,18 @@ export interface Finding {
   confidence?: 'verified' | 'heuristic';
   /** One sentence on why `confidence` was set this way — shown alongside the finding. */
   confidenceReason?: string;
+  /**
+   * An AI reviewer's independent opinion on whether this is a real defect, from the finding's
+   * own description, steps and screenshot (needs an LLM key). Shown beside the evidence-based
+   * badge, never instead of it: it does not change severity, confidence or the health score.
+   */
+  aiReview?: AiReview;
+}
+
+export interface AiReview {
+  verdict: 'agrees' | 'doubts' | 'unsure';
+  /** One sentence the reviewer gave for its verdict. */
+  reason: string;
 }
 
 /**
@@ -228,6 +240,10 @@ export interface SessionState {
   id: string;
   config: SessionConfig;
   status: SessionStatus;
+  /** AI reviews already made for this run's findings, by finding id — so a report re-render doesn't pay for them again. */
+  aiReviews?: Record<string, AiReview>;
+  /** A check is paused right now waiting for the user to answer this permission prompt in chat. */
+  pendingPreAction?: { keys: string[]; description: string };
   plan?: ExplorationPlan;
   findings: Finding[];
   progress: SessionProgress;
@@ -408,6 +424,11 @@ export interface PreActionRequest {
   requiredExtras?: string[];
   /** URL the action was reached on, so the resulting "skipped" finding is locatable. */
   pageUrl?: string;
+  /**
+   * The caller will wait for a chat reply via ctx.waitForPreActionReply, so the orchestrator
+   * must not log the "Skipped" note yet — it is logged only if the wait times out.
+   */
+  willWait?: boolean;
 }
 
 export interface ExecutorContext {
@@ -442,6 +463,12 @@ export interface ExecutorContext {
    * The orchestrator also emits a live chat message prompting the user to provide missing data.
    */
   onPreActionNeeded?: (req: PreActionRequest) => Record<string, string> | null;
+  /**
+   * Pause the current check until the user answers a pre-action prompt in chat (or the wait
+   * runs out). Resolves to the extras once one of `req.requiredExtras` is supplied, or null on
+   * `skip`/no reply. Time spent here does not count toward the task's own timeout.
+   */
+  waitForPreActionReply?: (req: PreActionRequest) => Promise<Record<string, string> | null>;
   /** Distinct routes (origin+pathname) discovered from links on the landing page, set by recon. */
   discoveredRoutes?: string[];
   /** Distinct routes actually navigated to during the session, set by the coverage-report flow. */
@@ -544,6 +571,8 @@ export interface SiteClassification {
   signals: string[];
   inferredJourneys: string[];
   keyFeatures: string[];
+  /** Who decided: the AI model, or the built-in keyword rules (no key / AI failed). Absent on older cached entries. */
+  source?: 'ai' | 'rules';
 }
 
 export interface SiteIntelligenceSignals {

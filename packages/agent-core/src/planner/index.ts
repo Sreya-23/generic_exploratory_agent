@@ -79,6 +79,36 @@ const LOW_RISK = new Set([
   'long-content', 'locale-format', 'bfcache', 'coverage-report', 'web-vitals',
 ]);
 
+// Section-scoped runs ("only explore Recruitment"). Scope used to guard only navigation, so a
+// restricted run still scheduled the full ~115-check plan — load tests, network chaos, logout /
+// session checks, cross-browser, and API sweeps over every endpoint recon happened to record —
+// which made it as slow as a full run and produced findings about pages the user excluded.
+// When sections are restricted (and the user didn't hand-pick checks), only checks that act on
+// the page in front of them are kept: they run on the allowed section's own page.
+export const SECTION_LEVEL_FLOWS = new Set([
+  'recon', 'journey', 'user-directed', 'navigation',
+  'generic-crud', 'cancel-creation', 'cancel-deletion', 'duplicate-creation',
+  'form-validation', 'field-validation', 'input-boundary', 'double-click', 'double-submit',
+  'modal-lifecycle', 'dropdown-exploration', 'interactive-states', 'table-interaction',
+  'empty-states', 'keyboard-nav', 'viewport', 'error-ui', 'file-upload', 'pagination-ui', 'wizard',
+  'element-integrity', 'touch-target', 'dead-links', 'action-inventory', 'data-integrity',
+  'state-transition', 'business-logic-boundary', 'sort-verification', 'link-target-consistency',
+  'input-retention', 'cart-integrity', 'download-verify', 'autofill-overlap', 'focus-trap',
+  'placeholder-check', 'broken-images', 'element-overflow', 'long-content', 'toast-stacking',
+  'duplicate-images', 'back-during-post', 'js-errors', 'web-vitals', 'coverage-report',
+  'labels', 'keyboard', 'contrast', 'semantic-structure',
+  'xss-probe', 'security-headers', 'hidden-route-access', 'visual-review', 'agentic-explore',
+]);
+
+/** True when this run should use the shorter, section-only plan. Set QA_SCOPED_FULL_PLAN=1 to keep every check. */
+export function isSectionFocusedRun(config: SessionConfig): boolean {
+  return (
+    !!config.allowedSections?.length &&
+    !config.selectedFlowClasses?.length &&
+    process.env.QA_SCOPED_FULL_PLAN !== '1'
+  );
+}
+
 function riskWeight(flowClass: string): number {
   if (flowClass === 'recon') return 100; // always first, not part of the risk ordering below
   if (CRITICAL_RISK.has(flowClass)) return 10;
@@ -155,7 +185,10 @@ export function buildGenericPlan(sessionId: string, config: SessionConfig): Expl
   }
 
   const limit = DEPTH_TASK_LIMITS[config.depth];
-  const limitedTasks = tasks.slice(0, limit);
+  const scopedTasks = isSectionFocusedRun(config)
+    ? tasks.filter((t) => SECTION_LEVEL_FLOWS.has(t.flowClass))
+    : tasks;
+  const limitedTasks = scopedTasks.slice(0, limit);
 
   const phases: PlanPhase[] = GENERIC_PHASES.map((phase) => ({
     id: phase.id,

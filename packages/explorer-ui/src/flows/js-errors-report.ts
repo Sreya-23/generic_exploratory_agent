@@ -1,3 +1,4 @@
+import { isUrlInScope } from './helpers.js';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
 import { getTrackedErrors, clearTrackedErrors } from './js-error-tracker.js';
@@ -96,7 +97,26 @@ export async function runJsErrorsReport(
   ctx: ExecutorContext,
   _task: FlowTask,
 ): Promise<void> {
-  const errors = getTrackedErrors(ctx.sessionId);
+  // Errors raised on another company's site (a link the agent followed opened it in a new tab —
+  // e.g. OrangeHRM's "Upgrade" → orangehrm.com) are not this app's bugs, and errors on pages
+  // outside the user's allowed sections are not what they asked about.
+  const siteOf = (u: string) => {
+    try {
+      return new URL(u).hostname.split('.').slice(-2).join('.');
+    } catch {
+      return '';
+    }
+  };
+  const targetSite = siteOf(ctx.config.targetUrl);
+  const allErrors = getTrackedErrors(ctx.sessionId);
+  const errors = allErrors.filter(
+    (e) =>
+      siteOf(e.url) === targetSite &&
+      (!ctx.config.allowedSections?.length || isUrlInScope(e.url, ctx.config.allowedSections)),
+  );
+  if (errors.length < allErrors.length) {
+    ctx.onLog(`[JsErrors] ${allErrors.length - errors.length} error(s) left out — raised on another site or outside the allowed sections`);
+  }
   if (errors.length === 0) {
     ctx.onLog('[JsErrors] No uncaught JS errors or console errors observed across the session');
     return;

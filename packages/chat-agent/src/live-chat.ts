@@ -76,6 +76,9 @@ export function sessionEventToChatMessage(event: SessionEvent): ChatMessage | nu
       if (message.startsWith('[Auth]')) {
         return msg('assistant', message.replace('[Auth] ', '🔐 '), { kind: 'auth' });
       }
+      if (message.startsWith('[Gate]')) {
+        return msg('assistant', message.replace('[Gate] ', '⏸️ '), { kind: 'auth' });
+      }
       return msg('assistant', message, { kind: 'progress' });
     }
 
@@ -266,6 +269,44 @@ export function processLiveMessage(
       ),
     );
     return { messages, action: 'update_auth', credentials: merged };
+  }
+
+  // A plain "yes" / "go ahead" while a check is paused on a permission prompt approves THAT
+  // prompt. Previously only the exact `confirm_create: yes` form worked — a natural "yes" fell
+  // through to the help text, saved nothing, and the action was reported as not approved.
+  const pending = session.pendingPreAction;
+  if (pending && /\b(yes|yep|yeah|ok|okay|sure|allow|approve[d]?|go ahead|proceed|do it)\b/i.test(userText)) {
+    const confirmKeys = pending.keys.filter((k) => k.startsWith('confirm'));
+    if (confirmKeys.length > 0) {
+      const existingCreds = session.config.credentials ?? { type: 'none' as const };
+      const approved: Record<string, string> = { ...(existingCreds.extras ?? {}) };
+      delete approved['_user_skip'];
+      for (const k of confirmKeys) approved[k] = 'yes';
+      messages.push(
+        msg('assistant', `✅ Approved: **${pending.description}** — going ahead.`, { kind: 'status' }),
+      );
+      return { messages, action: 'update_auth', credentials: { ...existingCreds, extras: approved } };
+    }
+    messages.push(
+      msg(
+        'assistant',
+        `This one needs a value, not just yes — send ${pending.keys.map((k) => `\`${k}: <value>\``).join(', ')}, or \`skip\`.`,
+        { kind: 'status' },
+      ),
+    );
+    return { messages, action: 'none' };
+  }
+
+  if (!pending && /^(yes|yep|yeah|ok|okay|sure|allow|approve[d]?|go ahead|proceed|do it)\b[\s.!]*$/i.test(userText.trim())) {
+    messages.push(
+      msg(
+        'assistant',
+        'Nothing is waiting for your approval right now — the last question already timed out and was skipped. ' +
+          'To approve ahead of time, send `confirm_create: yes` (or `confirm_edit: yes` / `confirm_delete: yes`); it applies to the rest of this run.',
+        { kind: 'status' },
+      ),
+    );
+    return { messages, action: 'none' };
   }
 
   // Check for extra key:value inputs (card, phone, account, etc.) provided in response to pre-action prompts

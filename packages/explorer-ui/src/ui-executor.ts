@@ -671,12 +671,25 @@ export class UiExecutor implements BaseExecutor {
       environmentChecks: ctx.environmentChecks,
       accessMap: ctx.accessMap,
     };
+    // Time spent paused on a permission prompt (waiting for the user's chat reply) is not the
+    // check being slow, so it is added back onto this task's timeout below.
+    let waitedForUserMs = 0;
     const wrappedCtx: ExecutorContext = {
       ...ctx,
       onFinding: (f) => {
         findingsCount++;
         ctx.onFinding(f);
       },
+      waitForPreActionReply: ctx.waitForPreActionReply
+        ? async (req) => {
+            const t0 = Date.now();
+            try {
+              return await ctx.waitForPreActionReply!(req);
+            } finally {
+              waitedForUserMs += Date.now() - t0;
+            }
+          }
+        : undefined,
     };
 
     ctx.onLog(`[UI] Starting: ${task.title}`);
@@ -738,18 +751,25 @@ export class UiExecutor implements BaseExecutor {
         }
       };
 
-      await Promise.race([
-        run(),
-        new Promise<never>((_, reject) => {
-          setTimeout(() => {
-            reject(
-              new Error(
-                `Task timeout after ${TASK_TIMEOUT_MS / 1000}s — aborted to keep the session moving`,
-              ),
-            );
-          }, TASK_TIMEOUT_MS);
-        }),
-      ]);
+      const taskStart = Date.now();
+      let timeoutTimer: ReturnType<typeof setInterval> | undefined;
+      try {
+        await Promise.race([
+          run(),
+          new Promise<never>((_, reject) => {
+            timeoutTimer = setInterval(() => {
+              if (Date.now() - taskStart - waitedForUserMs < TASK_TIMEOUT_MS) return;
+              reject(
+                new Error(
+                  `Task timeout after ${TASK_TIMEOUT_MS / 1000}s — aborted to keep the session moving`,
+                ),
+              );
+            }, 1000);
+          }),
+        ]);
+      } finally {
+        if (timeoutTimer) clearInterval(timeoutTimer);
+      }
 
       // wrappedCtx is a SEPARATE object from ctx (built via `{...ctx, onFinding}` above) — a
       // flow setting wrappedCtx.discoveredApiEndpoints/postLoginUrl/actionInventory/etc. only

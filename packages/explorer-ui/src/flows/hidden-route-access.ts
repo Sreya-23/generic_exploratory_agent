@@ -7,7 +7,7 @@
 import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
-import { restoreSessionStorage, savedSessionStatePath, isLoginWallPage, waitForRealContent } from './helpers.js';
+import { isUrlInScope, restoreSessionStorage, savedSessionStatePath, isLoginWallPage, waitForRealContent } from './helpers.js';
 
 const MAX_CANDIDATES = 5;
 // Never follow a hidden logout link — actually navigating it would end the session this whole
@@ -76,7 +76,7 @@ export async function runHiddenRouteAccessCheck(
         return null;
       }
     })
-    .filter((c): c is { url: string; label: string } => !!c && c.url.startsWith(origin) && !SKIP_HREF_PATTERN.test(c.url))
+    .filter((c): c is { url: string; label: string } => !!c && c.url.startsWith(origin) && !SKIP_HREF_PATTERN.test(c.url) && isUrlInScope(c.url, ctx.config.allowedSections))
     .slice(0, MAX_CANDIDATES);
 
   if (candidates.length === 0) {

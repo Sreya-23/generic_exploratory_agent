@@ -2,7 +2,7 @@
 import { join } from 'node:path';
 import { chromium, type Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
-import { restoreAuthenticatedState, isLoginWallPage } from './helpers.js';
+import { restoreAuthenticatedState, isLoginWallPage, isUrlInScope } from './helpers.js';
 
 // B2 — Forward after Back: stale form resubmit
 export async function runForwardAfterBack(
@@ -84,7 +84,10 @@ export async function runDeepLink(
   const shot = (n: string) =>
     join(ctx.sessionsDir, ctx.sessionId, 'screenshots', `deep-link-${n}.png`);
 
-  const baseUrl = ctx.config.targetUrl.replace(/\/$/, '');
+  // Paths collected below are absolute (/web/index.php/…), so they join onto the ORIGIN. Joining
+  // them onto the full target URL produced …/auth/login/web/index.php/… on any site whose
+  // start URL has a path (OrangeHRM), which 404'd and was reported as a JS error.
+  const baseUrl = new URL(ctx.config.targetUrl).origin;
 
   /**
    * Collect internal links from a page that is already loaded.
@@ -120,7 +123,9 @@ export async function runDeepLink(
     ctx.onLog(`[B5] Collected ${currentPaths.length} paths from current authenticated page (${page.url()})`);
 
     // BFS-lite: visit up to 3 more pages to find more routes
-    const queue = [...new Set(currentPaths)].slice(0, 5);
+    const queue = [...new Set(currentPaths)]
+      .filter((p) => isUrlInScope(p, ctx.config.allowedSections, ctx.config.targetUrl))
+      .slice(0, 5);
     const visited = new Set<string>([page.url()]);
 
     for (const path of queue) {
@@ -162,6 +167,11 @@ export async function runDeepLink(
     ];
     pathsToTest = commonGuesses;
     ctx.onLog(`[B5] No paths discovered from auth session — falling back to ${pathsToTest.length} common guesses`);
+  }
+  if (ctx.config.allowedSections?.length) {
+    const before = pathsToTest.length;
+    pathsToTest = pathsToTest.filter((p) => isUrlInScope(p, ctx.config.allowedSections, ctx.config.targetUrl));
+    ctx.onLog(`[B5] ${before - pathsToTest.length} path(s) outside the allowed sections left out`);
   }
 
   // Clear session before testing

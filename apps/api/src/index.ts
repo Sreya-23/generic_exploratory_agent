@@ -146,9 +146,10 @@ app.post<{ Params: { id: string }; Body: { findingIds?: string[] } }>(
     // Info-severity findings are never real defects (see generate-report.ts's own split) —
     // excluded even if explicitly requested, same discipline as the report's own bug list.
     const candidates = session.findings.filter((f) => f.severity !== 'info');
-    const findings = findingIds?.length
+    const findings = (findingIds?.length
       ? candidates.filter((f) => findingIds.includes(f.id))
-      : candidates;
+      : candidates
+    ).map((f) => (session.aiReviews?.[f.id] ? { ...f, aiReview: session.aiReviews[f.id] } : f));
 
     if (findings.length === 0) {
       return reply.status(400).send({ error: 'No eligible findings to raise (info-severity findings are excluded).' });

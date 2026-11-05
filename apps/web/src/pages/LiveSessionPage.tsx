@@ -22,6 +22,7 @@ function applyEvent(
   setSession: Dispatch<SetStateAction<SessionState | null>>,
   setFindings: Dispatch<SetStateAction<Finding[]>>,
   setChatMessages: Dispatch<SetStateAction<ChatMessage[]>>,
+  setPendingGate?: Dispatch<SetStateAction<PendingGate | null>>,
 ): void {
   if (event.type === 'chat:history') {
     setChatMessages(event.payload as ChatMessage[]);
@@ -92,16 +93,52 @@ function applyEvent(
   }
 
   if (event.type === 'pre_action:required') {
-    const payload = event.payload as { prompt: string; missing: string[] };
+    const payload = event.payload as { prompt: string; missing: string[]; request?: { description?: string } };
     const msg: ChatMessage = {
       id: `pre-action-${Date.now()}`,
       role: 'assistant',
       content: payload.prompt,
       timestamp: new Date().toISOString(),
-      meta: { kind: 'status' },
+      // Highlighted like login prompts — as a plain status line it was lost among the progress logs.
+      meta: { kind: 'auth' },
     };
     setChatMessages((prev) => [...prev, msg]);
+    const waitSeconds = Number(/paused for (\d+)s/.exec(payload.prompt)?.[1] ?? 0);
+    if (setPendingGate && waitSeconds > 0) {
+      setPendingGate({
+        description: payload.request?.description ?? 'An action needs your permission',
+        reply: payload.missing.every((k) => k.startsWith('confirm'))
+          ? 'yes'
+          : payload.missing.map((k) => `${k}: <value>`).join(', '),
+        until: Date.now() + waitSeconds * 1000,
+      });
+    }
   }
+}
+
+interface PendingGate {
+  description: string;
+  reply: string;
+  until: number;
+}
+
+/** Pinned above the progress bar while a check is paused on a permission prompt. */
+function PendingGateBanner({ gate, onDone }: { gate: PendingGate; onDone: () => void }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const left = Math.max(0, Math.round((gate.until - now) / 1000));
+  useEffect(() => {
+    if (left === 0) onDone();
+  }, [left, onDone]);
+  return (
+    <p className="auth-status-warning">
+      ⏸️ <strong>Permission needed:</strong> {gate.description}. Reply <code>{gate.reply}</code> in the chat to
+      allow it, or <code>skip</code> — {left}s left before it is skipped.
+    </p>
+  );
 }
 
 export function LiveSessionPage() {
@@ -112,6 +149,8 @@ export function LiveSessionPage() {
   const [wsStatus, setWsStatus] = useState<'connecting' | 'connected' | 'error' | 'closed'>('connecting');
   const [loadError, setLoadError] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  const [pendingGate, setPendingGate] = useState<PendingGate | null>(null);
+  const clearGate = useCallback(() => setPendingGate(null), []);
   // Once the run has finished, show the report's de-duplicated list (merged repeats, e.g. the
   // same broken add-to-cart on two products) instead of every raw finding as it arrived.
   const [reportFindings, setReportFindings] = useState<Finding[] | null>(null);
@@ -161,7 +200,7 @@ export function LiveSessionPage() {
 
     const disconnect = connectSessionWs(
       id,
-      (event) => applyEvent(event, setSession, setFindings, setChatMessages),
+      (event) => applyEvent(event, setSession, setFindings, setChatMessages, setPendingGate),
       setWsStatus,
     );
 
@@ -178,6 +217,7 @@ export function LiveSessionPage() {
     async (text: string) => {
       if (!id) return;
       setChatLoading(true);
+      setPendingGate(null);
       try {
         const result = await sendSessionChat(id, text);
         setChatMessages(result.messages);
@@ -286,6 +326,7 @@ export function LiveSessionPage() {
         </div>
       </div>
 
+      {pendingGate && isActive && <PendingGateBanner gate={pendingGate} onDone={clearGate} />}
       <SessionProgress session={session} />
 
       <div className="live-grid live-grid-chat">

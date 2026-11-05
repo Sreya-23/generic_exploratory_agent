@@ -1,5 +1,7 @@
-import type { Finding, HealthScore } from '@qa/shared';
-import { callLLM, hasAnyLLMKey } from '@qa/shared';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { extname } from 'node:path';
+import type { AiReview, Finding, HealthScore, LLMPart } from '@qa/shared';
+import { callLLM, callLLMParts, hasAnyLLMKey, isExecutionError } from '@qa/shared';
 import type { SeverityCounts } from './generate-report.js';
 
 // Same discipline as classify-site-ai.ts: the deterministic path (token-overlap dedup,
@@ -127,64 +129,104 @@ Respond with ONLY the summary text, nothing else.`;
   return cleaned;
 }
 
-export interface FindingValidation {
-  plausible: boolean;
-  note: string;
+// ── AI review of every reported bug ────────────────────────────────────────────────────────
+// The point of configuring an API key is a second, independent look at each bug before anyone
+// raises it. Every defect-type finding (not info notes, not the agent's own execution issues)
+// is sent with its description, steps and first screenshot; the reviewer answers agrees /
+// doubts / unsure with one sentence. The answer is shown BESIDE the evidence-based badge — it
+// never changes severity, confidence or the health score, and never hides a finding. Reviews
+// are cached on the session by finding id, so re-opening the report doesn't pay for them again.
+
+const REVIEW_MAX = Math.max(0, Number(process.env.AI_REVIEW_MAX_FINDINGS ?? 40));
+const REVIEW_CONCURRENCY = 3;
+const REVIEW_TIMEOUT_MS = 60000;
+const MAX_SCREENSHOT_BYTES = 4 * 1024 * 1024;
+const IMAGE_TYPES: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp' };
+const inFlight = new Map<string, Promise<AiReview | null>>();
+
+function firstScreenshot(f: Finding): { mimeType: string; base64: string } | null {
+  for (const path of f.evidence ?? []) {
+    const mime = IMAGE_TYPES[extname(path).toLowerCase()];
+    if (!mime || !existsSync(path)) continue;
+    try {
+      if (statSync(path).size > MAX_SCREENSHOT_BYTES) continue;
+      return { mimeType: mime, base64: readFileSync(path).toString('base64') };
+    } catch {
+      /* unreadable — try the next one */
+    }
+  }
+  return null;
 }
 
-/**
- * §30 — a Validator pass, distinct from each flow's own Detector role (noticing something)
- * and from the dedup pass above (which only asks "is this the same as another finding", never
- * "is this real at all"). Only reviews 'heuristic'-confidence findings — 'verified' findings
- * are already backed by an objective signal (HTTP status, thrown exception, direct DOM
- * measurement) and don't need a second opinion. Never drops or downgrades a finding on its
- * own say-so — an LLM flagging something "implausible" is itself just another heuristic
- * signal, not ground truth. The report keeps every finding and only adds a caveat, same
- * "potential issue — human verification recommended" discipline visual-review.ts already uses
- * for its own Gemini-sourced findings.
- */
-export async function validateFindingsWithAI(findings: Finding[]): Promise<Map<number, FindingValidation> | null> {
-  const candidates = findings.map((f, i) => ({ f, i })).filter(({ f }) => f.confidence === 'heuristic');
-  if (!hasAnyLLMKey() || candidates.length === 0 || candidates.length > 40) return null;
+function reviewPrompt(f: Finding, targetUrl: string, hasImage: boolean): string {
+  return `You are a senior QA engineer reviewing one bug that an automated exploratory-testing agent reported on ${targetUrl}. Decide whether a careful human tester would agree this is a REAL defect worth raising, or whether it is likely a false positive caused by how the automation tested (timing, test data, a deliberate design choice, a third-party page, etc.).
 
-  const indexed = candidates
-    .map(({ f, i }) => `${i}: [${f.severity}/${f.area}] ${f.title}\n   Expected: ${f.expected}\n   Actual: ${f.actual}`.slice(0, 400))
-    .join('\n');
+Severity given: ${f.severity}
+Check area: ${f.area}
+Title: ${f.title}
+Page: ${f.pageUrl ?? targetUrl}
+Steps:
+${f.steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
+Expected: ${f.expected}
+Actual: ${f.actual}
+Agent's own confidence: ${f.confidence ?? 'not stated'}${f.confidenceReason ? ` — ${f.confidenceReason}` : ''}
+${hasImage ? 'The attached image is the screenshot the agent took as evidence.' : 'No screenshot is available.'}
 
-  const prompt = `You are a senior QA engineer doing a second-pass sanity check on automated exploratory-testing findings before they reach a human reviewer. Each finding below was already flagged "heuristic confidence" by the tool that found it — some ambiguity is already expected and acknowledged. Only flag a finding as implausible when you're genuinely confident it does NOT describe a real defect on its face (e.g. the Expected/Actual actually describe normal, correct behavior; the finding is self-contradictory; or it's an obvious environment artifact) — do not flag something merely because it's uncertain; uncertainty is already priced in.
+Reply with ONLY a JSON object, no markdown:
+{"verdict": "agrees" | "doubts" | "unsure", "reason": "<one plain-English sentence a non-technical reader understands>"}
+Use "agrees" when the evidence shows a real problem, "doubts" when it is probably not a real defect, "unsure" when the evidence is not enough to tell.`;
+}
 
-FINDINGS (index: [severity/area] title, expected, actual):
-${indexed}
-
-Respond with ONLY a JSON array of {"index": <number>, "plausible": true|false, "note": "<one short sentence why>"} — one entry for EVERY finding listed above.`;
-
-  const text = await callLLM(prompt, REQUEST_TIMEOUT_MS);
+async function reviewOne(f: Finding, targetUrl: string): Promise<AiReview | null> {
+  const image = firstScreenshot(f);
+  const parts: LLMPart[] = [{ type: 'text', text: reviewPrompt(f, targetUrl, !!image) }];
+  if (image) parts.push({ type: 'image', mimeType: image.mimeType, base64: image.base64 });
+  const text = await callLLMParts(parts, REVIEW_TIMEOUT_MS);
   if (!text) return null;
-  const match = text.match(/\[[\s\S]*\]/);
+  const match = text.match(/\{[\s\S]*\}/);
   if (!match) return null;
-
   try {
-    const parsed = JSON.parse(match[0]);
-    if (!Array.isArray(parsed)) return null;
-    const result = new Map<number, FindingValidation>();
-    for (const entry of parsed) {
-      if (
-        entry &&
-        typeof entry === 'object' &&
-        typeof entry.index === 'number' &&
-        Number.isInteger(entry.index) &&
-        entry.index >= 0 &&
-        entry.index < findings.length &&
-        typeof entry.plausible === 'boolean'
-      ) {
-        result.set(entry.index, {
-          plausible: entry.plausible,
-          note: typeof entry.note === 'string' ? entry.note.slice(0, 200) : '',
-        });
-      }
-    }
-    return result.size > 0 ? result : null;
+    const parsed = JSON.parse(match[0]) as { verdict?: string; reason?: string };
+    const verdict = parsed.verdict === 'agrees' || parsed.verdict === 'doubts' || parsed.verdict === 'unsure' ? parsed.verdict : null;
+    const reason = (parsed.reason ?? '').trim().slice(0, 400);
+    if (!verdict || reason.length < 5) return null;
+    return { verdict, reason };
   } catch {
     return null;
   }
+}
+
+/**
+ * Reviews every not-yet-reviewed defect-type finding (up to AI_REVIEW_MAX_FINDINGS, default 40)
+ * and returns the cache with the new reviews added. Unchanged (and no calls made) when no LLM
+ * key is configured.
+ */
+export async function reviewFindingsWithAI(
+  findings: Finding[],
+  cache: Record<string, AiReview>,
+  targetUrl: string,
+): Promise<Record<string, AiReview>> {
+  if (!hasAnyLLMKey() || REVIEW_MAX === 0) return cache;
+  const todo = findings
+    .filter((f) => f.severity !== 'info' && !isExecutionError(f) && !cache[f.id])
+    .slice(0, REVIEW_MAX);
+  if (todo.length === 0) return cache;
+
+  const result = { ...cache };
+  let next = 0;
+  const worker = async () => {
+    while (next < todo.length) {
+      const f = todo[next++];
+      let pending = inFlight.get(f.id);
+      if (!pending) {
+        pending = reviewOne(f, targetUrl).catch(() => null);
+        inFlight.set(f.id, pending);
+      }
+      const review = await pending;
+      inFlight.delete(f.id);
+      if (review) result[f.id] = review;
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(REVIEW_CONCURRENCY, todo.length) }, worker));
+  return result;
 }

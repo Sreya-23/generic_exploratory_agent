@@ -6,7 +6,7 @@ import { chromium, firefox, webkit, type Browser } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
 import type { Page } from 'playwright';
 import { join } from 'node:path';
-import { savedSessionStatePath, restoreSessionStorage, waitForRealContent, waitForTitleStable } from './helpers.js';
+import { isUrlInScope, savedSessionStatePath, restoreSessionStorage, waitForRealContent, waitForTitleStable } from './helpers.js';
 
 // A browser engine that isn't installed on THIS machine ("Executable doesn't exist") is a
 // setup problem with the agent, not a defect in the site — report it under UI-Environment (an
@@ -296,7 +296,10 @@ export async function runCrossBrowserCheck(
   await checkPageAcrossEngines(currentUrl, ctx, page);
 
   if (ctx.config.depth === 'standard' || ctx.config.depth === 'deep') {
-    const extraUrl = pickAdditionalPage(currentUrl, ctx.discoveredRoutes);
+    const extraUrl = pickAdditionalPage(
+      currentUrl,
+      ctx.discoveredRoutes?.filter((r) => isUrlInScope(r, ctx.config.allowedSections, currentUrl)),
+    );
     if (extraUrl) {
       ctx.onLog(`[CrossBrowser] Also checking a second discovered page: ${extraUrl}`);
       await checkPageAcrossEngines(extraUrl, ctx, null);

@@ -1,6 +1,6 @@
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
-import { isLoginWallPage, isRiskyActionLabel } from './helpers.js';
+import { isLoginWallPage, isRiskyActionLabel, isUrlInScope } from './helpers.js';
 import { detectListItems, itemLocator, namesMatch, normalizeName, snap, spreadIndices } from './list-items.js';
 
 // A18 — Link-target consistency. dead-links.ts only asks "does the link load something?" — a
@@ -62,6 +62,10 @@ export async function runLinkTargetConsistency(page: Page, ctx: ExecutorContext,
     if ((await target.count().catch(() => 0)) === 0) target = container.locator('a[href], [role="link"]').first();
     if ((await target.count().catch(() => 0)) === 0) continue;
     if (isRiskyActionLabel(item.name)) continue;
+    if (item.href && !isUrlInScope(item.href, ctx.config.allowedSections, listUrl)) {
+      ctx.onLog(`[LinkTarget] Not opening "${item.name}" — it leads outside the allowed sections`);
+      continue;
+    }
 
     const beforeUrl = page.url();
     const beforeHeading = await detailHeading(page);

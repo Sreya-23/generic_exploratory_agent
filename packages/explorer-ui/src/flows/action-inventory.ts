@@ -8,6 +8,7 @@ import type {
 } from '@qa/shared';
 import {
   isRiskyActionLabel,
+  isUrlInScope,
   explorationBreadth,
   describeElement,
   elementFingerprint,
@@ -89,11 +90,41 @@ function isStickyScrollOscillation(message: string): boolean {
   return /scrolling into view if needed/.test(message) && /element is outside of the viewport/.test(message);
 }
 
+// Playwright's log says the click itself happened ("click action done") and it then timed out
+// only "waiting for scheduled navigations to finish" — a slow page load after a real click,
+// not a broken control. Seen on every sidebar link of the OrangeHRM demo.
+function clickLandedButNavigationSlow(message: string): boolean {
+  return /click action done/.test(message) && /waiting for scheduled navigations/.test(message);
+}
+
 async function clickWithStickyRetry(el: Locator, ctx: ExecutorContext, label: string): Promise<void> {
   try {
     await el.click({ timeout: 4000 });
   } catch (err) {
-    if (!isStickyScrollOscillation((err as Error).message)) throw err;
+    const message = (err as Error).message;
+    if (clickLandedButNavigationSlow(message)) {
+      ctx.onLog(`[ActionInventory] "${label}": clicked; the page it opened is still loading — treated as a navigation, not an error`);
+      await el.page().waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+      return;
+    }
+    // "<a …> intercepts pointer events" where the intercepting element is part of the control
+    // itself (a button wrapping a link, an icon inside a link) — a user's click lands on the
+    // same control, so click it where it is.
+    if (/intercepts pointer events/.test(message)) {
+      const ownChild = await el
+        .evaluate((node) => {
+          const r = node.getBoundingClientRect();
+          const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+          return !!hit && (node.contains(hit) || hit.contains(node));
+        })
+        .catch(() => false);
+      if (ownChild) {
+        ctx.onLog(`[ActionInventory] "${label}": an element inside the control caught the click — clicking it in place`);
+        await el.click({ timeout: 4000, force: true });
+        return;
+      }
+    }
+    if (!isStickyScrollOscillation(message)) throw err;
     // force:true clicks at the element's current computed position directly, skipping the
     // scroll-and-recheck loop entirely that was oscillating — exactly how a sticky element is
     // actually reachable. If this also fails, the original error still surfaces normally via
@@ -330,6 +361,17 @@ async function scanCurrentPage(
     if (unreachable) {
       testedKeys.add(`${kind}:${label}`);
       continue;
+    }
+
+    if (ctx.config.allowedSections?.length) {
+      // A button can wrap the real link (OrangeHRM's "Upgrade" → orangehrm.com), so look inside too.
+      const href =
+        (await el.getAttribute('href').catch(() => null)) ??
+        (await el.locator('a[href]').first().getAttribute('href', { timeout: 500 }).catch(() => null));
+      if (href && !href.startsWith('#') && !isUrlInScope(href, ctx.config.allowedSections, page.url())) {
+        ctx.onLog(`[ActionInventory] Not clicking "${label}" — it leads outside the allowed sections`);
+        continue;
+      }
     }
 
     if (isRiskyActionLabel(label)) {

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { evidenceUrl, raiseBugsInQualityPilot, type Finding } from '../../api/client';
-import { parseListLikeText, isLikelyFalsePositive, explainFinding } from '@qa/shared';
+import { parseListLikeText, isLikelyFalsePositive, explainFinding, aiReviewLabel } from '@qa/shared';
 
 /** Same validation-status wording as the downloadable report (generate-report.ts) — "confirmed
  *  / requires validation / possible false positive" rather than the internal 'verified'/
@@ -79,6 +79,14 @@ export function FindingCard({ finding, sessionId }: { finding: Finding; sessionI
         <span className="finding-severity">{finding.severity}</span>
         <span className="finding-area" title={`Check area: ${finding.area}`}>{plain.areaLabel}</span>
         <ValidationBadge finding={finding} />
+        {finding.aiReview && (
+          <span
+            className={`confidence-badge ${finding.aiReview.verdict === 'agrees' ? 'verified' : finding.aiReview.verdict === 'doubts' ? 'flagged' : 'heuristic'}`}
+            title={finding.aiReview.reason}
+          >
+            🤖 AI: {aiReviewLabel(finding.aiReview)}
+          </span>
+        )}
       </header>
       {/* Plain-English first, so anyone can read it; the technical detail is kept below. */}
       <h3>{plain.headline}</h3>
@@ -89,6 +97,11 @@ export function FindingCard({ finding, sessionId }: { finding: Finding; sessionI
         <p>
           <strong>Why it matters:</strong> {plain.whyItMatters}
         </p>
+        {finding.aiReview && (
+          <p>
+            <strong>AI review:</strong> {aiReviewLabel(finding.aiReview)} — {finding.aiReview.reason}
+          </p>
+        )}
       </div>
       <div className="finding-steps">
         <strong>How to see it yourself:</strong>

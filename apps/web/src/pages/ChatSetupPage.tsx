@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import type { ChatMessage, SetupChatResponse } from '@qa/shared';
 import { ChatPanel } from '../components/chat/ChatPanel';
 import {
@@ -19,9 +19,17 @@ export function ChatSetupPage() {
   const [starting, setStarting] = useState(false);
   const [draftSummary, setDraftSummary] = useState('');
   const conversationIdRef = useRef<string | undefined>(undefined);
+  // "+ New Session" while already on /chat clears the stored conversation and links to this same
+  // page. React keeps the page mounted, so a []-dependency effect never re-ran and the button
+  // looked dead. Each click produces a new location.key, so re-initialise on that.
+  const location = useLocation();
 
   useEffect(() => {
     let cancelled = false;
+    setMessages([]);
+    setReadyToStart(false);
+    setDraftSummary('');
+    conversationIdRef.current = undefined;
     const storedId = sessionStorage.getItem(SETUP_CONV_KEY) ?? undefined;
     initSetupChat(storedId)
       .then((res) => {
@@ -44,7 +52,7 @@ export function ChatSetupPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [location.key]);
 
   const applyResponse = (res: SetupChatResponse) => {
     conversationIdRef.current = res.conversationId;

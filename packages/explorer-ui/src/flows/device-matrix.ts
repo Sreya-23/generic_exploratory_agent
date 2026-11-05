@@ -10,7 +10,7 @@ import { chromium, firefox, webkit, devices, type Browser } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
 import type { Page } from 'playwright';
 import { join } from 'node:path';
-import { savedSessionStatePath, restoreSessionStorage, waitForRealContent, waitForTitleStable, isLoginWallPage } from './helpers.js';
+import { isUrlInScope, savedSessionStatePath, restoreSessionStorage, waitForRealContent, waitForTitleStable, isLoginWallPage } from './helpers.js';
 import { matchesKnownNonBugPattern } from './non-bug-patterns.js';
 
 // A browser engine that isn't installed on THIS machine ("Executable doesn't exist") is a
@@ -469,7 +469,10 @@ export async function runDeviceMatrixCheck(
   // own device count — this already runs up to 8 profiles concurrently for ONE page; a second
   // full 8-device pass would double an already-heavy step for one supplementary check.
   if (ctx.config.depth === 'deep') {
-    const extraUrl = pickAdditionalPage(currentUrl, ctx.discoveredRoutes);
+    const extraUrl = pickAdditionalPage(
+      currentUrl,
+      ctx.discoveredRoutes?.filter((r) => isUrlInScope(r, ctx.config.allowedSections, currentUrl)),
+    );
     if (extraUrl) {
       ctx.onLog(`[DeviceMatrix] Also checking a second discovered page: ${extraUrl}`);
       await page.goto(extraUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});

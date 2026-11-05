@@ -19,9 +19,10 @@ import {
   parseListLikeText,
   resultTypeOf,
   isLikelyFalsePositive,
+  aiReviewLabel,
   type FindingResultType,
 } from '@qa/shared';
-import { dedupeFindingsWithAI, summarizeWithAI, validateFindingsWithAI } from './ai-report-enhance.js';
+import { dedupeFindingsWithAI, reviewFindingsWithAI, summarizeWithAI } from './ai-report-enhance.js';
 
 const IMAGE_MIME: Record<string, string> = {
   '.png': 'image/png',
@@ -490,6 +491,7 @@ function formatFindingMarkdown(f: Finding, resultType: FindingResultType = resul
   if (statusLabel) {
     lines.push(`**Validation status:** ${statusLabel}` + (f.confidenceReason ? ` — ${f.confidenceReason}` : ''));
   }
+  if (f.aiReview) lines.push(`**AI review:** ${aiReviewLabel(f.aiReview)} — ${f.aiReview.reason}`);
   lines.push('');
   return lines.join('\n');
 }
@@ -535,6 +537,9 @@ function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F', re
   const confidenceNote = f.confidenceReason
     ? `<p class="confidence-note"><span class="label">Validation note</span>${escapeHtml(f.confidenceReason)}</p>`
     : '';
+  const aiReviewNote = f.aiReview
+    ? `<p class="confidence-note"><span class="label">AI review</span>${escapeHtml(`${aiReviewLabel(f.aiReview)} — ${f.aiReview.reason}`)}</p>`
+    : '';
   const plain = explainFinding(f);
   const unconfirmed = resultType === 'potential-defect' ? ' <em>(Not yet confirmed — check the evidence before acting.)</em>' : '';
 
@@ -545,6 +550,7 @@ function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F', re
     <span class="sev-badge ${escapeHtml(f.severity)}">${escapeHtml(f.severity)}</span>
     <span class="area-chip" title="Check area: ${escapeHtml(f.area)}">${escapeHtml(plain.areaLabel)}</span>
     ${confidenceBadge}
+    ${f.aiReview ? `<span class="confidence-badge ${f.aiReview.verdict === 'agrees' ? 'verified' : f.aiReview.verdict === 'doubts' ? 'flagged' : 'heuristic'}" title="${escapeHtml(f.aiReview.reason)}">AI: ${escapeHtml(aiReviewLabel(f.aiReview))}</span>` : ''}
   </header>
   <h4>${escapeHtml(plain.headline)}</h4>
   <p class="pre"><span class="label">What's wrong</span>${escapeHtml(plain.summary)}</p>
@@ -561,6 +567,7 @@ function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F', re
       <div class="ea actual"><span class="label">Actual</span><div class="ea-text">${withListFormatting(f.actual)}</div></div>
     </div>
     ${confidenceNote}
+    ${aiReviewNote}
   </details>
   <footer class="finding-foot">
     <span>Repro rate: <strong>${escapeHtml(f.reproRate)}</strong></span>
@@ -943,21 +950,13 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
     withReproSteps(f, targetUrl),
   );
 
-  // §30 — Validator pass: a second-opinion sanity check on heuristic-confidence findings,
-  // additive only (see validateFindingsWithAI's own doc comment for why nothing is ever
-  // dropped, only annotated).
-  const validations = await validateFindingsWithAI(findings).catch(() => null);
-  if (validations) {
-    findings = findings.map((f, i) => {
-      const v = validations.get(i);
-      if (!v || v.plausible) return f;
-      const note = `⚠ Automated second-pass check flagged this as possibly not a real defect: ${v.note}`;
-      return {
-        ...f,
-        confidenceReason: f.confidenceReason ? `${f.confidenceReason} ${note}` : note,
-      };
-    });
-  }
+  // AI review (only with an LLM key): an independent second look at every reported bug, shown
+  // beside the evidence-based badge. Cached on the session so re-rendering the report is free.
+  state.aiReviews = await reviewFindingsWithAI(findings, state.aiReviews ?? {}, targetUrl).catch(
+    () => state.aiReviews ?? {},
+  );
+  const reviews = state.aiReviews;
+  findings = findings.map((f) => (reviews[f.id] ? { ...f, aiReview: reviews[f.id] } : f));
   // Every count/section below is built from ONE classification (resultTypeOf — see
   // finding-classification.ts), not each re-deriving its own notion of "is this a defect":
   // that's what let a report show two different totals for the same run (one section's number
