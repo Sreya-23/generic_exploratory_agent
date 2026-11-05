@@ -88,8 +88,13 @@ export async function writeSessionReport(
   sessionsDir: string,
   state: SessionState,
 ): Promise<SessionReport> {
+  const reviewsBefore = Object.keys(state.aiReviews ?? {}).length;
   const report = await generateSessionReport(state);
   const dir = await ensureSessionDir(sessionsDir, state.id);
+  // Keep new AI reviews with the session so a restart doesn't pay for them again.
+  if (Object.keys(state.aiReviews ?? {}).length > reviewsBefore) {
+    await saveSessionState(sessionsDir, state).catch(() => {});
+  }
   await writeFile(join(dir, 'report.md'), report.markdown, 'utf8');
   await writeFile(join(dir, 'report.html'), report.html, 'utf8');
   await writeFile(

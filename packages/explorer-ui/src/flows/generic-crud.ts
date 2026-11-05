@@ -20,7 +20,8 @@ import type { ExecutorContext, FlowTask } from '@qa/shared';
 import { waitForRealContent, isRiskyActionLabel, confirmWriteAction } from './helpers.js';
 import { classifyInputRisk } from './forms.js';
 
-const CREATE_TRIGGER_PATTERN = /^(create|add|new)\b/i;
+// Leading symbols are allowed: "+ Add", "＋ New", "➕ Create" are as common as the bare words.
+const CREATE_TRIGGER_PATTERN = /^\W*(create|add|new)\b/i;
 const SUBMIT_PATTERN = /^(save|create|add|submit|confirm)\b/i;
 const EDIT_TRIGGER_PATTERN = /^(edit|update)\b/i;
 const DELETE_TRIGGER_PATTERN = /^(delete|remove|destroy)\b/i;

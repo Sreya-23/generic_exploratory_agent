@@ -6,6 +6,7 @@ import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
+import { isUrlInScope } from './helpers.js';
 
 const GOLDEN_DIR_NAME = 'golden-snapshots';
 // Below this, treat differences as noise (font antialiasing, clock/date widgets, etc.)
@@ -68,7 +69,15 @@ export async function runGoldenPath(
   );
 
   for (const link of links) {
-    if (link.href && link.href.startsWith('http') && !link.href.includes('#')) {
+    // Same site only — a nav link to another company's site (SauceDemo's "About" → saucelabs.com)
+    // is not this app, so it is never opened or used as a baseline.
+    let sameSite = false;
+    try {
+      sameSite = new URL(link.href).origin === new URL(ctx.config.targetUrl).origin;
+    } catch {
+      /* unparsable → skip */
+    }
+    if (link.href && sameSite && !link.href.includes('#') && isUrlInScope(link.href, ctx.config.allowedSections)) {
       pages.push({ name: link.text.toLowerCase().replace(/\s+/g, '-').slice(0, 30), url: link.href });
     }
   }

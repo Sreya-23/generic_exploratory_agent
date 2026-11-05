@@ -74,3 +74,8 @@ export function bucketFindings(findings: Finding[]): FindingBuckets {
   }
   return buckets;
 }
+
+/** Short label for an AI review verdict — same wording in every report format and the web UI. */
+export function aiReviewLabel(r: { verdict: 'agrees' | 'doubts' | 'unsure' }): string {
+  return r.verdict === 'agrees' ? 'Agrees it is a real bug' : r.verdict === 'doubts' ? 'Doubts this is a real bug' : 'Not sure';
+}

@@ -327,6 +327,30 @@ export function isSubTabAllowed(parentLabel: string, tabLabel: string, allowedSe
   return section.subSections.some((sub) => normalizeSectionLabel(sub) === tabNorm);
 }
 
+/**
+ * Is this URL inside the user's allowed sections? Same rule the start page uses
+ * (`findInScopeStartUrl` in auth/post-login.ts): the URL's path must contain one of the allowed
+ * section / sub-tab names, compared as lowercase letters and digits only ("My Info" ↔ "/myinfo").
+ * No restriction set → everything is in scope. Unparsable URL → out of scope when a restriction
+ * is set (confidentiality is the point, so an unclear case never wins by default).
+ */
+export function isUrlInScope(url: string, allowedSections?: ScopeSection[], base?: string): boolean {
+  if (!allowedSections?.length) return true;
+  const keywords = allowedSections
+    .flatMap((s) => [s.section, ...(s.subSections ?? [])])
+    .map((k) => k.toLowerCase().replace(/[^a-z0-9]+/g, ''))
+    .filter(Boolean);
+  if (keywords.length === 0) return true;
+  let path: string;
+  try {
+    const u = new URL(url, base);
+    path = `${u.pathname}${u.hash}`.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  } catch {
+    return false;
+  }
+  return keywords.some((k) => path.includes(k));
+}
+
 // Broader than modals.ts's own detection (which only cares about a modal it just opened
 // itself): this also has to catch a modal that was ALREADY open from a previous, unrelated
 // click — the case that actually causes cascading false positives. `[role="dialog"]`/
@@ -392,6 +416,19 @@ export async function dismissBlockingOverlay(page: Page): Promise<boolean> {
   return !(await hasBlockingOverlay(page));
 }
 
+/** Pause the check and wait for the user's chat answer to a gate prompt (when the orchestrator supports it). */
+async function waitForReply(
+  ctx: ExecutorContext,
+  key: string,
+  description: string,
+  pageUrl: string,
+): Promise<Record<string, string> | null> {
+  if (!ctx.waitForPreActionReply) return null;
+  return ctx
+    .waitForPreActionReply({ type: 'generic', description, requiredExtras: [key], pageUrl, willWait: true })
+    .catch(() => null);
+}
+
 /**
  * Consent gate for a risky-looking action (per site-policies.md): if `buttonLabel` doesn't
  * look risky, proceeds immediately. If it does, checks whether the required data (a
@@ -439,7 +476,7 @@ export async function gateIfSensitive(
   if (extras[requiredKey]) return true; // User already provided data
 
   // Emit gate — pause and ask user
-  const provided = ctx.onPreActionNeeded?.({
+  const gateRequest = {
     type: actionType,
     description:
       actionType === 'payment' || actionType === 'purchase'
@@ -455,12 +492,15 @@ export async function gateIfSensitive(
                 : `"${buttonLabel}" — this may have a real, irreversible effect`,
     requiredExtras: [requiredKey],
     pageUrl: page.url(),
-  });
+    willWait: !!ctx.waitForPreActionReply,
+  };
+  const provided = ctx.onPreActionNeeded?.(gateRequest) ?? null;
 
-  if (provided && provided[requiredKey]) {
+  const answered = provided ?? (await waitForReply(ctx, requiredKey, gateRequest.description, page.url()));
+  if (answered && answered[requiredKey]) {
     // Merge provided value into config extras for use by the flow
     ctx.config.credentials = ctx.config.credentials ?? { type: 'none' };
-    ctx.config.credentials.extras = { ...extras, ...provided };
+    ctx.config.credentials.extras = { ...extras, ...answered };
     return true;
   }
 
@@ -510,11 +550,15 @@ export async function confirmWriteAction(
     description: `${verb} "${details.entityLabel}" — ${details.data}`,
     requiredExtras: [confirmKey],
     pageUrl: page.url(),
-  });
+    willWait: !!ctx.waitForPreActionReply,
+  }) ?? null;
 
-  if (provided && isAffirmative(provided[confirmKey])) {
+  const answered =
+    provided ?? (await waitForReply(ctx, confirmKey, `${verb} "${details.entityLabel}" — ${details.data}`, page.url()));
+  if (answered && isAffirmative(answered[confirmKey])) {
     ctx.config.credentials = ctx.config.credentials ?? { type: 'none' };
-    ctx.config.credentials.extras = { ...extras, ...provided };
+    ctx.config.credentials.extras = { ...(ctx.config.credentials.extras ?? {}), ...answered };
+    ctx.onLog(`[Gate] ${verb} "${details.entityLabel}" approved in chat — going ahead`);
     return true;
   }
 

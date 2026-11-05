@@ -16,7 +16,7 @@ import type {
 } from '@qa/shared';
 import { hasAnyLLMKey, activeLLMProvider } from '@qa/shared';
 import { credentialsComplete, effectiveAuthState, authPromptForState } from '@qa/chat-agent';
-import { buildPlan, injectJourneyTasks, removeUnlikelyTasks } from '../planner/index.js';
+import { buildPlan, injectJourneyTasks, isSectionFocusedRun, removeUnlikelyTasks } from '../planner/index.js';
 import { classifySite } from '../intelligence/classify-site.js';
 import { classifySiteWithAI } from '../intelligence/classify-site-ai.js';
 import { ensureSiteKnowledge } from '../intelligence/site-knowledge-base.js';
@@ -70,6 +70,29 @@ function logSessionEventToConsole(event: SessionEvent): void {
     default:
       console.log(`${tag}`);
   }
+}
+
+/**
+ * How long a check pauses for the user's answer to a create/edit/delete or payment/send prompt
+ * before skipping it. Only the first prompt of each kind waits; see unansweredKeys.
+ */
+const PRE_ACTION_WAIT_MS = Math.max(0, Number(process.env.PRE_ACTION_WAIT_SECONDS ?? 60)) * 1000;
+
+function preActionPrompt(req: PreActionRequest, missing: string[], waitMs: number): string {
+  const isConfirm = missing.every((k) => k.startsWith('confirm'));
+  const reply = isConfirm
+    ? missing.map((k) => `\`${k}: yes\``).join(' or ')
+    : missing.map((k) => `\`${k}: <value>\``).join(', ');
+  const replyHint = isConfirm ? `**yes** (or ${reply})` : reply;
+  const wait = waitMs > 0
+    ? `\n\n⏸️ The run is **paused for ${Math.round(waitMs / 1000)}s** waiting for your answer.`
+    : '\n\n(Not pausing — an earlier prompt like this went unanswered, so this one is skipped.)';
+  return (
+    `⚠️ **Permission needed:** ${req.description}` +
+    (req.pageUrl ? `\n\nPage: ${req.pageUrl}` : '') +
+    `\n\nReply ${replyHint} to allow it, or \`skip\` to leave it.` +
+    wait
+  );
 }
 
 const executors: BaseExecutor[] = [new UiExecutor(), new ApiExecutor(), new ChaosExecutor()];
@@ -311,6 +334,19 @@ export class SessionOrchestrator {
 
     state.plan = await buildPlan(sessionId, state.config);
     state.progress = { completedTasks: 0, totalTasks: state.plan.tasks.length, percent: 0 };
+    if (isSectionFocusedRun(state.config)) {
+      const names = (state.config.allowedSections ?? []).map((s) => s.section).join(', ');
+      this.emit({
+        type: 'log',
+        sessionId,
+        timestamp: new Date().toISOString(),
+        payload: {
+          message:
+            `[Plan] Focused on ${names}: ${state.plan.tasks.length} checks that run on that section's pages. ` +
+            'Site-wide checks (load tests, network chaos, logout/session, cross-browser, API sweeps) are left out for this run.',
+        },
+      });
+    }
     state.status = 'running';
     state.authState = 'ready';
 
@@ -501,6 +537,9 @@ export class SessionOrchestrator {
     // state.plan.tasks fresh each iteration and tracking progress by task id (not array
     // position) makes both dynamic addition and removal actually take effect.
     const executedTaskIds = new Set<string>();
+    // Gate keys (confirm_create, recipient, …) whose prompt already went unanswered once this
+    // run — later prompts of the same kind are still shown but don't pause the run again.
+    const unansweredKeys = new Set<string>();
     while (true) {
       if (signal.aborted) break;
       const task = (state.plan?.tasks ?? []).find((t) => !executedTaskIds.has(t.id));
@@ -527,6 +566,23 @@ export class SessionOrchestrator {
         payload: { ...state.progress, status: state.status },
       });
 
+      const recordSkipped = (req: PreActionRequest, missing: string[], reason?: string) => {
+        ctx.onFinding({
+          severity: 'info',
+          area: 'UI-Journey',
+          title: `Skipped: ${req.description}`,
+          steps: [
+            req.pageUrl ? `Open ${req.pageUrl}` : `Navigate to the page where this action is reached`,
+            `Trigger: ${req.description}`,
+            `Missing data: ${missing.join(', ')} — reply in the live chat with e.g. \`${missing[0]}: ${missing[0]?.startsWith('confirm_') ? 'yes' : '<value>'}\` to let this run for real`,
+          ],
+          expected: `Data provided for: ${missing.join(', ')}`,
+          actual: reason ?? 'Action skipped — nobody answered the prompt in the live chat',
+          evidence: [],
+          reproRate: 'N/A',
+          automationCandidate: false,
+        });
+      };
       const ctx: ExecutorContext = {
         sessionId,
         config: state.config,
@@ -584,41 +640,60 @@ export class SessionOrchestrator {
           }
 
           const missing = (req.requiredExtras ?? []).filter((k) => !extras[k]);
+          if (missing.length === 0) return extras;
 
-          if (missing.length > 0) {
-            // Tell the user what's needed via a live chat message
-            const prompt =
-              `⚠️ **${req.description}** — I need more info before proceeding:\n\n` +
-              missing.map((k) => `- \`${k}\`: _not provided_`).join('\n') +
-              `\n\nReply with the missing value(s) in the format \`key: value\` (e.g. \`card: 4111111111111111\`) to allow this action, or ignore to skip it.`;
-
-            this.emit({
-              type: 'pre_action:required',
-              sessionId,
-              timestamp: new Date().toISOString(),
-              payload: { request: req, missing, prompt },
-            });
-
-            ctx.onFinding({
-              severity: 'info',
-              area: 'UI-Journey',
-              title: `Skipped: ${req.description}`,
-              steps: [
-                req.pageUrl ? `Open ${req.pageUrl}` : `Navigate to the page where this action is reached`,
-                `Trigger: ${req.description}`,
-                `Missing data: ${missing.join(', ')} — reply in the live chat with e.g. \`${missing[0]}: <value>\` to let this run for real`,
-              ],
-              expected: `Data provided for: ${missing.join(', ')}`,
-              actual: `Action skipped — provide missing data in live chat to test this flow`,
-              evidence: [],
-              reproRate: 'N/A',
-              automationCandidate: false,
-            });
-
+          // A caller that waits for the answer gets the prompt now and the "Skipped" note only
+          // if nobody answers (see waitForPreActionReply) — unless an earlier identical prompt
+          // already went unanswered, in which case it is skipped straight away, not re-waited.
+          const willWait = !!req.willWait && !missing.some((k) => unansweredKeys.has(k));
+          this.emit({
+            type: 'pre_action:required',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            payload: { request: req, missing, prompt: preActionPrompt(req, missing, willWait ? PRE_ACTION_WAIT_MS : 0) },
+          });
+          if (!req.willWait) recordSkipped(req, missing);
+          return null;
+        },
+        waitForPreActionReply: async (req: PreActionRequest): Promise<Record<string, string> | null> => {
+          const keys = req.requiredExtras ?? [];
+          if (keys.some((k) => unansweredKeys.has(k))) {
+            recordSkipped(req, keys);
             return null;
           }
-
-          return extras;
+          this.emit({
+            type: 'log',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            payload: { message: `[Gate] Paused — waiting up to ${Math.round(PRE_ACTION_WAIT_MS / 1000)}s for your reply in chat: ${req.description}` },
+          });
+          const deadline = Date.now() + PRE_ACTION_WAIT_MS;
+          // Lets the live chat treat a plain "yes" as the answer to THIS prompt.
+          state.pendingPreAction = { keys, description: req.description };
+          try {
+          while (Date.now() < deadline && !signal.aborted) {
+            const current = state.config.credentials?.extras ?? {};
+            if (current['_user_skip'] === 'true') {
+              delete current['_user_skip'];
+              this.emit({ type: 'log', sessionId, timestamp: new Date().toISOString(), payload: { message: `[Gate] You said skip — not doing: ${req.description}` } });
+              recordSkipped(req, keys, 'You chose to skip this action in chat');
+              return null;
+            }
+            if (keys.some((k) => current[k])) return current;
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+          } finally {
+            state.pendingPreAction = undefined;
+          }
+          for (const k of keys) unansweredKeys.add(k);
+          this.emit({
+            type: 'log',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            payload: { message: `[Gate] No reply — skipped: ${req.description}. Later prompts of this kind will not pause the run again.` },
+          });
+          recordSkipped(req, keys);
+          return null;
         },
         onClassification: async (raw) => {
           // recon.ts passes raw signals wrapped in a SiteClassification shell
@@ -629,14 +704,29 @@ export class SessionOrchestrator {
           // the exact same site — skip the AI/rule-based recompute (saving the LLM call) and
           // reuse what we already know, rather than redoing work a previous crawl already did.
           let classification: SiteClassification;
-          if (state.siteCacheHit?.classification) {
-            classification = state.siteCacheHit.classification;
+          const cached = state.siteCacheHit?.classification;
+          // A cached answer the keyword rules made (no key at the time, or the AI call failed)
+          // is not reused once a key is configured — the AI classifies the site again, and the
+          // site cache picks up the AI answer for next time.
+          const cachedUsable = !!cached && (cached.source === 'ai' || !hasAnyLLMKey());
+          if (cached && !cachedUsable) {
             this.emit({
               type: 'log',
               sessionId,
               timestamp: new Date().toISOString(),
               payload: {
-                message: `[Classify] Reusing cached classification from a previous crawl of this site: ${classification.siteType} (${Math.round(classification.confidence * 100)}%) — skipping re-classification`,
+                message: `[Classify] The saved classification for this site (${cached.siteType}) came from the keyword rules — asking the AI (${activeLLMProvider()}) to classify it now`,
+              },
+            });
+          }
+          if (cached && cachedUsable) {
+            classification = cached;
+            this.emit({
+              type: 'log',
+              sessionId,
+              timestamp: new Date().toISOString(),
+              payload: {
+                message: `[Classify] Reusing the saved ${classification.source === 'ai' ? 'AI' : 'rule-based'} classification from a previous crawl of this site: ${classification.siteType} (${Math.round(classification.confidence * 100)}%) — skipping re-classification`,
               },
             });
           } else {
@@ -644,8 +734,9 @@ export class SessionOrchestrator {
             // and is exactly what gets used if the AI call below is unavailable, slow, or
             // returns something we can't validate. This is a strict upgrade path, never a
             // replacement: classifySite() must keep working standalone regardless of Gemini.
-            const ruleBased: SiteClassification = classifySite(signals);
-            const aiClassification = await classifySiteWithAI(signals).catch(() => null);
+            const ruleBased: SiteClassification = { ...classifySite(signals), source: 'rules' };
+            const aiResult = await classifySiteWithAI(signals).catch(() => null);
+            const aiClassification: SiteClassification | null = aiResult ? { ...aiResult, source: 'ai' } : null;
             classification = aiClassification ?? ruleBased;
 
             this.emit({
@@ -885,8 +976,36 @@ export class SessionOrchestrator {
       state.progress.percent = 100;
       state.updatedAt = new Date().toISOString();
       await saveSessionState(sessionsDir, state);
+      const bugCount = state.findings.filter((f) => f.severity !== 'info').length;
+      this.emit({
+        type: 'log',
+        sessionId,
+        timestamp: new Date().toISOString(),
+        payload: {
+          message: hasAnyLLMKey()
+            ? `[AI review] Asking ${activeLLMProvider()} to review ${bugCount} reported bug(s) — results appear on each card as "AI: …"`
+            : '[AI review] No AI key configured — bugs are not AI-reviewed (set GEMINI_API_KEY in .env and restart to enable)',
+        },
+      });
       try {
         await writeSessionReport(sessionsDir, state);
+        const verdicts = Object.values(state.aiReviews ?? {});
+        if (verdicts.length > 0) {
+          const n = (v: string) => verdicts.filter((r) => r.verdict === v).length;
+          this.emit({
+            type: 'log',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            payload: { message: `[AI review] Done: agrees ${n('agrees')}, doubts ${n('doubts')}, not sure ${n('unsure')}` },
+          });
+        } else if (hasAnyLLMKey() && bugCount > 0) {
+          this.emit({
+            type: 'log',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            payload: { message: '[AI review] The AI did not return usable reviews (key invalid, quota or timeout) — cards show no AI verdict' },
+          });
+        }
       } catch (err) {
         // Report generation must not fail the session; surface in logs via emit
         this.emit({

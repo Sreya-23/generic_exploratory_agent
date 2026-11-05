@@ -3,6 +3,7 @@
 // request per link, never clicking or filling anything on the other site.
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
+import { isUrlInScope, waitForRealContent } from './helpers.js';
 
 const MAX_LINKS_TO_CHECK = 20;
 const MAX_OUTBOUND_TO_CHECK = 15;
@@ -34,9 +35,11 @@ export async function runDeadLinksCheck(
     return result;
   }, origin);
 
-  const toCheck = links.slice(0, MAX_LINKS_TO_CHECK);
+  // Same-origin links into sections outside the user's restriction are not requested at all.
+  const toCheck = links.filter((l) => isUrlInScope(l.href, ctx.config.allowedSections)).slice(0, MAX_LINKS_TO_CHECK);
   const dead: string[] = [];
   const softErrors: string[] = [];
+  const unanswered: string[] = [];
 
   for (const link of toCheck) {
     let status: number | null = null;
@@ -46,14 +49,25 @@ export async function runDeadLinksCheck(
     } catch {
       status = null;
     }
-    if (status !== null && status < 400) continue;
+    if (status === null) {
+      // No answer at all within 8s is usually a slow server (the OrangeHRM demo takes 5-10s),
+      // not a broken link — ask once more with more patience before judging.
+      try {
+        const res = await page.context().request.get(link.href, { timeout: 25000, failOnStatusCode: false });
+        status = res.status();
+      } catch {
+        unanswered.push(`"${link.text}" → ${link.href}`);
+        continue;
+      }
+    }
+    if (status < 400) continue;
 
     // A raw HTTP status is not what the user sees. Single-page apps hosted on static storage
     // (SauceDemo: /inventory.html → HTTP 404) return an error status for deep links and then
     // render the real page anyway via their 404 fallback. Only call a link dead when the page
     // ALSO fails to render in a real browser.
     const rendered = await rendersRealPage(page, link.href);
-    const label = `"${link.text}" → ${link.href} → ${status === null ? 'request failed' : `HTTP ${status}`}`;
+    const label = `"${link.text}" → ${link.href} → HTTP ${status}`;
     if (rendered) softErrors.push(label);
     else dead.push(label);
   }
@@ -72,6 +86,10 @@ export async function runDeadLinksCheck(
       confidence: 'verified',
       confidenceReason: 'Raw status from a direct request, plus a real browser load showing the page renders.',
     });
+  }
+
+  if (unanswered.length > 0) {
+    ctx.onLog(`[UI] ${unanswered.length} internal link(s) could not be checked — the server did not answer within 25s: ${unanswered.join('; ')}`);
   }
 
   await checkOutboundLinks(page, ctx);
@@ -107,8 +125,8 @@ async function rendersRealPage(page: Page, url: string): Promise<boolean> {
   const probe = await page.context().newPage().catch(() => null);
   if (!probe) return false;
   try {
-    await probe.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    await probe.waitForTimeout(1200);
+    await probe.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await waitForRealContent(probe).catch(() => {});
     const info = await probe.evaluate(() => ({
       text: (document.body?.innerText ?? '').replace(/\s+/g, ' ').trim(),
       interactive: document.querySelectorAll('a[href], button, input, select').length,

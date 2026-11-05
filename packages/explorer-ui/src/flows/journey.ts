@@ -10,6 +10,8 @@ import {
   elementFingerprint,
   isLoginWallPage,
   gateIfSensitive,
+  isSectionAllowed,
+  confirmWriteAction,
 } from './helpers.js';
 import { findByIntentWithRetry } from './element-matcher.js';
 
@@ -681,7 +683,17 @@ async function runEntityModuleCrud(
   });
 
   let created = false;
-  if (createBtn) {
+  // A unique marker so the agent's own record can be found again — Delete below only ever
+  // targets the row carrying it, never somebody's real data.
+  const marker = `QA-${moduleLabel.replace(/[^a-z0-9]/gi, '').slice(0, 10)}-${Date.now().toString(36)}`;
+  // Creating writes real data, so it asks first — the same rule generic-crud.ts follows.
+  const createAllowed =
+    !!createBtn &&
+    (await confirmWriteAction(page, ctx, { action: 'create', entityLabel: moduleLabel, data: `Name: "${marker}"` }));
+  if (createBtn && !createAllowed) {
+    ctx.onLog(`[Journey/saas] ${tag} Create needs your confirmation — skipped this time (create, and therefore delete, not exercised)`);
+  }
+  if (createBtn && createAllowed) {
     // Captured BEFORE clicking — the click may navigate away or the element may go stale,
     // and a finding that just says "Click Create/New button" gives no way to tell which of
     // possibly several such buttons on the page was actually the one tested.
@@ -711,10 +723,14 @@ async function runEntityModuleCrud(
         targetSelector: createTargetSelector ?? undefined,
       });
     } else {
-      const textInputs = page.locator('form input[type="text"]:visible, [role="dialog"] input[type="text"]:visible');
+      // Untyped inputs are text inputs too (the HTML default) — missing them left required
+      // fields empty, so the form silently refused to submit.
+      const textInputs = page.locator(
+        'form input[type="text"]:visible, form input:not([type]):visible, [role="dialog"] input[type="text"]:visible, [role="dialog"] input:not([type]):visible',
+      );
       const inputCount = await textInputs.count().catch(() => 0);
       for (let i = 0; i < Math.min(inputCount, 5); i++) {
-        await textInputs.nth(i).fill('QA Test Entry').catch(() => {});
+        await textInputs.nth(i).fill(marker).catch(() => {});
       }
 
       const submitBtn = page
@@ -735,7 +751,7 @@ async function runEntityModuleCrud(
         }
       }
     }
-  } else {
+  } else if (!createBtn) {
     ctx.onLog(`[Journey/saas] ${tag} No Create/New button found`);
   }
 
@@ -841,8 +857,15 @@ async function runEntityModuleCrud(
     ctx.onLog(`[Journey/saas] ${tag} Returned to entity list after edit flow`);
   }
 
-  // Delete an entity and verify removal — destructive, requires consent per site-policies.md
-  const deleteTrigger =
+  // Delete an entity and verify removal — destructive, requires consent per site-policies.md.
+  // Only the record this journey created (found by its marker) is ever a delete target; if
+  // nothing was created, nothing is deleted.
+  const ownRow = page.locator(SAAS_DATA_ROW_SELECTOR).filter({ hasText: marker }).first();
+  const hasOwnRow = created && (await ownRow.count().catch(() => 0)) > 0;
+  if (!hasOwnRow) {
+    ctx.onLog(`[Journey/saas] ${tag} Delete not attempted — only the agent's own test record may be deleted, and none was created this run`);
+  }
+  const deleteTrigger = !hasOwnRow ? null :
     (await findByIntentWithRetry(
       page,
       ctx,
@@ -854,17 +877,11 @@ async function runEntityModuleCrud(
         iconKeywords: ['trash', 'delete'],
       },
       6000,
-      firstDataRow,
-    )) ??
-    (await findByIntentWithRetry(
-      page,
-      ctx,
-      { id: 'delete-page-wide', candidateSelector: 'button, a[href]', textKeywords: ['delete'] },
-      2000,
+      ownRow,
     ));
 
   if (deleteTrigger) {
-    const proceed = await gateIfSensitive(page, ctx, `Delete entity (${moduleLabel})`);
+    const proceed = await confirmWriteAction(page, ctx, { action: 'delete', entityLabel: moduleLabel, data: `Name: "${marker}"` });
     if (proceed) {
       const deleteLabel = await describeElement(deleteTrigger);
       const deleteTargetUrl = page.url();
@@ -888,7 +905,7 @@ async function runEntityModuleCrud(
           severity: 'medium',
           area: 'UI-Journey',
           title: `${tag} Row count did not decrease after delete action`,
-          steps: [`Open ${moduleLabel} entity list`, `Click "${deleteLabel}" (the Delete action on the first row)`, 'Confirm if prompted'],
+          steps: [`Open ${moduleLabel} entity list`, `Click "${deleteLabel}" on the row "${marker}"`, 'Confirm if prompted'],
           expected: 'Row count decreases by at least 1 after delete',
           actual: `Rows before=${rowsBeforeDelete}, after=${rowsAfterDelete} (deleted via "${deleteLabel}")`,
           evidence: [s],
@@ -899,8 +916,8 @@ async function runEntityModuleCrud(
         });
       }
     }
-  } else {
-    ctx.onLog(`[Journey/saas] ${tag} No Delete affordance found on entity list rows`);
+  } else if (hasOwnRow) {
+    ctx.onLog(`[Journey/saas] ${tag} No Delete affordance found on the agent's own row`);
   }
 }
 
@@ -914,7 +931,11 @@ async function runSaasDashboardJourney(page: Page, ctx: ExecutorContext): Promis
   // samples one, a deep run sweeps across several instead of only ever touching whichever
   // module happens to be first in DOM order (which is all this journey did before).
   const rawLabels = await collectNavLabels(page, SAAS_SIDEBAR_SELECTOR, breadth + 5);
-  const moduleLabels = rawLabels.filter((l) => !SAAS_EXCLUDE_LABEL_RE.test(l)).slice(0, breadth);
+  // Only modules inside the user's section restriction (if any) — the journey must never walk
+  // into a sidebar section the user kept out of scope.
+  const moduleLabels = rawLabels
+    .filter((l) => !SAAS_EXCLUDE_LABEL_RE.test(l) && isSectionAllowed(l, ctx.config.allowedSections))
+    .slice(0, breadth);
 
   ctx.onLog(
     `[Journey/saas] Sidebar → entity list → create → edit → delete (gated) → settings ` +

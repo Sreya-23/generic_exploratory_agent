@@ -80,6 +80,7 @@ function findingToExploratoryInput(finding: Finding, targetUrl: string) {
     `Expected: ${finding.expected}`,
     `Actual: ${finding.actual}`,
     finding.confidenceReason ? `Confidence note: ${finding.confidenceReason}` : '',
+    finding.aiReview ? `AI review: ${finding.aiReview.verdict} — ${finding.aiReview.reason}` : '',
   ];
   const screenshots = (finding.evidence ?? [])
     .map(screenshotToDataUri)

@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { CachedNavChild, ExecutorContext, FlowTask } from '@qa/shared';
-import { findVisibleErrorText, explorationBreadth, dismissBlockingOverlay, isRiskyActionLabel, isSectionAllowed, isSubTabAllowed } from './helpers.js';
+import { findVisibleErrorText, explorationBreadth, dismissBlockingOverlay, isRiskyActionLabel, isSectionAllowed, isSubTabAllowed, isUrlInScope } from './helpers.js';
 import { loadSiteCache, saveSiteCache } from '../site-cache.js';
 
 interface NavPage {
@@ -358,11 +358,16 @@ export async function runNavigation(
     ctx.onLog(`[Navigation] Scope restriction active — only exploring: ${allowedSections.map((s) => s.section).join(', ')}`);
   }
 
+  const rejectedTopLevel = new Set<string>();
   for (const item of initialItems) {
     // Top-level items (the landing page's own sidebar) must match an allowed section by name —
     // there's no parent to inherit scope from at the root of the tree.
-    if (!isSectionAllowed(item.label, allowedSections)) {
+    // Also allowed: a link whose address is itself inside an allowed section (e.g. "+ Add" →
+    // /leave/add when the crawl starts on the Leave page).
+    const inScopeByUrl = !!item.href && !!allowedSections?.length && isUrlInScope(item.href, allowedSections);
+    if (!isSectionAllowed(item.label, allowedSections) && !inScopeByUrl) {
       ctx.onLog(`[Navigation] Skipping "${item.label}" — outside the allowed scope`);
+      rejectedTopLevel.add(item.label.trim().toLowerCase());
       continue;
     }
     queue.push({ url: item.href, label: item.label, depth: 1, selector: item.selector, discoveredOnUrl: startUrl });
@@ -709,8 +714,24 @@ export async function runNavigation(
           // CURRENT, already-in-scope page — covers both a persistent sidebar re-offering other
           // top-level sections (rejected unless separately allowed) and a genuine sub-page link
           // (e.g. an "Overview" page, not just a same-URL tab) nested under an allowed section.
-          const allowed =
-            isSectionAllowed(child.label, allowedSections) || isSubTabAllowed(next.label, child.label, allowedSections);
+          // A persistent sidebar re-offers every top-level section on every page; inheriting
+          // the parent's scope must not let those through. So a child link counts as part of
+          // the parent only if its own address is inside an allowed section, and an href-less
+          // child only if its label isn't one of the top-level items already rejected.
+          // When the parent is an allowed section that lists specific sub-tabs, the child must
+          // be one of them; deeper pages (a form opened from a list) have no such list.
+          const parentSection = allowedSections?.find(
+            (s) => s.section.trim().toLowerCase() === next.label.trim().toLowerCase(),
+          );
+          const subTabOk = parentSection?.subSections?.length
+            ? isSubTabAllowed(next.label, child.label, allowedSections)
+            : true;
+          const inheritsParent =
+            subTabOk &&
+            (child.href
+              ? isUrlInScope(child.href, allowedSections)
+              : !rejectedTopLevel.has(child.label.trim().toLowerCase()));
+          const allowed = isSectionAllowed(child.label, allowedSections) || inheritsParent;
           if (!allowed) {
             ctx.onLog(`[Navigation] Skipping "${child.label}" (under "${next.label}") — outside the allowed scope`);
             continue;
