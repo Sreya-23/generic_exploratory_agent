@@ -184,11 +184,14 @@ export function bridgeSessionEventToChat(event: SessionEvent): SessionEvent | nu
 
 /** Session report download (Markdown / HTML / JSON) + findings Q&A */
 export function registerReportRoutes(app: FastifyInstance, sessionsDir: string): void {
-  app.get<{ Params: { id: string }; Querystring: { format?: string } }>(
+  app.get<{ Params: { id: string }; Querystring: { format?: string; refreshAiReview?: string } }>(
     '/api/sessions/:id/report',
     async (req, reply) => {
       const session = await orchestrator.getSessionOrRehydrate(req.params.id, sessionsDir);
       if (!session) return reply.status(404).send({ error: 'Session not found' });
+      // ?refreshAiReview=1 throws away this run's saved AI verdicts so they are asked again
+      // (e.g. after changing the review model or prompt).
+      if (req.query.refreshAiReview === '1') session.aiReviews = {};
 
       const format = (req.query.format ?? 'json').toLowerCase();
 

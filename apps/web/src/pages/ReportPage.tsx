@@ -10,7 +10,6 @@ import {
 } from '../api/client';
 import { GroupedFindingList, listedFindingCount } from '../components/session/GroupedFindingList';
 import { QualityPilotConnect } from '../components/session/QualityPilotConnect';
-import { FindingsChatPanel } from '../components/chat/FindingsChatPanel';
 import { SETUP_CONV_KEY } from './ChatSetupPage';
 
 // Chips show the severity breakdown of actual defects only — 'info' is deliberately excluded
@@ -116,7 +115,6 @@ export function ReportPage() {
 
   const bySeverity = report.bySeverity;
   const htmlUrl = reportDownloadUrl(session.id, 'html');
-  const mdUrl = reportDownloadUrl(session.id, 'md');
   const findingsByArea = report.findingsByArea ?? [];
 
   return (
@@ -142,12 +140,6 @@ export function ReportPage() {
           <Link to={`/session/${session.id}`} className="btn btn-secondary">
             Live Session
           </Link>
-          <a className="btn btn-secondary" href={mdUrl} download>
-            Download Markdown
-          </a>
-          <a className="btn btn-secondary" href={htmlUrl} download>
-            Download styled HTML
-          </a>
           <a className="btn btn-primary" href={htmlUrl} target="_blank" rel="noreferrer">
             Open report / Save PDF
           </a>
@@ -188,7 +180,6 @@ export function ReportPage() {
         )}
       </section>
 
-      <FindingsChatPanel sessionId={session.id} />
 
       <div className="report-actions" style={{ marginBottom: '1.25rem' }}>
         <button

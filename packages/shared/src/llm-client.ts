@@ -48,8 +48,8 @@ export function activeLLMProvider(): Provider | null {
   return detectProvider()?.provider ?? null;
 }
 
-async function callGemini(apiKey: string, parts: LLMPart[], signal: AbortSignal): Promise<string | null> {
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${MODELS.gemini}:generateContent`;
+async function callGemini(apiKey: string, parts: LLMPart[], signal: AbortSignal, model = MODELS.gemini): Promise<string | null> {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
   const geminiParts = parts.map((p) =>
     p.type === 'text' ? { text: p.text } : { inline_data: { mime_type: p.mimeType, data: p.base64 } },
   );
@@ -66,7 +66,7 @@ async function callGemini(apiKey: string, parts: LLMPart[], signal: AbortSignal)
   return data.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text ?? null;
 }
 
-async function callOpenAI(apiKey: string, parts: LLMPart[], signal: AbortSignal): Promise<string | null> {
+async function callOpenAI(apiKey: string, parts: LLMPart[], signal: AbortSignal, model = MODELS.openai): Promise<string | null> {
   const content = parts.map((p) =>
     p.type === 'text'
       ? { type: 'text', text: p.text }
@@ -76,7 +76,7 @@ async function callOpenAI(apiKey: string, parts: LLMPart[], signal: AbortSignal)
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
     signal,
-    body: JSON.stringify({ model: MODELS.openai, messages: [{ role: 'user', content }] }),
+    body: JSON.stringify({ model, messages: [{ role: 'user', content }] }),
   });
   if (!response.ok) return null;
   const data = (await response.json()) as {
@@ -85,7 +85,7 @@ async function callOpenAI(apiKey: string, parts: LLMPart[], signal: AbortSignal)
   return data.choices?.[0]?.message?.content ?? null;
 }
 
-async function callAnthropic(apiKey: string, parts: LLMPart[], signal: AbortSignal): Promise<string | null> {
+async function callAnthropic(apiKey: string, parts: LLMPart[], signal: AbortSignal, model = MODELS.anthropic): Promise<string | null> {
   const content = parts.map((p) =>
     p.type === 'text'
       ? { type: 'text', text: p.text }
@@ -95,7 +95,7 @@ async function callAnthropic(apiKey: string, parts: LLMPart[], signal: AbortSign
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
     signal,
-    body: JSON.stringify({ model: MODELS.anthropic, max_tokens: 4096, messages: [{ role: 'user', content }] }),
+    body: JSON.stringify({ model, max_tokens: 4096, messages: [{ role: 'user', content }] }),
   });
   if (!response.ok) return null;
   const data = (await response.json()) as {
@@ -107,17 +107,44 @@ async function callAnthropic(apiKey: string, parts: LLMPart[], signal: AbortSign
 /** Text + optional images, in order (e.g. [prompt, screenshot1-label, screenshot1,
  *  screenshot2-label, screenshot2]) — the shape visual-review.ts needs for multi-screenshot
  *  review. Plain-text callers use callLLM() below instead. */
-export async function callLLMParts(parts: LLMPart[], timeoutMs = DEFAULT_TIMEOUT_MS): Promise<string | null> {
+/**
+ * Model for judgement-heavy calls (the AI bug review). The cheap default model kept doubting real
+ * bugs, so these calls use a stronger one. AI_REVIEW_MODEL in .env overrides it for any provider.
+ */
+const STRONG_MODELS: Record<Provider, string> = {
+  gemini: MODELS.gemini,
+  openai: 'gpt-4o',
+  anthropic: MODELS.anthropic,
+};
+
+export interface LLMCallOptions {
+  /** Use the stronger model (STRONG_MODELS / AI_REVIEW_MODEL) instead of the fast default. */
+  strong?: boolean;
+}
+
+export function callModelName(opts?: LLMCallOptions): string | null {
+  const detected = detectProvider();
+  if (!detected) return null;
+  if (!opts?.strong) return MODELS[detected.provider];
+  return process.env.AI_REVIEW_MODEL?.trim() || STRONG_MODELS[detected.provider];
+}
+
+export async function callLLMParts(
+  parts: LLMPart[],
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  opts?: LLMCallOptions,
+): Promise<string | null> {
   const detected = detectProvider();
   if (!detected) return null;
   const { provider, apiKey } = detected;
+  const model = callModelName(opts) ?? MODELS[provider];
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    if (provider === 'gemini') return await callGemini(apiKey, parts, controller.signal);
-    if (provider === 'openai') return await callOpenAI(apiKey, parts, controller.signal);
-    return await callAnthropic(apiKey, parts, controller.signal);
+    if (provider === 'gemini') return await callGemini(apiKey, parts, controller.signal, model);
+    if (provider === 'openai') return await callOpenAI(apiKey, parts, controller.signal, model);
+    return await callAnthropic(apiKey, parts, controller.signal, model);
   } catch {
     return null;
   } finally {
