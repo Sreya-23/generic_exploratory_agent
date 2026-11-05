@@ -149,7 +149,17 @@ app.post<{ Params: { id: string }; Body: { findingIds?: string[] } }>(
     const findings = (findingIds?.length
       ? candidates.filter((f) => findingIds.includes(f.id))
       : candidates
-    ).map((f) => (session.aiReviews?.[f.id] ? { ...f, aiReview: session.aiReviews[f.id] } : f));
+    ).map((f) => {
+      // Same single-badge rule as the report: the AI verdict, when there is one, decides it.
+      const r = session.aiReviews?.[f.id];
+      if (!r) return f;
+      return {
+        ...f,
+        aiReview: r,
+        confidence: r.verdict === 'agrees' ? ('verified' as const) : ('heuristic' as const),
+        confidenceReason: `AI review: ${r.reason}`,
+      };
+    });
 
     if (findings.length === 0) {
       return reply.status(400).send({ error: 'No eligible findings to raise (info-severity findings are excluded).' });

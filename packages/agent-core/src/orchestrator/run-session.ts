@@ -14,7 +14,7 @@ import type {
   SiteClassification,
   SiteIntelligenceSignals,
 } from '@qa/shared';
-import { hasAnyLLMKey, activeLLMProvider } from '@qa/shared';
+import { hasAnyLLMKey, activeLLMProvider, callModelName } from '@qa/shared';
 import { credentialsComplete, effectiveAuthState, authPromptForState } from '@qa/chat-agent';
 import { buildPlan, injectJourneyTasks, isSectionFocusedRun, removeUnlikelyTasks } from '../planner/index.js';
 import { classifySite } from '../intelligence/classify-site.js';
@@ -78,7 +78,7 @@ function logSessionEventToConsole(event: SessionEvent): void {
  */
 const PRE_ACTION_WAIT_MS = Math.max(0, Number(process.env.PRE_ACTION_WAIT_SECONDS ?? 60)) * 1000;
 
-function preActionPrompt(req: PreActionRequest, missing: string[], waitMs: number): string {
+function preActionPrompt(req: PreActionRequest, missing: string[], waitMs: number, alreadyUnanswered = false): string {
   const isConfirm = missing.every((k) => k.startsWith('confirm'));
   const reply = isConfirm
     ? missing.map((k) => `\`${k}: yes\``).join(' or ')
@@ -86,7 +86,9 @@ function preActionPrompt(req: PreActionRequest, missing: string[], waitMs: numbe
   const replyHint = isConfirm ? `**yes** (or ${reply})` : reply;
   const wait = waitMs > 0
     ? `\n\n⏸️ The run is **paused for ${Math.round(waitMs / 1000)}s** waiting for your answer.`
-    : '\n\n(Not pausing — an earlier prompt like this went unanswered, so this one is skipped.)';
+    : alreadyUnanswered
+      ? '\n\n(Not pausing — an earlier prompt like this went unanswered, so this one is skipped.)'
+      : '\n\n(Not pausing — this check skips the action for now; send the value and it is used the next time the action comes up.)';
   return (
     `⚠️ **Permission needed:** ${req.description}` +
     (req.pageUrl ? `\n\nPage: ${req.pageUrl}` : '') +
@@ -645,12 +647,17 @@ export class SessionOrchestrator {
           // A caller that waits for the answer gets the prompt now and the "Skipped" note only
           // if nobody answers (see waitForPreActionReply) — unless an earlier identical prompt
           // already went unanswered, in which case it is skipped straight away, not re-waited.
-          const willWait = !!req.willWait && !missing.some((k) => unansweredKeys.has(k));
+          const alreadyUnanswered = missing.some((k) => unansweredKeys.has(k));
+          const willWait = !!req.willWait && !alreadyUnanswered;
           this.emit({
             type: 'pre_action:required',
             sessionId,
             timestamp: new Date().toISOString(),
-            payload: { request: req, missing, prompt: preActionPrompt(req, missing, willWait ? PRE_ACTION_WAIT_MS : 0) },
+            payload: {
+              request: req,
+              missing,
+              prompt: preActionPrompt(req, missing, willWait ? PRE_ACTION_WAIT_MS : 0, alreadyUnanswered),
+            },
           });
           if (!req.willWait) recordSkipped(req, missing);
           return null;
@@ -983,7 +990,7 @@ export class SessionOrchestrator {
         timestamp: new Date().toISOString(),
         payload: {
           message: hasAnyLLMKey()
-            ? `[AI review] Asking ${activeLLMProvider()} to review ${bugCount} reported bug(s) — results appear on each card as "AI: …"`
+            ? `[AI review] Asking ${activeLLMProvider()} (${callModelName({ strong: true })}) to review ${bugCount} reported bug(s) — agreed bugs are marked Confirmed, the rest Requires validation`
             : '[AI review] No AI key configured — bugs are not AI-reviewed (set GEMINI_API_KEY in .env and restart to enable)',
         },
       });
@@ -996,14 +1003,14 @@ export class SessionOrchestrator {
             type: 'log',
             sessionId,
             timestamp: new Date().toISOString(),
-            payload: { message: `[AI review] Done: agrees ${n('agrees')}, doubts ${n('doubts')}, not sure ${n('unsure')}` },
+            payload: { message: `[AI review] Done: ${n('agrees')} Confirmed, ${n('doubts') + n('unsure')} Requires validation` },
           });
         } else if (hasAnyLLMKey() && bugCount > 0) {
           this.emit({
             type: 'log',
             sessionId,
             timestamp: new Date().toISOString(),
-            payload: { message: '[AI review] The AI did not return usable reviews (key invalid, quota or timeout) — cards show no AI verdict' },
+            payload: { message: '[AI review] The AI did not return usable reviews (key invalid, quota or timeout) — badges fall back to the checks\' own evidence' },
           });
         }
       } catch (err) {

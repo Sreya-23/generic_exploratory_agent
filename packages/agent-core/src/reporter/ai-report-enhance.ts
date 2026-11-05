@@ -159,29 +159,38 @@ function firstScreenshot(f: Finding): { mimeType: string; base64: string } | nul
 }
 
 function reviewPrompt(f: Finding, targetUrl: string, hasImage: boolean): string {
-  return `You are a senior QA engineer reviewing one bug that an automated exploratory-testing agent reported on ${targetUrl}. Decide whether a careful human tester would agree this is a REAL defect worth raising, or whether it is likely a false positive caused by how the automation tested (timing, test data, a deliberate design choice, a third-party page, etc.).
+  // First version of this prompt listed example excuses ("timing, test data, a deliberate design
+  // choice") and the model repeated them back as reasons to doubt real bugs — on SauceDemo's
+  // problem_user it doubted 3 of 11 findings, all 3 genuine defects. The rules below make
+  // "doubts" require a concrete contradiction, and treat a direct measurement as strong evidence.
+  const measured = f.confidence === 'verified';
+  return `You are a senior QA engineer double-checking one bug that an automated testing agent reported on ${targetUrl}. Your job is to check the EVIDENCE, not to think of reasons the bug might not matter.
 
-Severity given: ${f.severity}
-Check area: ${f.area}
-Title: ${f.title}
-Page: ${f.pageUrl ?? targetUrl}
-Steps:
-${f.steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}
-Expected: ${f.expected}
-Actual: ${f.actual}
-Agent's own confidence: ${f.confidence ?? 'not stated'}${f.confidenceReason ? ` — ${f.confidenceReason}` : ''}
-${hasImage ? 'The attached image is the screenshot the agent took as evidence.' : 'No screenshot is available.'}
+Report:
+- Severity: ${f.severity}
+- Check area: ${f.area}
+- Title: ${f.title}
+- Page: ${f.pageUrl ?? targetUrl}
+- Steps the agent took:
+${f.steps.map((s, i) => `  ${i + 1}. ${s}`).join('\n')}
+- Expected: ${f.expected}
+- Actual (what the agent observed): ${f.actual}
+- How the agent knows: ${f.confidenceReason ?? (f.confidence ?? 'not stated')}
+${measured ? '- The agent MEASURED this directly in the browser (a value read before/after, a status code, a DOM attribute). Treat the "Actual" as an observed fact.\n' : ''}${hasImage ? '- The attached image is a screenshot the agent took. It may be from before or after the action, so a screenshot that does not show the problem is NOT evidence against it.\n' : '- No screenshot is available.\n'}
+Rules:
+1. "agrees" — the observed Actual differs from the Expected in a way a user, the business or an accessibility/security standard would care about. Most objectively measured differences are real bugs, even on demo sites.
+2. "doubts" — ONLY when something in the report or screenshot concretely contradicts the claim (e.g. the screenshot clearly shows the value the agent says is missing, or the Expected itself is wrong). Name that contradiction in the reason.
+3. "unsure" — the evidence is too thin to tell either way. Possible explanations you merely imagine (timing, design intent, test data) are not evidence: if that is all you have, answer "agrees" for a measured result, otherwise "unsure".
 
 Reply with ONLY a JSON object, no markdown:
-{"verdict": "agrees" | "doubts" | "unsure", "reason": "<one plain-English sentence a non-technical reader understands>"}
-Use "agrees" when the evidence shows a real problem, "doubts" when it is probably not a real defect, "unsure" when the evidence is not enough to tell.`;
+{"verdict": "agrees" | "doubts" | "unsure", "reason": "<one plain-English sentence a non-technical reader understands, pointing at the evidence>"}`;
 }
 
 async function reviewOne(f: Finding, targetUrl: string): Promise<AiReview | null> {
   const image = firstScreenshot(f);
   const parts: LLMPart[] = [{ type: 'text', text: reviewPrompt(f, targetUrl, !!image) }];
   if (image) parts.push({ type: 'image', mimeType: image.mimeType, base64: image.base64 });
-  const text = await callLLMParts(parts, REVIEW_TIMEOUT_MS);
+  const text = await callLLMParts(parts, REVIEW_TIMEOUT_MS, { strong: true });
   if (!text) return null;
   const match = text.match(/\{[\s\S]*\}/);
   if (!match) return null;

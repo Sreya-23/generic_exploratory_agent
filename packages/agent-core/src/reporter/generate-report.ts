@@ -19,7 +19,6 @@ import {
   parseListLikeText,
   resultTypeOf,
   isLikelyFalsePositive,
-  aiReviewLabel,
   type FindingResultType,
 } from '@qa/shared';
 import { dedupeFindingsWithAI, reviewFindingsWithAI, summarizeWithAI } from './ai-report-enhance.js';
@@ -444,6 +443,7 @@ function formatExpectedActualMarkdown(label: string, text: string): string {
 function validationStatusLabel(f: Finding): string | null {
   if (!f.confidence) return null;
   if (isLikelyFalsePositive(f)) return 'Possible false positive (flagged by automated second-pass check)';
+  if (f.aiReview) return f.confidence === 'verified' ? 'Confirmed (AI-reviewed)' : 'Requires validation (AI was not convinced)';
   return f.confidence === 'verified' ? 'Confirmed (objective signal)' : 'Requires validation (single heuristic signal)';
 }
 
@@ -491,7 +491,6 @@ function formatFindingMarkdown(f: Finding, resultType: FindingResultType = resul
   if (statusLabel) {
     lines.push(`**Validation status:** ${statusLabel}` + (f.confidenceReason ? ` — ${f.confidenceReason}` : ''));
   }
-  if (f.aiReview) lines.push(`**AI review:** ${aiReviewLabel(f.aiReview)} — ${f.aiReview.reason}`);
   lines.push('');
   return lines.join('\n');
 }
@@ -537,9 +536,6 @@ function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F', re
   const confidenceNote = f.confidenceReason
     ? `<p class="confidence-note"><span class="label">Validation note</span>${escapeHtml(f.confidenceReason)}</p>`
     : '';
-  const aiReviewNote = f.aiReview
-    ? `<p class="confidence-note"><span class="label">AI review</span>${escapeHtml(`${aiReviewLabel(f.aiReview)} — ${f.aiReview.reason}`)}</p>`
-    : '';
   const plain = explainFinding(f);
   const unconfirmed = resultType === 'potential-defect' ? ' <em>(Not yet confirmed — check the evidence before acting.)</em>' : '';
 
@@ -550,7 +546,6 @@ function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F', re
     <span class="sev-badge ${escapeHtml(f.severity)}">${escapeHtml(f.severity)}</span>
     <span class="area-chip" title="Check area: ${escapeHtml(f.area)}">${escapeHtml(plain.areaLabel)}</span>
     ${confidenceBadge}
-    ${f.aiReview ? `<span class="confidence-badge ${f.aiReview.verdict === 'agrees' ? 'verified' : f.aiReview.verdict === 'doubts' ? 'flagged' : 'heuristic'}" title="${escapeHtml(f.aiReview.reason)}">AI: ${escapeHtml(aiReviewLabel(f.aiReview))}</span>` : ''}
   </header>
   <h4>${escapeHtml(plain.headline)}</h4>
   <p class="pre"><span class="label">What's wrong</span>${escapeHtml(plain.summary)}</p>
@@ -567,7 +562,6 @@ function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F', re
       <div class="ea actual"><span class="label">Actual</span><div class="ea-text">${withListFormatting(f.actual)}</div></div>
     </div>
     ${confidenceNote}
-    ${aiReviewNote}
   </details>
   <footer class="finding-foot">
     <span>Repro rate: <strong>${escapeHtml(f.reproRate)}</strong></span>
@@ -956,7 +950,20 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
     () => state.aiReviews ?? {},
   );
   const reviews = state.aiReviews;
-  findings = findings.map((f) => (reviews[f.id] ? { ...f, aiReview: reviews[f.id] } : f));
+  // One badge per finding: when the AI reviewed it, the AI's verdict decides it — agrees →
+  // Confirmed, doubts / not sure → Requires validation — and its reason becomes the "how sure"
+  // note. Without a review (no key, or the call failed) the check's own evidence decides, as
+  // before. Counts and the health score read the same field, so they follow the badge.
+  findings = findings.map((f) => {
+    const r = reviews[f.id];
+    if (!r) return f;
+    return {
+      ...f,
+      aiReview: r,
+      confidence: r.verdict === 'agrees' ? ('verified' as const) : ('heuristic' as const),
+      confidenceReason: `AI review: ${r.reason}`,
+    };
+  });
   // Every count/section below is built from ONE classification (resultTypeOf — see
   // finding-classification.ts), not each re-deriving its own notion of "is this a defect":
   // that's what let a report show two different totals for the same run (one section's number
