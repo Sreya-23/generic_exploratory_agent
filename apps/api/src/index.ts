@@ -152,7 +152,7 @@ app.post<{ Params: { id: string }; Body: { findingIds?: string[] } }>(
     ).map((f) => {
       // Same single-badge rule as the report: the AI verdict, when there is one, decides it.
       const r = session.aiReviews?.[f.id];
-      if (!r) return f;
+      if (!r) return f.confidence ? f : { ...f, confidence: 'verified' as const, confidenceReason: 'The check measured this directly.' };
       return {
         ...f,
         aiReview: r,

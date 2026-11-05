@@ -18,7 +18,7 @@ import {
   FLOW_TITLES,
   parseListLikeText,
   resultTypeOf,
-  isLikelyFalsePositive,
+  isExecutionError,
   type FindingResultType,
 } from '@qa/shared';
 import { dedupeFindingsWithAI, reviewFindingsWithAI, summarizeWithAI } from './ai-report-enhance.js';
@@ -441,8 +441,7 @@ function formatExpectedActualMarkdown(label: string, text: string): string {
  *  positive" rather than the internal 'verified'/'heuristic' field names, since this is read by
  *  whoever is deciding what to triage, not by someone reading the code. */
 function validationStatusLabel(f: Finding): string | null {
-  if (!f.confidence) return null;
-  if (isLikelyFalsePositive(f)) return 'Possible false positive (flagged by automated second-pass check)';
+  if (!f.confidence || f.severity === 'info' || isExecutionError(f)) return null;
   if (f.aiReview) return f.confidence === 'verified' ? 'Confirmed (AI-reviewed)' : 'Requires validation (AI was not convinced)';
   return f.confidence === 'verified' ? 'Confirmed (objective signal)' : 'Requires validation (single heuristic signal)';
 }
@@ -495,6 +494,77 @@ function formatFindingMarkdown(f: Finding, resultType: FindingResultType = resul
   return lines.join('\n');
 }
 
+/** The one tag a bug carries — same wording as the web app's FindingCard. */
+function tagLabel(f: Finding): string | null {
+  // Info notes and the agent's own execution issues aren't bugs, so they carry no tag.
+  if (!f.confidence || f.severity === 'info' || isExecutionError(f)) return null;
+  return f.confidence === 'verified' ? '✓ Confirmed' : '⚠ Requires validation';
+}
+
+function tagBadgeHtml(f: Finding): string {
+  const label = tagLabel(f);
+  return label
+    ? `<span class="confidence-badge ${f.confidence}" title="${escapeHtml(f.confidenceReason ?? '')}">${label}</span>`
+    : '';
+}
+
+function shortPage(f: Finding, targetUrl: string): string {
+  const raw = f.pageUrl ?? targetUrl;
+  try {
+    const u = new URL(raw);
+    const path = `${u.pathname}${u.search}`.replace(/\/$/, '');
+    return path && path !== '' ? path : u.host;
+  } catch {
+    return raw;
+  }
+}
+
+/** "All bugs at a glance": one row per bug, in the same order (and with the same ids) as the cards. */
+function buildGlanceHtml(groups: AreaFindingGroup[], targetUrl: string): string {
+  const rows: string[] = [];
+  let i = 0;
+  for (const g of groups) {
+    for (const f of g.findings) {
+      const id = `F-${String(++i).padStart(3, '0')}`;
+      rows.push(`<tr>
+        <td class="num"><a href="#${id}">${id}</a></td>
+        <td><span class="sev-badge ${escapeHtml(f.severity)}">${escapeHtml(f.severity)}</span></td>
+        <td><a href="#${id}">${escapeHtml(explainFinding(f).headline)}</a></td>
+        <td class="muted small">${escapeHtml(shortPage(f, targetUrl))}</td>
+        <td>${tagBadgeHtml(f)}</td>
+      </tr>`);
+    }
+  }
+  if (rows.length === 0) return '<p class="empty">No bugs were found in this run.</p>';
+  return `<table class="data-table glance">
+    <thead><tr><th style="width:9%">#</th><th style="width:11%">Severity</th><th>Problem</th><th style="width:22%">Page</th><th style="width:19%">Status</th></tr></thead>
+    <tbody>${rows.join('\n')}</tbody>
+  </table>`;
+}
+
+function buildGlanceMarkdown(groups: AreaFindingGroup[], targetUrl: string): string {
+  const lines = ['## 1. All bugs at a glance', ''];
+  const all = groups.flatMap((g) => g.findings);
+  if (all.length === 0) return [...lines, '_No bugs were found in this run._', ''].join('\n');
+  lines.push('| # | Severity | Problem | Page | Status |', '|---|---|---|---|---|');
+  all.forEach((f, i) => {
+    const cell = (s: string) => s.replace(/\|/g, '\\|');
+    lines.push(
+      `| ${i + 1} | ${f.severity} | ${cell(explainFinding(f).headline)} | ${cell(shortPage(f, targetUrl))} | ${(tagLabel(f) ?? '').replace(/^[✓⚠] /, '')} |`,
+    );
+  });
+  lines.push('');
+  return lines.join('\n');
+}
+
+/** Pushes a block of report sections one heading level down and drops their "N. " numbers, for the appendix. */
+function asAppendixMarkdown(md: string): string {
+  return md
+    .split('\n')
+    .map((l) => (/^#{2,5} /.test(l) ? `#${l.replace(/^(#+ )\d+\. /, '$1')}` : l))
+    .join('\n');
+}
+
 function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F', resultType: FindingResultType = resultTypeOf(f)): string {
   const id = `${idPrefix}-${String(index + 1).padStart(3, '0')}`;
   const steps =
@@ -523,24 +593,19 @@ function formatFindingHtml(f: Finding, index: number, idPrefix: string = 'F', re
     return `${intro}<ul class="finding-list">${items}</ul>`;
   };
 
-  const flaggedFalsePositive = isLikelyFalsePositive(f);
-  const confidenceBadge = f.confidence
-    ? flaggedFalsePositive
-      ? `<span class="confidence-badge flagged" title="${escapeHtml(f.confidenceReason ?? '')}">🚩 Possible false positive</span>`
-      : `<span class="confidence-badge ${f.confidence}" title="${escapeHtml(f.confidenceReason ?? '')}">${f.confidence === 'verified' ? '✓ Confirmed' : '⚠ Requires validation'}</span>`
-    : '';
+  const confidenceBadge = tagBadgeHtml(f);
   // The badge's title= tooltip is easy to miss entirely (no hover on touch, and invisible in
   // any copy-pasted or printed version of the report) — confidenceReason is exactly the kind
   // of context ("verified" doesn't mean "always reproduces") that shouldn't depend on a reader
   // thinking to hover over a small badge, so it's also shown as plain, always-visible text.
   const confidenceNote = f.confidenceReason
-    ? `<p class="confidence-note"><span class="label">Validation note</span>${escapeHtml(f.confidenceReason)}</p>`
+    ? `<p class="confidence-note"><span class="label">How sure the agent is</span>${escapeHtml(f.confidenceReason)}</p>`
     : '';
   const plain = explainFinding(f);
   const unconfirmed = resultType === 'potential-defect' ? ' <em>(Not yet confirmed — check the evidence before acting.)</em>' : '';
 
   return `
-<article class="finding" data-severity="${escapeHtml(f.severity)}">
+<article class="finding" id="${id}" data-severity="${escapeHtml(f.severity)}">
   <header class="finding-head">
     <span class="finding-id">${id}</span>
     <span class="sev-badge ${escapeHtml(f.severity)}">${escapeHtml(f.severity)}</span>
@@ -598,7 +663,7 @@ function buildOverviewMarkdown(
           : 'Auth: not probed';
 
   return [
-    '## 1. Overview',
+    '## 1. Run details',
     '',
     `| | |`,
     `|---|---|`,
@@ -865,7 +930,7 @@ function buildFindingsMarkdown(groups: AreaFindingGroup[], bySeverity: SeverityC
   // already gives them zero weight), so they're broken out into their own "Additional Notes"
   // section below rather than diluting a section that's meant to be exclusively real bugs.
   const lines: string[] = [
-    '## 3. Findings',
+    '## 2. Bug details',
     '',
     '### Severity summary',
     '',
@@ -889,7 +954,7 @@ function buildFindingsMarkdown(groups: AreaFindingGroup[], bySeverity: SeverityC
     lines.push(`| ${areaHeading(g)} | ${g.count} (${formatSeverityInline(g.bySeverity)}) |`);
   }
 
-  lines.push('', '### Detailed findings', '');
+  lines.push('');
   let idx = 0;
   for (const g of groups) {
     lines.push(`### ${areaHeading(g)} (${g.count})`, '');
@@ -913,7 +978,7 @@ function buildInfoNotesMarkdown(groups: AreaFindingGroup[]): string {
   if (groups.length === 0) return '';
   const total = groups.reduce((n, g) => n + g.count, 0);
   const lines: string[] = [
-    `## 4. Additional Notes (${total})`,
+    `## 4. Info notes (${total})`,
     '',
     '_Not defects — informational observations (discovered endpoints, coverage summaries, ' +
       'confirmation checks) that may be useful context for future exploration._',
@@ -956,7 +1021,14 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
   // before. Counts and the health score read the same field, so they follow the badge.
   findings = findings.map((f) => {
     const r = reviews[f.id];
-    if (!r) return f;
+    if (!r) {
+      // Every bug carries exactly one tag. A check that doesn't label itself reports a plain
+      // measured fact (a missing header, a size in pixels) and was already counted as confirmed.
+      if (!f.confidence && f.severity !== 'info' && !isExecutionError(f)) {
+        return { ...f, confidence: 'verified' as const, confidenceReason: f.confidenceReason ?? 'The check measured this directly.' };
+      }
+      return f;
+    }
     return {
       ...f,
       aiReview: r,
@@ -1015,27 +1087,41 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
   const date = state.updatedAt || state.createdAt || new Date().toISOString();
   const areas = state.config.areas.join(', ') || 'n/a';
 
+  // Reader-first order: the answer (health + summary), every bug on one screen, the bug cards,
+  // what to do next — then everything about how the agent ran, in one appendix at the end.
   const markdown = [
     '# Exploratory QA Report',
     '',
+    ...(/Health Score/i.test(executiveSummary)
+      ? []
+      : [`**Site health: ${healthScore.grade} (${healthScore.score}/100)** — ${healthScore.summary}`, '']),
     executiveSummary,
     '',
-    buildOverviewMarkdown(state, flowsCovered, bugFindings, confirmedCount, potentialCount, executionErrorFindings.length),
-    buildFlowsMarkdown(flowsCovered),
-    buildExecutionErrorsMarkdown(executionErrorsByArea),
-    buildSiteKnowledgeMarkdown(state),
-    buildApplicationMapMarkdown(state),
-    buildPageCoverageMarkdown(state),
-    buildActionInventoryMarkdown(state),
-    buildEnvironmentMatrixMarkdown(state),
-    buildAccessMapMarkdown(state),
-    buildFindingDiffMarkdown(state),
+    buildGlanceMarkdown(findingsByArea, targetUrl),
     buildFindingsMarkdown(findingsByArea, bySeverity),
-    buildInfoNotesMarkdown(infoByArea),
-    `## ${infoByArea.length > 0 ? '5' : '4'}. Recommended Next Steps`,
+    '## 3. Recommended Next Steps',
     '',
     ...recommendedNextSteps.map((s, i) => `${i + 1}. ${s}`),
     '',
+    '---',
+    '',
+    '## Appendix: how the agent ran this test',
+    '',
+    asAppendixMarkdown(
+      [
+        buildOverviewMarkdown(state, flowsCovered, bugFindings, confirmedCount, potentialCount, executionErrorFindings.length),
+        buildFlowsMarkdown(flowsCovered),
+        buildExecutionErrorsMarkdown(executionErrorsByArea),
+        buildSiteKnowledgeMarkdown(state),
+        buildApplicationMapMarkdown(state),
+        buildPageCoverageMarkdown(state),
+        buildActionInventoryMarkdown(state),
+        buildEnvironmentMatrixMarkdown(state),
+        buildAccessMapMarkdown(state),
+        buildFindingDiffMarkdown(state),
+        buildInfoNotesMarkdown(infoByArea),
+      ].join('\n'),
+    ),
   ].join('\n');
 
   const displayDate = new Date(date).toLocaleString(undefined, {
@@ -1886,6 +1972,13 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
       flex-wrap: wrap;
       background: var(--soft);
     }
+    details.appendix > summary { cursor: pointer; list-style: none; }
+    details.appendix > summary::-webkit-details-marker { display: none; }
+    details.appendix > summary h2 { display: inline; }
+    details.appendix > summary h2::before { content: '▸ '; color: var(--muted); }
+    details.appendix[open] > summary h2::before { content: '▾ '; }
+    details.appendix > summary .small { display: block; margin-top: 0.25rem; }
+    details.appendix h3 { margin-top: 1.75rem; }
     @media print {
       body { background: #fff; }
       .doc { margin: 0; border: none; box-shadow: none; max-width: none; }
@@ -1913,109 +2006,75 @@ export async function generateSessionReport(state: SessionState): Promise<Sessio
 
     <div class="toolbar no-print">
       <button type="button" class="primary" onclick="window.print()">Print / Save as PDF</button>
+      <script>window.addEventListener('beforeprint', function () { var a = document.getElementById('appendix'); if (a) a.open = true; });</script>
     </div>
 
     <div class="body">
       <div class="kpi-grid">
-        <div class="kpi"><div class="v">${flowsCovered.length}</div><div class="l">Flows tested</div></div>
-        <div class="kpi"><div class="v">${state.progress.completedTasks}/${state.progress.totalTasks}</div><div class="l">Tasks completed</div></div>
-        <div class="kpi"><div class="v">${confirmedCount}</div><div class="l">Confirmed defects</div></div>
-        <div class="kpi"><div class="v">${potentialCount}</div><div class="l">Potential (unvalidated)</div></div>
+        <div class="kpi"><div class="v">${escapeHtml(healthScore.grade)} <span class="small muted">${healthScore.score}/100</span></div><div class="l">Site health</div></div>
+        <div class="kpi"><div class="v">${confirmedCount}</div><div class="l">Confirmed</div></div>
+        <div class="kpi"><div class="v">${potentialCount}</div><div class="l">Requires validation</div></div>
+        <div class="kpi"><div class="v">${bySeverity.critical + bySeverity.high}</div><div class="l">Critical + high</div></div>
       </div>
 
       <ul class="toc">
-        <li><a href="#overview">1. Overview</a></li>
-        <li><a href="#flows">2. Flows tested</a></li>
-        ${executionErrorsHtml ? `<li><a href="#execution-errors">Agent Execution Issues (${executionErrorFindings.length})</a></li>` : ''}
-        ${siteKnowledgeHtml ? '<li><a href="#site-knowledge">Application Knowledge Base</a></li>' : ''}
-        ${applicationMapHtml ? '<li><a href="#application-map">Application Map</a></li>' : ''}
-        ${pageCoverageHtml ? '<li><a href="#page-coverage">Page Coverage</a></li>' : ''}
-        ${actionInventoryHtml ? '<li><a href="#action-inventory">Action Inventory</a></li>' : ''}
-        ${environmentMatrixHtml ? '<li><a href="#environment-matrix">Environment Comparison</a></li>' : ''}
-        ${accessMapHtml ? '<li><a href="#access-map">Access Map</a></li>' : ''}
-        ${findingDiffHtml ? '<li><a href="#regression">Regression vs Previous Run</a></li>' : ''}
-        <li><a href="#findings">3. Findings</a></li>
-        ${infoNotesHtml ? `<li><a href="#info-notes">4. Additional Notes</a></li>` : ''}
-        <li><a href="#next-steps">${infoNotesHtml ? '5' : '4'}. Recommendations</a></li>
+        <li><a href="#summary">1. Summary</a></li>
+        <li><a href="#glance">2. All bugs at a glance</a></li>
+        <li><a href="#findings">3. Bug details</a></li>
+        <li><a href="#next-steps">4. Recommendations</a></li>
+        <li><a href="#appendix">Appendix: how the agent ran this test</a></li>
       </ul>
 
-      <section class="sec" id="overview">
-        <h2>1. Overview</h2>
-        <p class="summary-text">${escapeHtml(executiveSummary)}</p>
-        <div class="two-col">
-          <table class="overview-table">${overviewRows}</table>
-          <div>
-            <div class="table-block-title">Severity distribution</div>
-            ${severityBars}
-          </div>
-        </div>
+      <section class="sec" id="summary">
+        <h2>1. Summary</h2>
+        <p class="summary-text">${escapeHtml(executiveSummary.replace(/\*\*/g, ''))}</p>
+        <div class="table-block-title">Severity distribution</div>
+        ${severityBars}
       </section>
 
-      <section class="sec" id="flows">
-        <h2>2. Flows Tested</h2>
-        <p class="muted" style="margin:0 0 0.75rem">Functional journeys and UI checks exercised in this session, grouped by exploration area.</p>
-        ${flowsHtml}
+      <section class="sec" id="glance">
+        <h2>2. All bugs at a glance</h2>
+        ${buildGlanceHtml(findingsByArea, targetUrl)}
       </section>
-
-      ${executionErrorsHtml ? `<section class="sec" id="execution-errors">
-        <h2>Agent Execution Issues <span class="muted small">(${executionErrorFindings.length})</span></h2>
-        <p class="muted" style="margin:0 0 0.75rem">Not application defects — checks the agent itself could not finish (a timeout, a crashed step, the target being briefly unreachable). Excluded from Findings and the health score.</p>
-        ${executionErrorsAreaSummaryHtml ? `<div style="margin:0.75rem 0 1.25rem">${executionErrorsAreaSummaryHtml}</div>` : ''}
-        ${executionErrorsHtml}
-      </section>` : ''}
-
-      ${siteKnowledgeHtml ? `<section class="sec" id="site-knowledge">
-        <h2>Application Knowledge Base</h2>
-        ${siteKnowledgeHtml}
-      </section>` : ''}
-
-      ${applicationMapHtml ? `<section class="sec" id="application-map">
-        <h2>Application Map</h2>
-        ${applicationMapHtml}
-      </section>` : ''}
-
-      ${pageCoverageHtml ? `<section class="sec" id="page-coverage">
-        <h2>Page Coverage</h2>
-        ${pageCoverageHtml}
-      </section>` : ''}
-
-      ${actionInventoryHtml ? `<section class="sec" id="action-inventory">
-        <h2>Action Inventory</h2>
-        ${actionInventoryHtml}
-      </section>` : ''}
-
-      ${environmentMatrixHtml ? `<section class="sec" id="environment-matrix">
-        <h2>Environment Comparison</h2>
-        ${environmentMatrixHtml}
-      </section>` : ''}
-
-      ${accessMapHtml ? `<section class="sec" id="access-map">
-        <h2>Access Map</h2>
-        ${accessMapHtml}
-      </section>` : ''}
-
-      ${findingDiffHtml ? `<section class="sec" id="regression">
-        <h2>Regression vs Previous Run</h2>
-        ${findingDiffHtml}
-      </section>` : ''}
 
       <section class="sec" id="findings">
-        <h2>3. Findings</h2>
-        ${areaSummaryHtml ? `<div style="margin:0.75rem 0 1.25rem">${areaSummaryHtml}</div>` : ''}
+        <h2>3. Bug details</h2>
         ${findingsHtml}
       </section>
 
-      ${infoNotesHtml ? `<section class="sec" id="info-notes">
-        <h2>4. Additional Notes <span class="muted small">(${infoFindings.length})</span></h2>
-        <p class="muted" style="margin:0 0 0.75rem">Not defects — informational observations (discovered endpoints, coverage summaries, confirmation checks) that may be useful context for future exploration.</p>
-        ${infoAreaSummaryHtml ? `<div style="margin:0.75rem 0 1.25rem">${infoAreaSummaryHtml}</div>` : ''}
-        ${infoNotesHtml}
-      </section>` : ''}
-
       <section class="sec" id="next-steps">
-        <h2>${infoNotesHtml ? '5' : '4'}. Recommendations</h2>
+        <h2>4. Recommendations</h2>
         <ol class="next-steps">${nextStepsHtml}</ol>
       </section>
+
+      <details class="sec appendix" id="appendix">
+        <summary><h2>Appendix: how the agent ran this test</h2><span class="muted small">Run details, what was tested, pages and buttons explored, browsers/devices, regression and info notes. Click to expand.</span></summary>
+
+        <h3>Run details</h3>
+        <table class="overview-table">${overviewRows}</table>
+
+        <h3>Flows tested</h3>
+        <p class="muted" style="margin:0 0 0.75rem">Functional journeys and UI checks exercised in this session, grouped by exploration area.</p>
+        ${flowsHtml}
+
+        ${executionErrorsHtml ? `<h3>Agent execution issues <span class="muted small">(${executionErrorFindings.length})</span></h3>
+        <p class="muted" style="margin:0 0 0.75rem">Not application defects — checks the agent itself could not finish (a timeout, a crashed step, the target being briefly unreachable). Excluded from the bug list and the health score.</p>
+        ${executionErrorsAreaSummaryHtml ? `<div style="margin:0.75rem 0 1.25rem">${executionErrorsAreaSummaryHtml}</div>` : ''}
+        ${executionErrorsHtml}` : ''}
+
+        ${siteKnowledgeHtml ? `<h3>Application knowledge base</h3>${siteKnowledgeHtml}` : ''}
+        ${applicationMapHtml ? `<h3>Application map</h3>${applicationMapHtml}` : ''}
+        ${pageCoverageHtml ? `<h3>Page coverage</h3>${pageCoverageHtml}` : ''}
+        ${actionInventoryHtml ? `<h3>Action inventory</h3>${actionInventoryHtml}` : ''}
+        ${environmentMatrixHtml ? `<h3>Environment comparison</h3>${environmentMatrixHtml}` : ''}
+        ${accessMapHtml ? `<h3>Access map</h3>${accessMapHtml}` : ''}
+        ${findingDiffHtml ? `<h3>Regression vs previous run</h3>${findingDiffHtml}` : ''}
+
+        ${infoNotesHtml ? `<h3>Info notes <span class="muted small">(${infoFindings.length})</span></h3>
+        <p class="muted" style="margin:0 0 0.75rem">Not defects — observations (discovered endpoints, coverage summaries, skipped actions) kept as context.</p>
+        ${infoAreaSummaryHtml ? `<div style="margin:0.75rem 0 1.25rem">${infoAreaSummaryHtml}</div>` : ''}
+        ${infoNotesHtml}` : ''}
+      </details>
     </div>
 
     <footer class="doc-footer">
