@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import type { Page } from 'playwright';
 import type { ExecutorContext, FlowTask } from '@qa/shared';
-import { findVisibleErrorText } from './helpers.js';
+import { askAndWait, findVisibleErrorText } from './helpers.js';
 
 async function shot(page: Page, ctx: ExecutorContext, label: string): Promise<string> {
   const p = join(
@@ -177,15 +177,17 @@ export async function runUserDirectedFlow(
   if (isRisky && ctx.onPreActionNeeded) {
     const isPayment = /\bpay|\bpurchase\b|\bbuy\b|\bcheckout\b|\btransfer\b/.test(lower);
     const isSendLink = /\bsend.*link\b/.test(lower);
+    const key = isPayment ? 'card' : isSendLink ? 'phone' : 'confirm_action';
 
-    const extras = ctx.onPreActionNeeded({
+    const extras = await askAndWait(ctx, {
       type: isPayment ? 'purchase' : isSendLink ? 'send_link' : 'generic',
       description: `User-directed: "${instruction.slice(0, 80)}"`,
-      requiredExtras: isPayment ? ['card'] : isSendLink ? ['phone'] : [],
+      requiredExtras: [key],
       pageUrl: page.url(),
     });
 
-    if (extras === null) {
+    const ok = key === 'confirm_action' ? /^(yes|true)$/i.test(extras?.[key] ?? '') : !!extras?.[key];
+    if (!ok) {
       ctx.onLog(`[UserDirected] Skipped risky instruction — awaiting user confirmation`);
       return;
     }

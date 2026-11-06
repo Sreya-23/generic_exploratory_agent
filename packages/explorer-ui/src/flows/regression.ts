@@ -1,6 +1,6 @@
 // H1 — Golden path snapshot / H3 — Visual regression
 import { join } from 'node:path';
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, copyFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { PNG } from 'pngjs';
 import pixelmatch from 'pixelmatch';
@@ -18,6 +18,23 @@ const DIFF_PCT_THRESHOLD = 1.5;
 // against a screenshot of site A taken weeks earlier (observed: a 50.94% "regression" on
 // SauceDemo that was really a comparison with a different website). Different accounts on the
 // same site also legitimately render different pages, so the login identity is part of the key.
+/**
+ * Reference ("golden") screenshots live outside the session folder, so the web app — which only
+ * serves files from sessions/<id>/screenshots/ — showed them as broken images. Evidence points at
+ * a copy inside this session's screenshots folder instead; the original stays the baseline.
+ */
+async function copyIntoSession(ctx: ExecutorContext, src: string, name: string): Promise<string> {
+  const dir = join(ctx.sessionsDir, ctx.sessionId, 'screenshots');
+  const dest = join(dir, name);
+  try {
+    await mkdir(dir, { recursive: true });
+    await copyFile(src, dest);
+    return dest;
+  } catch {
+    return src;
+  }
+}
+
 function baselineDir(ctx: ExecutorContext): string {
   let host = 'unknown-host';
   try {
@@ -116,7 +133,7 @@ export async function runGoldenPath(
         steps: [`Navigate to ${p.url}`, 'Take full-page screenshot'],
         expected: 'Baseline established for future visual comparison',
         actual: `Snapshot saved to ${join(goldenDir, `${p.name}.png`)} — future sessions against this site and login will diff against this`,
-        evidence: [shotPath],
+        evidence: [await copyIntoSession(ctx, shotPath, `golden-baseline-${p.name}.png`)],
         reproRate: '1/1',
         automationCandidate: true,
       });
@@ -211,6 +228,7 @@ export async function runVisualRegression(
   await page.screenshot({ path: currentShot, fullPage: true });
 
   const diffShot = join(shotDir, 'visual-regression-home-diff.png');
+  const goldenEvidence = await copyIntoSession(ctx, goldenShot, 'golden-baseline-home.png');
   const { diffPct, diffPixels, totalPixels, sizeMismatch, heightChangePct } = await diffScreenshots(
     currentShot,
     goldenShot,
@@ -225,7 +243,7 @@ export async function runVisualRegression(
       steps: ['Load homepage', 'Take full-page screenshot', 'Compare dimensions with golden snapshot'],
       expected: 'Screenshot width matches baseline',
       actual: 'Current screenshot and baseline have different widths — horizontal overflow or a layout change',
-      evidence: [currentShot, goldenShot],
+      evidence: [currentShot, goldenEvidence],
       reproRate: '1/1',
       automationCandidate: true,
     });
@@ -244,7 +262,7 @@ export async function runVisualRegression(
       steps: ['Load homepage', 'Take a full-page screenshot', 'Compare its height with the stored baseline'],
       expected: 'Page length roughly the same as the baseline',
       actual: `Height changed by ${heightChangePct.toFixed(1)}% — content was added or removed; check it was intentional`,
-      evidence: [currentShot, goldenShot],
+      evidence: [currentShot, goldenEvidence],
       reproRate: '1/1',
       automationCandidate: true,
       confidence: 'heuristic',
@@ -265,7 +283,7 @@ export async function runVisualRegression(
       ],
       expected: `Less than ${DIFF_PCT_THRESHOLD}% pixel difference from baseline`,
       actual: `${diffPct.toFixed(2)}% of pixels (${diffPixels}/${totalPixels}) differ from the golden snapshot`,
-      evidence: [currentShot, goldenShot, diffShot],
+      evidence: [currentShot, goldenEvidence, diffShot],
       reproRate: '1/1',
       automationCandidate: true,
     });
