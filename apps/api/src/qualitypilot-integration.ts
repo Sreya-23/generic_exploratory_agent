@@ -14,6 +14,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { extname, join } from 'node:path';
 import type { Finding, SessionState } from '@qa/shared';
+import { explainFinding } from '@qa/shared';
 
 export interface QualityPilotConfig {
   baseUrl: string;
@@ -75,27 +76,51 @@ const SEVERITY_MAP: Record<Finding['severity'], string | null> = {
   info: null,
 };
 
-function findingToExploratoryInput(finding: Finding, targetUrl: string) {
+/**
+ * A raised bug reads like one a tester would write: a plain-English title, then what's wrong and
+ * why it matters (the reasoning a developer or PM needs), then the steps, expected/actual, page,
+ * the test account used (username only) and the one tag with its reason. Internal check codes
+ * stay out of the text and travel as labels in metadata.
+ */
+function findingToExploratoryInput(finding: Finding, state: SessionState) {
+  const targetUrl = state.config.targetUrl;
+  const plain = explainFinding(finding);
+  const creds = state.config.credentials;
+  const username = creds && creds.type !== 'none' ? creds.username : undefined;
+  const steps =
+    username && !/^log ?in\b/i.test(finding.steps[0] ?? '')
+      ? [`Log in as ${username}`, ...finding.steps]
+      : finding.steps;
+  const confirmed = finding.confidence !== 'heuristic';
+  const status = `${confirmed ? 'Confirmed' : 'Requires validation'} — ${finding.confidenceReason ?? 'The check measured this directly.'}`;
+
   const descriptionParts = [
-    `Expected: ${finding.expected}`,
-    `Actual: ${finding.actual}`,
-    finding.confidenceReason ? `Confidence note: ${finding.confidenceReason}` : '',
+    `What's wrong\n${plain.summary}`,
+    `Why it matters\n${plain.whyItMatters}`,
+    `Steps to reproduce\n${steps.map((s, i) => `${i + 1}. ${s}`).join('\n')}`,
+    `Expected: ${finding.expected}\nActual: ${finding.actual}`,
+    [`Page: ${finding.pageUrl ?? targetUrl}`, username ? `Test account: ${username}` : '', `Status: ${status}`]
+      .filter(Boolean)
+      .join('\n'),
   ];
   const screenshots = (finding.evidence ?? [])
     .map(screenshotToDataUri)
     .filter((s): s is string => s !== null);
+  const areaSlug = plain.areaLabel.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 
   return {
-    title: finding.title,
-    description: descriptionParts.filter(Boolean).join('\n\n'),
+    title: plain.headline,
+    description: descriptionParts.join('\n\n'),
     severity: SEVERITY_MAP[finding.severity] ?? 'medium',
     url: finding.pageUrl ?? targetUrl,
-    steps: finding.steps,
+    steps,
     evidence: screenshots.length > 0 ? `${screenshots.length} screenshot(s) attached` : undefined,
     screenshots,
     metadata: {
+      labels: ['exploratory-agent', areaSlug].filter(Boolean),
       area: finding.area,
-      confidence: finding.confidence,
+      status: confirmed ? 'confirmed' : 'requires-validation',
+      checkResult: finding.title,
       reproRate: finding.reproRate,
       automationCandidate: finding.automationCandidate,
     },
@@ -118,7 +143,7 @@ export async function raiseFindingsInQualityPilot(
   const payload = {
     target_url: state.config.targetUrl,
     source: 'exploratory',
-    findings: findings.map((f) => findingToExploratoryInput(f, state.config.targetUrl)),
+    findings: findings.map((f) => findingToExploratoryInput(f, state)),
   };
 
   const url = `${config.baseUrl.replace(/\/$/, '')}/workspaces/${config.workspaceId}/projects/${config.projectId}/exploratory/submit-findings`;

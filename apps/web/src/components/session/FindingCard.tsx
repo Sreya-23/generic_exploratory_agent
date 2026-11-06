@@ -1,21 +1,15 @@
 import { useState } from 'react';
 import { evidenceUrl, raiseBugsInQualityPilot, type Finding } from '../../api/client';
-import { parseListLikeText, isLikelyFalsePositive, explainFinding } from '@qa/shared';
+import { parseListLikeText, explainFinding, isExecutionError } from '@qa/shared';
 
-/** Same validation-status wording as the downloadable report (generate-report.ts) — "confirmed
- *  / requires validation / possible false positive" rather than the internal 'verified'/
- *  'heuristic' field names, so the live view and the final report never say different things. */
+/** The one tag every bug carries — same rule and wording as the downloadable report: the AI's
+ *  verdict when it reviewed the bug, otherwise the check's own evidence; a check that doesn't
+ *  label itself reports a measured fact, so it shows Confirmed. Info notes carry no tag. */
 function ValidationBadge({ finding }: { finding: Finding }) {
-  if (!finding.confidence) return null;
-  if (isLikelyFalsePositive(finding)) {
-    return (
-      <span className="confidence-badge flagged" title={finding.confidenceReason}>
-        🚩 Possible false positive
-      </span>
-    );
-  }
-  return finding.confidence === 'verified' ? (
-    <span className="confidence-badge verified" title={finding.confidenceReason}>
+  if (finding.severity === 'info' || isExecutionError(finding)) return null;
+  const confirmed = finding.confidence !== 'heuristic';
+  return confirmed ? (
+    <span className="confidence-badge verified" title={finding.confidenceReason ?? 'The check measured this directly.'}>
       ✓ Confirmed
     </span>
   ) : (
@@ -134,9 +128,9 @@ export function FindingCard({ finding, sessionId }: { finding: Finding; sessionI
             <strong>Actual:</strong> <FindingText text={finding.actual} />
           </div>
         </div>
-        {finding.confidenceReason && (
+        {finding.severity !== 'info' && !isExecutionError(finding) && (
           <p className="finding-preconditions">
-            <strong>How sure the agent is:</strong> {finding.confidenceReason}
+            <strong>How sure the agent is:</strong> {finding.confidenceReason ?? 'The check measured this directly.'}
           </p>
         )}
         {rawEvidence.length > 0 && (
