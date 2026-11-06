@@ -4,7 +4,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BrowserContext, Locator, Page } from 'playwright';
-import type { ExecutorContext, ScopeSection } from '@qa/shared';
+import type { ExecutorContext, PreActionRequest, ScopeSection } from '@qa/shared';
 import { matchesKnownNonBugPattern } from './non-bug-patterns.js';
 
 /**
@@ -414,6 +414,28 @@ export async function dismissBlockingOverlay(page: Page): Promise<boolean> {
   await overlay.click({ position: { x: 5, y: 5 }, timeout: 2000 }).catch(() => {});
   await page.waitForTimeout(300);
   return !(await hasBlockingOverlay(page));
+}
+
+/**
+ * Ask the user for something in chat and WAIT for the answer (up to the orchestrator's pause
+ * window) — the waiting counterpart of calling ctx.onPreActionNeeded directly, which only asks
+ * and returns at once. Returns the extras once one of the requested keys is supplied (or the
+ * value was already given earlier), null on `skip` / no reply.
+ */
+export async function askAndWait(
+  ctx: ExecutorContext,
+  req: { type: PreActionRequest['type']; description: string; requiredExtras: string[]; pageUrl: string },
+): Promise<Record<string, string> | null> {
+  const willWait = !!ctx.waitForPreActionReply;
+  const provided = ctx.onPreActionNeeded?.({ ...req, willWait }) ?? null;
+  if (provided && req.requiredExtras.some((k) => provided[k])) return provided;
+  if (!willWait) return null;
+  const answered = await ctx.waitForPreActionReply!({ ...req, willWait: true }).catch(() => null);
+  if (answered) {
+    ctx.config.credentials = ctx.config.credentials ?? { type: 'none' };
+    ctx.config.credentials.extras = { ...(ctx.config.credentials.extras ?? {}), ...answered };
+  }
+  return answered;
 }
 
 /** Pause the check and wait for the user's chat answer to a gate prompt (when the orchestrator supports it). */

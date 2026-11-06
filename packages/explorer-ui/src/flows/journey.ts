@@ -12,6 +12,7 @@ import {
   gateIfSensitive,
   isSectionAllowed,
   confirmWriteAction,
+  askAndWait,
 } from './helpers.js';
 import { findByIntentWithRetry } from './element-matcher.js';
 
@@ -339,29 +340,28 @@ async function runEcommerceJourney(page: Page, ctx: ExecutorContext): Promise<vo
         return;
       }
 
-      // 5. Pre-action gate before payment — need card/address details
-      const extras = ctx.onPreActionNeeded?.({
-        type: 'purchase',
-        description: 'Complete checkout / payment',
-        requiredExtras: ['card'],
-        pageUrl: page.url(),
-      });
-
-      if (extras && extras['card']) {
-        // Fill payment details if card was provided
-        const cardInput = page.locator(
-          'input[placeholder*="card" i], input[name*="card" i], input[data-testid*="card"]',
-        ).first();
-
-        if (await cardInput.count() > 0) {
+      // 5. Pre-action gate before payment. Only ask when the page really has a card field —
+      // SauceDemo-style checkouts have none, and asking (then waiting) for a card number there
+      // only stalls the run for nothing.
+      const cardInput = page.locator(
+        'input[placeholder*="card" i], input[name*="card" i], input[data-testid*="card"], input[autocomplete="cc-number"]',
+      ).first();
+      if ((await cardInput.count()) === 0) {
+        ctx.onLog('[Journey/ecommerce] No card field on the checkout page — nothing to ask for, payment step not tested');
+      } else {
+        const extras = await askAndWait(ctx, {
+          type: 'purchase',
+          description: 'Complete checkout / payment (send a TEST card number only)',
+          requiredExtras: ['card'],
+          pageUrl: page.url(),
+        });
+        if (extras?.['card']) {
           await cardInput.fill(extras['card']);
           ctx.onLog(`[Journey/ecommerce] Filled card number`);
           await shot(page, ctx, 'checkout-payment-filled');
         } else {
-          ctx.onLog('[Journey/ecommerce] No card input visible on checkout page');
+          ctx.onLog('[Journey/ecommerce] Payment step skipped — no card provided');
         }
-      } else {
-        ctx.onLog('[Journey/ecommerce] Payment step skipped — no card provided');
       }
     }
   }
@@ -412,14 +412,16 @@ async function runBookingJourney(page: Page, ctx: ExecutorContext): Promise<void
 
       if (await firstResult.count() > 0) {
         // Pre-action gate before confirming a booking
-        const extras = ctx.onPreActionNeeded?.({
+        // Previously asked with no required value, which counted as approved at once — so the
+        // booking was opened without anyone saying yes. Now it waits for an explicit yes.
+        const extras = await askAndWait(ctx, {
           type: 'booking_confirm',
           description: 'Confirm booking / reservation',
-          requiredExtras: [],
+          requiredExtras: ['confirm_booking'],
           pageUrl: page.url(),
         });
 
-        if (extras !== null) {
+        if (/^(yes|true)$/i.test(extras?.['confirm_booking'] ?? '')) {
           await firstResult.click();
           await page.waitForLoadState('domcontentloaded').catch(() => {});
           await shot(page, ctx, 'booking-confirm-page');
@@ -1181,14 +1183,14 @@ async function runFintechJourney(page: Page, ctx: ExecutorContext): Promise<void
 
   if (await transferBtn.count() > 0) {
     // Pre-action gate before any payment/transfer
-    const extras = ctx.onPreActionNeeded?.({
+    const extras = await askAndWait(ctx, {
       type: 'payment',
-      description: 'Initiate fund transfer or payment',
+      description: 'Initiate fund transfer or payment (send a TEST phone/account only)',
       requiredExtras: ['phone'],
       pageUrl: page.url(),
     });
 
-    if (extras !== null) {
+    if (extras?.['phone']) {
       await transferBtn.click();
       await page.waitForLoadState('domcontentloaded').catch(() => {});
       await shot(page, ctx, 'fintech-transfer-form');
