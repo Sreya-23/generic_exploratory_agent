@@ -26,7 +26,11 @@ const REQUEST_TIMEOUT_MS = 50000;
 // How many NEW distinct sites of a category must be seen since the doc was last (re)generated
 // before spending another LLM call to refresh it. Deliberately not "every session" — see the
 // file-level comment for why.
-const REGEN_THRESHOLD = 5;
+// Was 5: a doc written from the first site of a category (e.g. a payments dashboard) was then
+// shown unchanged for very different sites of the same category (an HR tool) until five more
+// had been seen. Now any NEW distinct site rewrites the doc from the whole pool, so the second
+// site already broadens it. Set KB_REGEN_AFTER_NEW_SITES in .env to make refreshes rarer.
+const REGEN_THRESHOLD = Math.max(1, Number(process.env.KB_REGEN_AFTER_NEW_SITES ?? 1));
 
 function docPath(knowledgeBaseDir: string, siteType: SiteType): string {
   return join(knowledgeBaseDir, `${siteType}.md`);
@@ -71,6 +75,8 @@ interface PooledSiteSignal {
 interface RegenMeta {
   lastRegeneratedAt: string;
   sitesAtLastRegen: number;
+  /** Hostnames the current doc was actually written from (absent on docs written before this). */
+  sources?: string[];
 }
 
 async function loadPool(knowledgeBaseDir: string, siteType: SiteType): Promise<PooledSiteSignal[]> {
@@ -225,6 +231,68 @@ ${DOC_SECTIONS_PROMPT}`;
 }
 
 /**
+ * "_Written from 2 sites: a.com, b.com — updated 2026-11-16_", plus "also seen, not yet included"
+ * for pooled sites the text hasn't been rewritten from yet (e.g. no AI key at the time).
+ */
+function sourcesLine(writtenFrom: string[], pool: PooledSiteSignal[], updatedAt: string): string {
+  const pending = pool.map((p) => p.hostname).filter((h) => !writtenFrom.includes(h));
+  const n = writtenFrom.length;
+  return (
+    `_Written from ${n} site${n === 1 ? '' : 's'}: ${writtenFrom.join(', ')}` +
+    (pending.length ? ` (also seen, not yet included: ${pending.join(', ')})` : '') +
+    ` — updated ${updatedAt.slice(0, 10)}_`
+  );
+}
+
+/**
+ * Put the sources line right under the title, replacing an older "_First captured from …_" /
+ * "_Refreshed from …_" / "_Written from …_" line. No AI call: it only lists hostnames.
+ */
+function withSourcesLine(doc: string, line: string): string {
+  const existing = /^_(First captured from|Refreshed from|Written from|Based on) .*_$/m;
+  if (existing.test(doc)) return doc.replace(existing, line);
+  const lines = doc.split('\n');
+  const titleIdx = lines.findIndex((l) => /^# /.test(l));
+  if (titleIdx === -1) return `${line}\n\n${doc}`;
+  lines.splice(titleIdx + 1, 0, '', line);
+  return lines.join('\n');
+}
+
+/**
+ * A short section about THIS site only, built from what recon actually saw on it — no AI call.
+ * Shown under the shared category notes in the report (never saved into the shared doc), so a
+ * reader sees both "what this kind of app usually has" and "what this particular site has".
+ */
+export function buildThisSiteSection(
+  hostname: string,
+  signals: SiteIntelligenceSignals,
+  classification: SiteClassification,
+): string {
+  const uniq = (xs: string[]) => [...new Set(xs.map((x) => x.replace(/\s+/g, ' ').trim()).filter(Boolean))];
+  const nav = uniq(signals.linkTexts)
+    .filter((t) => t.length >= 2 && t.length <= 30 && !/^(log ?out|sign ?out|help|privacy|terms|cookies?)$/i.test(t))
+    .slice(0, 15);
+  const pages = uniq(signals.urlPaths).filter((p) => p !== '/').slice(0, 15);
+  const headings = uniq(signals.headings).slice(0, 8);
+  const inputs = uniq(signals.inputTypes);
+  const lines = [
+    `## This site: ${hostname}`,
+    '',
+    `_Only about this site, from what the agent saw on it. The sections above are shared by every "${classification.siteType}" site._`,
+    '',
+    `- **Page title:** ${signals.title || '(none)'}`,
+  ];
+  if (nav.length) lines.push(`- **Menu and links seen:** ${nav.join(', ')}`);
+  if (headings.length) lines.push(`- **Headings seen:** ${headings.join(', ')}`);
+  if (pages.length) lines.push(`- **Pages found:** ${pages.join(', ')}`);
+  if (inputs.length) lines.push(`- **Kinds of input fields:** ${inputs.join(', ')}`);
+  if (classification.inferredJourneys.length) {
+    lines.push('- **Journeys worth testing here:**', ...classification.inferredJourneys.map((j) => `    - ${j}`));
+  }
+  return lines.join('\n');
+}
+
+/**
  * Called once per session, right after classification completes. Always records this site's
  * signals into the category's pool (deduped by hostname). If no doc exists yet for this
  * category, generates one from this single site (cheap, unchanged first-run path). If a doc
@@ -245,9 +313,10 @@ export async function ensureSiteKnowledge(
   if (!existing) {
     const generated = await generateWalkthroughDoc(hostname, signals, classification);
     if (!generated) return null;
-    const withHeader = `# ${siteType}\n\n_First captured from ${hostname} on ${new Date().toISOString()}_\n\n${generated}\n`;
+    const now = new Date().toISOString();
+    const withHeader = `# ${siteType}\n\n${sourcesLine([hostname], pool, now)}\n\n${generated}\n`;
     await saveSiteKnowledge(knowledgeBaseDir, siteType, withHeader);
-    await saveRegenMeta(knowledgeBaseDir, siteType, { lastRegeneratedAt: new Date().toISOString(), sitesAtLastRegen: pool.length });
+    await saveRegenMeta(knowledgeBaseDir, siteType, { lastRegeneratedAt: now, sitesAtLastRegen: pool.length, sources: [hostname] });
     return { content: withHeader, isNew: true, poolSize: pool.length };
   }
 
@@ -258,9 +327,11 @@ export async function ensureSiteKnowledge(
   if (newSitesSinceRegen >= REGEN_THRESHOLD) {
     const regenerated = await generateWalkthroughDocFromPool(siteType, pool);
     if (regenerated) {
-      const withHeader = `# ${siteType}\n\n_Refreshed from ${pool.length} pooled sites on ${new Date().toISOString()}_\n\n${regenerated}\n`;
+      const now = new Date().toISOString();
+      const hosts = pool.map((p) => p.hostname);
+      const withHeader = `# ${siteType}\n\n${sourcesLine(hosts, pool, now)}\n\n${regenerated}\n`;
       await saveSiteKnowledge(knowledgeBaseDir, siteType, withHeader);
-      await saveRegenMeta(knowledgeBaseDir, siteType, { lastRegeneratedAt: new Date().toISOString(), sitesAtLastRegen: pool.length });
+      await saveRegenMeta(knowledgeBaseDir, siteType, { lastRegeneratedAt: now, sitesAtLastRegen: pool.length, sources: hosts });
       return { content: withHeader, isNew: false, refreshed: true, poolSize: pool.length };
     }
     // Regeneration failed (no key / LLM error) — keep serving the existing doc, same
@@ -272,8 +343,15 @@ export async function ensureSiteKnowledge(
     await saveRegenMeta(knowledgeBaseDir, siteType, {
       lastRegeneratedAt: meta?.lastRegeneratedAt ?? new Date().toISOString(),
       sitesAtLastRegen: pool.length,
+      sources: meta?.sources,
     });
   }
 
-  return { content: existing, isNew: false, poolSize: pool.length };
+  // Reused as-is: still keep the "Based on …" line in step with the sites actually pooled, so a
+  // reader can see the notes came from other sites (no AI call, just the hostnames).
+  const legacyFirst = existing.match(/^_First captured from (\S+) on /m)?.[1];
+  const writtenFrom = meta?.sources ?? (legacyFirst ? [legacyFirst] : pool.slice(0, 1).map((p) => p.hostname));
+  const reused = withSourcesLine(existing, sourcesLine(writtenFrom, pool, meta?.lastRegeneratedAt ?? new Date().toISOString()));
+  if (reused !== existing) await saveSiteKnowledge(knowledgeBaseDir, siteType, reused).catch(() => {});
+  return { content: reused, isNew: false, poolSize: pool.length };
 }

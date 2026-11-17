@@ -19,7 +19,7 @@ import { credentialsComplete, effectiveAuthState, authPromptForState } from '@qa
 import { buildPlan, injectJourneyTasks, isSectionFocusedRun, removeUnlikelyTasks } from '../planner/index.js';
 import { classifySite } from '../intelligence/classify-site.js';
 import { classifySiteWithAI } from '../intelligence/classify-site-ai.js';
-import { ensureSiteKnowledge } from '../intelligence/site-knowledge-base.js';
+import { buildThisSiteSection, ensureSiteKnowledge } from '../intelligence/site-knowledge-base.js';
 import { saveSessionState, writeSessionReport } from '../reporter/index.js';
 import {
   attachFingerprints,
@@ -783,7 +783,8 @@ export class SessionOrchestrator {
             const knowledgeBaseDir = join(sessionsDir, '..', 'knowledge-base');
             const knowledge = await ensureSiteKnowledge(knowledgeBaseDir, hostname, signals, classification);
             if (knowledge) {
-              state.siteKnowledge = knowledge.content;
+              // Shared category notes + a short section about this exact site.
+              state.siteKnowledge = `${knowledge.content.trimEnd()}\n\n${buildThisSiteSection(hostname, signals, classification)}\n`;
               this.emit({
                 type: 'log',
                 sessionId,
@@ -793,7 +794,7 @@ export class SessionOrchestrator {
                     ? `[Knowledge] First "${classification.siteType}"-category site seen (${hostname}) — captured a new application walkthrough doc for this category`
                     : knowledge.refreshed
                       ? `[Knowledge] Refreshed "${classification.siteType}"-category doc from ${knowledge.poolSize} pooled sites (threshold reached since last refresh)`
-                      : `[Knowledge] Reusing existing "${classification.siteType}"-category walkthrough doc (${knowledge.poolSize} site(s) pooled so far, captured from a previously-seen site of this kind)`,
+                      : `[Knowledge] Reusing the "${classification.siteType}" notes (based on ${knowledge.poolSize} site(s)); added a section about ${hostname}`,
                 },
               });
             }

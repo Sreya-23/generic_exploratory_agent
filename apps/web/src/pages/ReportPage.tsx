@@ -311,7 +311,7 @@ export function ReportPage() {
             <section style={{ marginBottom: '1.5rem' }}>
               <h2>Application Knowledge Base</h2>
               <p className="session-meta">
-                Generated the first time this app CATEGORY was seen (by site type); reused silently for every other site that classifies into the same category.
+                Shared notes about this kind of app, written by the AI from the sites listed under the title and refreshed when a new site of the same kind is seen, followed by a section about this site only.
               </p>
               <pre style={{ whiteSpace: 'pre-wrap', fontFamily: 'inherit', fontSize: '0.9rem', lineHeight: 1.6 }}>
                 {session.siteKnowledge}
